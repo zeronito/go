@@ -11,17 +11,28 @@ import (
 	"hash"
 	"hash/crc32"
 	"io"
+	"unicode/utf8"
 )
 
-// TODO(adg): support zip file comments
-// TODO(adg): support specifying deflate level
+var (
+	errLongName  = errors.New("zip: FileHeader.Name too long")
+	errLongExtra = errors.New("zip: FileHeader.Extra too long")
+)
 
 // Writer implements a zip file writer.
 type Writer struct {
-	cw     *countWriter
-	dir    []*header
-	last   *fileWriter
-	closed bool
+	cw          *countWriter
+	dir         []*header
+	last        *fileWriter
+	closed      bool
+	compressors map[uint16]Compressor
+
+	// testHookCloseSizeOffset if non-nil is called with the size
+	// of offset of the central directory at Close.
+	testHookCloseSizeOffset func(size, offset uint64)
+
+	// Comment is the central directory comment and must be set before Close is called.
+	Comment string
 }
 
 type header struct {
@@ -34,6 +45,17 @@ func NewWriter(w io.Writer) *Writer {
 	return &Writer{cw: &countWriter{w: bufio.NewWriter(w)}}
 }
 
+// SetOffset sets the offset of the beginning of the zip data within the
+// underlying writer. It should be used when the zip data is appended to an
+// existing file, such as a binary executable.
+// It must be called before any data is written.
+func (w *Writer) SetOffset(n int64) {
+	if w.cw.count != 0 {
+		panic("zip: SetOffset called after data was written")
+	}
+	w.cw.count = n
+}
+
 // Flush flushes any buffered data to the underlying writer.
 // Calling Flush is not normally necessary; calling Close is sufficient.
 func (w *Writer) Flush() error {
@@ -41,8 +63,12 @@ func (w *Writer) Flush() error {
 }
 
 // Close finishes writing the zip file by writing the central directory.
-// It does not (and can not) close the underlying writer.
+// It does not (and cannot) close the underlying writer.
 func (w *Writer) Close() error {
+	if len(w.Comment) > uint16max {
+		return errors.New("zip: Writer.Comment too long")
+	}
+
 	if w.last != nil && !w.last.closed {
 		if err := w.last.close(); err != nil {
 			return err
@@ -67,7 +93,7 @@ func (w *Writer) Close() error {
 		b.uint16(h.ModifiedTime)
 		b.uint16(h.ModifiedDate)
 		b.uint32(h.CRC32)
-		if h.isZip64() || h.offset > uint32max {
+		if h.isZip64() || h.offset >= uint32max {
 			// the file needs a zip64 header. store maxint in both
 			// 32 bit size fields (and offset later) to signal that the
 			// zip64 extra header should be used.
@@ -87,6 +113,7 @@ func (w *Writer) Close() error {
 			b.uint32(h.CompressedSize)
 			b.uint32(h.UncompressedSize)
 		}
+
 		b.uint16(uint16(len(h.Name)))
 		b.uint16(uint16(len(h.Extra)))
 		b.uint16(uint16(len(h.Comment)))
@@ -116,21 +143,25 @@ func (w *Writer) Close() error {
 	size := uint64(end - start)
 	offset := uint64(start)
 
-	if records > uint16max || size > uint32max || offset > uint32max {
+	if f := w.testHookCloseSizeOffset; f != nil {
+		f(size, offset)
+	}
+
+	if records >= uint16max || size >= uint32max || offset >= uint32max {
 		var buf [directory64EndLen + directory64LocLen]byte
 		b := writeBuf(buf[:])
 
 		// zip64 end of central directory record
 		b.uint32(directory64EndSignature)
-		b.uint64(directory64EndLen)
-		b.uint16(zipVersion45) // version made by
-		b.uint16(zipVersion45) // version needed to extract
-		b.uint32(0)            // number of this disk
-		b.uint32(0)            // number of the disk with the start of the central directory
-		b.uint64(records)      // total number of entries in the central directory on this disk
-		b.uint64(records)      // total number of entries in the central directory
-		b.uint64(size)         // size of the central directory
-		b.uint64(offset)       // offset of start of central directory with respect to the starting disk number
+		b.uint64(directory64EndLen - 12) // length minus signature (uint32) and length fields (uint64)
+		b.uint16(zipVersion45)           // version made by
+		b.uint16(zipVersion45)           // version needed to extract
+		b.uint32(0)                      // number of this disk
+		b.uint32(0)                      // number of the disk with the start of the central directory
+		b.uint64(records)                // total number of entries in the central directory on this disk
+		b.uint64(records)                // total number of entries in the central directory
+		b.uint64(size)                   // size of the central directory
+		b.uint64(offset)                 // offset of start of central directory with respect to the starting disk number
 
 		// zip64 end of central directory locator
 		b.uint32(directory64LocSignature)
@@ -153,13 +184,16 @@ func (w *Writer) Close() error {
 	var buf [directoryEndLen]byte
 	b := writeBuf(buf[:])
 	b.uint32(uint32(directoryEndSignature))
-	b = b[4:]                 // skip over disk number and first disk number (2x uint16)
-	b.uint16(uint16(records)) // number of entries this disk
-	b.uint16(uint16(records)) // number of entries total
-	b.uint32(uint32(size))    // size of directory
-	b.uint32(uint32(offset))  // start of directory
-	// skipped size of comment (always zero)
+	b = b[4:]                        // skip over disk number and first disk number (2x uint16)
+	b.uint16(uint16(records))        // number of entries this disk
+	b.uint16(uint16(records))        // number of entries total
+	b.uint32(uint32(size))           // size of directory
+	b.uint32(uint32(offset))         // start of directory
+	b.uint16(uint16(len(w.Comment))) // byte size of EOCD comment
 	if _, err := w.cw.Write(buf[:]); err != nil {
+		return err
+	}
+	if _, err := io.WriteString(w.cw, w.Comment); err != nil {
 		return err
 	}
 
@@ -181,19 +215,43 @@ func (w *Writer) Create(name string) (io.Writer, error) {
 	return w.CreateHeader(header)
 }
 
+func hasValidUTF8(s string) bool {
+	n := 0
+	for _, r := range s {
+		// By default, ZIP uses CP437, which is only identical to ASCII for the printable characters.
+		if r < 0x20 || r >= 0x7f {
+			if !utf8.ValidRune(r) {
+				return false
+			}
+			n++
+		}
+	}
+	return n > 0
+}
+
 // CreateHeader adds a file to the zip file using the provided FileHeader
 // for the file metadata.
 // It returns a Writer to which the file contents should be written.
+//
 // The file's contents must be written to the io.Writer before the next
-// call to Create, CreateHeader, or Close.
+// call to Create, CreateHeader, or Close. The provided FileHeader fh
+// must not be modified after a call to CreateHeader.
 func (w *Writer) CreateHeader(fh *FileHeader) (io.Writer, error) {
 	if w.last != nil && !w.last.closed {
 		if err := w.last.close(); err != nil {
 			return nil, err
 		}
 	}
+	if len(w.dir) > 0 && w.dir[len(w.dir)-1].FileHeader == fh {
+		// See https://golang.org/issue/11144 confusion.
+		return nil, errors.New("archive/zip: invalid duplicate FileHeader")
+	}
 
 	fh.Flags |= 0x8 // we will write a data descriptor
+
+	if hasValidUTF8(fh.Name) || hasValidUTF8(fh.Comment) {
+		fh.Flags |= 0x800 // filename or comment have valid utf-8 string
+	}
 
 	fh.CreatorVersion = fh.CreatorVersion&0xff00 | zipVersion20 // preserve compatibility byte
 	fh.ReaderVersion = zipVersion20
@@ -203,7 +261,7 @@ func (w *Writer) CreateHeader(fh *FileHeader) (io.Writer, error) {
 		compCount: &countWriter{w: w.cw},
 		crc32:     crc32.NewIEEE(),
 	}
-	comp := compressor(fh.Method)
+	comp := w.compressor(fh.Method)
 	if comp == nil {
 		return nil, ErrAlgorithm
 	}
@@ -230,6 +288,14 @@ func (w *Writer) CreateHeader(fh *FileHeader) (io.Writer, error) {
 }
 
 func writeHeader(w io.Writer, h *FileHeader) error {
+	const maxUint16 = 1<<16 - 1
+	if len(h.Name) > maxUint16 {
+		return errLongName
+	}
+	if len(h.Extra) > maxUint16 {
+		return errLongExtra
+	}
+
 	var buf [fileHeaderLen]byte
 	b := writeBuf(buf[:])
 	b.uint32(uint32(fileHeaderSignature))
@@ -251,6 +317,24 @@ func writeHeader(w io.Writer, h *FileHeader) error {
 	}
 	_, err := w.Write(h.Extra)
 	return err
+}
+
+// RegisterCompressor registers or overrides a custom compressor for a specific
+// method ID. If a compressor for a given method is not found, Writer will
+// default to looking up the compressor at the package level.
+func (w *Writer) RegisterCompressor(method uint16, comp Compressor) {
+	if w.compressors == nil {
+		w.compressors = make(map[uint16]Compressor)
+	}
+	w.compressors[method] = comp
+}
+
+func (w *Writer) compressor(method uint16) Compressor {
+	comp := w.compressors[method]
+	if comp == nil {
+		comp = compressor(method)
+	}
+	return comp
 }
 
 type fileWriter struct {

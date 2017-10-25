@@ -6,6 +6,10 @@ package hex
 
 import (
 	"bytes"
+	"fmt"
+	"io"
+	"io/ioutil"
+	"strings"
 	"testing"
 )
 
@@ -76,14 +80,15 @@ func TestDecodeString(t *testing.T) {
 
 type errTest struct {
 	in  string
-	err string
+	err error
 }
 
 var errTests = []errTest{
-	{"0", "encoding/hex: odd length hex string"},
-	{"0g", "encoding/hex: invalid byte: U+0067 'g'"},
-	{"00gg", "encoding/hex: invalid byte: U+0067 'g'"},
-	{"0\x01", "encoding/hex: invalid byte: U+0001"},
+	{"0", ErrLength},
+	{"zd4aa", ErrLength},
+	{"0g", InvalidByteError('g')},
+	{"00gg", InvalidByteError('g')},
+	{"0\x01", InvalidByteError('\x01')},
 }
 
 func TestInvalidErr(t *testing.T) {
@@ -91,8 +96,8 @@ func TestInvalidErr(t *testing.T) {
 		dst := make([]byte, DecodedLen(len(test.in)))
 		_, err := Decode(dst, []byte(test.in))
 		if err == nil {
-			t.Errorf("#%d: expected error; got none", i)
-		} else if err.Error() != test.err {
+			t.Errorf("#%d: expected %v; got none", i, test.err)
+		} else if err != test.err {
 			t.Errorf("#%d: got: %v want: %v", i, err, test.err)
 		}
 	}
@@ -102,9 +107,66 @@ func TestInvalidStringErr(t *testing.T) {
 	for i, test := range errTests {
 		_, err := DecodeString(test.in)
 		if err == nil {
-			t.Errorf("#%d: expected error; got none", i)
-		} else if err.Error() != test.err {
+			t.Errorf("#%d: expected %v; got none", i, test.err)
+		} else if err != test.err {
 			t.Errorf("#%d: got: %v want: %v", i, err, test.err)
+		}
+	}
+}
+
+func TestEncoderDecoder(t *testing.T) {
+	for _, multiplier := range []int{1, 128, 192} {
+		for _, test := range encDecTests {
+			input := bytes.Repeat(test.dec, multiplier)
+			output := strings.Repeat(test.enc, multiplier)
+
+			var buf bytes.Buffer
+			enc := NewEncoder(&buf)
+			r := struct{ io.Reader }{bytes.NewReader(input)} // io.Reader only; not io.WriterTo
+			if n, err := io.CopyBuffer(enc, r, make([]byte, 7)); n != int64(len(input)) || err != nil {
+				t.Errorf("encoder.Write(%q*%d) = (%d, %v), want (%d, nil)", test.dec, multiplier, n, err, len(input))
+				continue
+			}
+
+			if encDst := buf.String(); encDst != output {
+				t.Errorf("buf(%q*%d) = %v, want %v", test.dec, multiplier, encDst, output)
+				continue
+			}
+
+			dec := NewDecoder(&buf)
+			var decBuf bytes.Buffer
+			w := struct{ io.Writer }{&decBuf} // io.Writer only; not io.ReaderFrom
+			if _, err := io.CopyBuffer(w, dec, make([]byte, 7)); err != nil || decBuf.Len() != len(input) {
+				t.Errorf("decoder.Read(%q*%d) = (%d, %v), want (%d, nil)", test.enc, multiplier, decBuf.Len(), err, len(input))
+			}
+
+			if !bytes.Equal(decBuf.Bytes(), input) {
+				t.Errorf("decBuf(%q*%d) = %v, want %v", test.dec, multiplier, decBuf.Bytes(), input)
+				continue
+			}
+		}
+	}
+}
+
+func TestDecodeErr(t *testing.T) {
+	tests := []struct {
+		in      string
+		wantOut string
+		wantErr error
+	}{
+		{"", "", nil},
+		{"0", "", io.ErrUnexpectedEOF},
+		{"0g", "", InvalidByteError('g')},
+		{"00gg", "\x00", InvalidByteError('g')},
+		{"0\x01", "", InvalidByteError('\x01')},
+		{"ffeed", "\xff\xee", io.ErrUnexpectedEOF},
+	}
+
+	for _, tt := range tests {
+		dec := NewDecoder(strings.NewReader(tt.in))
+		got, err := ioutil.ReadAll(dec)
+		if string(got) != tt.wantOut || err != tt.wantErr {
+			t.Errorf("NewDecoder(%q) = (%q, %v), want (%q, %v)", tt.in, got, err, tt.wantOut, tt.wantErr)
 		}
 	}
 }
@@ -151,3 +213,18 @@ var expectedHexDump = []byte(`00000000  1e 1f 20 21 22 23 24 25  26 27 28 29 2a 
 00000010  2e 2f 30 31 32 33 34 35  36 37 38 39 3a 3b 3c 3d  |./0123456789:;<=|
 00000020  3e 3f 40 41 42 43 44 45                           |>?@ABCDE|
 `)
+
+var sink []byte
+
+func BenchmarkEncode(b *testing.B) {
+	for _, size := range []int{256, 1024, 4096, 16384} {
+		src := bytes.Repeat([]byte{2, 3, 5, 7, 9, 11, 13, 17}, size/8)
+		sink = make([]byte, 2*size)
+
+		b.Run(fmt.Sprintf("%v", size), func(b *testing.B) {
+			for i := 0; i < b.N; i++ {
+				Encode(sink, src)
+			}
+		})
+	}
+}

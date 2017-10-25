@@ -69,6 +69,8 @@ const (
 	NodeTemplate                   // A template invocation action.
 	NodeVariable                   // A $ variable.
 	NodeWith                       // A with action.
+	NodeBreak                      // A break action.
+	NodeContinue                   // A continue action.
 )
 
 // Nodes.
@@ -145,7 +147,7 @@ type PipeNode struct {
 	NodeType
 	Pos
 	tr   *Tree
-	Line int             // The line number in the input (deprecated; kept for compatibility)
+	Line int             // The line number in the input. Deprecated: Kept for compatibility.
 	Decl []*VariableNode // Variable declarations in lexical order.
 	Cmds []*CommandNode  // The commands in lexical order.
 }
@@ -208,7 +210,7 @@ type ActionNode struct {
 	NodeType
 	Pos
 	tr   *Tree
-	Line int       // The line number in the input (deprecated; kept for compatibility)
+	Line int       // The line number in the input. Deprecated: Kept for compatibility.
 	Pipe *PipeNode // The pipeline in the action.
 }
 
@@ -592,6 +594,11 @@ func (t *Tree) newNumber(pos Pos, text string, typ itemType) (*NumberNode, error
 	} else {
 		f, err := strconv.ParseFloat(text, 64)
 		if err == nil {
+			// If we parsed it as a float but it looks like an integer,
+			// it's a huge number too large to fit in an int. Reject it.
+			if !strings.ContainsAny(text, ".eE") {
+				return nil, fmt.Errorf("integer overflow: %q", text)
+			}
 			n.IsFloat = true
 			n.Float64 = f
 			// If a floating-point extraction succeeded, extract the int if needed.
@@ -696,7 +703,7 @@ type elseNode struct {
 	NodeType
 	Pos
 	tr   *Tree
-	Line int // The line number in the input (deprecated; kept for compatibility)
+	Line int // The line number in the input. Deprecated: Kept for compatibility.
 }
 
 func (t *Tree) newElse(pos Pos, line int) *elseNode {
@@ -724,7 +731,7 @@ type BranchNode struct {
 	NodeType
 	Pos
 	tr       *Tree
-	Line     int       // The line number in the input (deprecated; kept for compatibility)
+	Line     int       // The line number in the input. Deprecated: Kept for compatibility.
 	Pipe     *PipeNode // The pipeline to be evaluated.
 	List     *ListNode // What to execute if the value is non-empty.
 	ElseList *ListNode // What to execute if the value is empty (nil if absent).
@@ -791,6 +798,68 @@ func (r *RangeNode) Copy() Node {
 	return r.tr.newRange(r.Pos, r.Line, r.Pipe.CopyPipe(), r.List.CopyList(), r.ElseList.CopyList())
 }
 
+// BreakNode represents a {{break}} action.
+type BreakNode struct {
+	NodeType
+	Pos
+	tr *Tree
+}
+
+func (t *Tree) newBreak(pos Pos) *BreakNode {
+	return &BreakNode{NodeType: NodeBreak, Pos: pos, tr: t}
+}
+
+func (b *BreakNode) Type() NodeType {
+	return b.NodeType
+}
+
+func (b *BreakNode) String() string {
+	return "{{break}}"
+}
+
+func (b *BreakNode) Copy() Node {
+	return b.tr.newBreak(b.Pos)
+}
+
+func (b *BreakNode) Position() Pos {
+	return b.Pos
+}
+
+func (b *BreakNode) tree() *Tree {
+	return b.tr
+}
+
+// ContinueNode represents a {{continue}} action.
+type ContinueNode struct {
+	NodeType
+	Pos
+	tr *Tree
+}
+
+func (t *Tree) newContinue(pos Pos) *ContinueNode {
+	return &ContinueNode{NodeType: NodeContinue, Pos: pos, tr: t}
+}
+
+func (c *ContinueNode) Type() NodeType {
+	return c.NodeType
+}
+
+func (c *ContinueNode) String() string {
+	return "{{continue}}"
+}
+
+func (c *ContinueNode) Copy() Node {
+	return c.tr.newContinue(c.Pos)
+}
+
+func (c *ContinueNode) Position() Pos {
+	return c.Pos
+}
+
+func (c *ContinueNode) tree() *Tree {
+	return c.tr
+}
+
 // WithNode represents a {{with}} action and its commands.
 type WithNode struct {
 	BranchNode
@@ -809,7 +878,7 @@ type TemplateNode struct {
 	NodeType
 	Pos
 	tr   *Tree
-	Line int       // The line number in the input (deprecated; kept for compatibility)
+	Line int       // The line number in the input. Deprecated: Kept for compatibility.
 	Name string    // The name of the template (unquoted).
 	Pipe *PipeNode // The command to evaluate as dot for the template.
 }

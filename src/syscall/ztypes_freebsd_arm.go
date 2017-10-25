@@ -1,6 +1,8 @@
 // Created by cgo -godefs - DO NOT EDIT
 // cgo -godefs -- -fsigned-char types_freebsd.go
 
+// +build arm,freebsd
+
 package syscall
 
 const (
@@ -483,6 +485,10 @@ type BpfZbufHeader struct {
 	User_gen   uint32
 	X_bzh_pad  [5]uint32
 }
+
+const (
+	_AT_FDCWD = -0x64
+)
 
 type Termios struct {
 	Iflag  uint32

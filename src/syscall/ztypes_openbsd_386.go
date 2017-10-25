@@ -1,6 +1,8 @@
 // Created by cgo -godefs - DO NOT EDIT
 // cgo -godefs types_openbsd.go
 
+// +build 386,openbsd
+
 package syscall
 
 const (
@@ -427,6 +429,10 @@ type BpfTimeval struct {
 	Sec  uint32
 	Usec uint32
 }
+
+const (
+	_AT_FDCWD = -0x64
+)
 
 type Termios struct {
 	Iflag  uint32

@@ -1,6 +1,8 @@
 // Created by cgo -godefs - DO NOT EDIT
 // cgo -godefs types_dragonfly.go
 
+// +build amd64,dragonfly
+
 package syscall
 
 const (
@@ -429,6 +431,10 @@ type BpfHdr struct {
 	Hdrlen    uint16
 	Pad_cgo_0 [6]byte
 }
+
+const (
+	_AT_FDCWD = 0xfffafdcd
+)
 
 type Termios struct {
 	Iflag  uint32

@@ -1,6 +1,8 @@
 // Created by cgo -godefs - DO NOT EDIT
 // cgo -godefs types_netbsd.go
 
+// +build amd64,netbsd
+
 package syscall
 
 const (
@@ -376,6 +378,10 @@ type BpfTimeval struct {
 	Sec  int64
 	Usec int64
 }
+
+const (
+	_AT_FDCWD = -0x64
+)
 
 type Termios struct {
 	Iflag  uint32
