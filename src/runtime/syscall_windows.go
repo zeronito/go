@@ -1,4 +1,4 @@
-// Copyright 2014 The Go Authors.  All rights reserved.
+// Copyright 2014 The Go Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
@@ -25,36 +25,51 @@ func (c *wincallbackcontext) setCleanstack(cleanstack bool) {
 var (
 	cbs     callbacks
 	cbctxts **wincallbackcontext = &cbs.ctxt[0] // to simplify access to cbs.ctxt in sys_windows_*.s
-
-	callbackasm byte // type isn't really byte, it's code in runtime
 )
+
+func callbackasm()
 
 // callbackasmAddr returns address of runtime.callbackasm
 // function adjusted by i.
-// runtime.callbackasm is just a series of CALL instructions
-// (each is 5 bytes long), and we want callback to arrive at
+// On x86 and amd64, runtime.callbackasm is a series of CALL instructions,
+// and we want callback to arrive at
 // correspondent call instruction instead of start of
 // runtime.callbackasm.
+// On ARM, runtime.callbackasm is a series of mov and branch instructions.
+// R12 is loaded with the callback index. Each entry is two instructions,
+// hence 8 bytes.
 func callbackasmAddr(i int) uintptr {
-	return uintptr(add(unsafe.Pointer(&callbackasm), uintptr(i*5)))
+	var entrySize int
+	switch GOARCH {
+	default:
+		panic("unsupported architecture")
+	case "386", "amd64":
+		entrySize = 5
+	case "arm":
+		// On ARM, each entry is a MOV instruction
+		// followed by a branch instruction
+		entrySize = 8
+	}
+	return funcPC(callbackasm) + uintptr(i*entrySize)
 }
 
+//go:linkname compileCallback syscall.compileCallback
 func compileCallback(fn eface, cleanstack bool) (code uintptr) {
 	if fn._type == nil || (fn._type.kind&kindMask) != kindFunc {
-		panic("compilecallback: not a function")
+		panic("compileCallback: expected function with one uintptr-sized result")
 	}
 	ft := (*functype)(unsafe.Pointer(fn._type))
-	if len(ft.out) != 1 {
-		panic("compilecallback: function must have one output parameter")
+	if len(ft.out()) != 1 {
+		panic("compileCallback: expected function with one uintptr-sized result")
 	}
 	uintptrSize := unsafe.Sizeof(uintptr(0))
-	if t := (**_type)(unsafe.Pointer(&ft.out[0])); (*t).size != uintptrSize {
-		panic("compilecallback: output parameter size is wrong")
+	if ft.out()[0].size != uintptrSize {
+		panic("compileCallback: expected function with one uintptr-sized result")
 	}
 	argsize := uintptr(0)
-	for _, t := range (*[1024](*_type))(unsafe.Pointer(&ft.in[0]))[:len(ft.in)] {
-		if (*t).size > uintptrSize {
-			panic("compilecallback: input parameter size is wrong")
+	for _, t := range ft.in() {
+		if t.size > uintptrSize {
+			panic("compileCallback: argument size is larger than uintptr")
 		}
 		argsize += uintptrSize
 	}
@@ -69,7 +84,7 @@ func compileCallback(fn eface, cleanstack bool) (code uintptr) {
 		}
 	}
 	if n >= cb_max {
-		gothrow("too many callback functions")
+		throw("too many callback functions")
 	}
 
 	c := new(wincallbackcontext)
@@ -87,15 +102,37 @@ func compileCallback(fn eface, cleanstack bool) (code uintptr) {
 	return callbackasmAddr(n)
 }
 
-func getLoadLibrary() uintptr
+const _LOAD_LIBRARY_SEARCH_SYSTEM32 = 0x00000800
 
+//go:linkname syscall_loadsystemlibrary syscall.loadsystemlibrary
 //go:nosplit
-func syscall_loadlibrary(filename *uint16) (handle, err uintptr) {
-	var c libcall
-	c.fn = getLoadLibrary()
-	c.n = 1
-	c.args = uintptr(unsafe.Pointer(&filename))
-	cgocall_errno(unsafe.Pointer(funcPC(asmstdcall)), unsafe.Pointer(&c))
+func syscall_loadsystemlibrary(filename *uint16) (handle, err uintptr) {
+	lockOSThread()
+	defer unlockOSThread()
+	c := &getg().m.syscall
+
+	if useLoadLibraryEx {
+		c.fn = getLoadLibraryEx()
+		c.n = 3
+		args := struct {
+			lpFileName *uint16
+			hFile      uintptr // always 0
+			flags      uint32
+		}{filename, 0, _LOAD_LIBRARY_SEARCH_SYSTEM32}
+		c.args = uintptr(noescape(unsafe.Pointer(&args)))
+	} else {
+		// User doesn't have KB2533623 installed. The caller
+		// wanted to only load the filename DLL from the
+		// System32 directory but that facility doesn't exist,
+		// so just load it the normal way. This is a potential
+		// security risk, but so is not installing security
+		// updates.
+		c.fn = getLoadLibrary()
+		c.n = 1
+		c.args = uintptr(noescape(unsafe.Pointer(&filename)))
+	}
+
+	cgocall(asmstdcallAddr, unsafe.Pointer(c))
 	handle = c.r1
 	if handle == 0 {
 		err = c.err
@@ -103,15 +140,33 @@ func syscall_loadlibrary(filename *uint16) (handle, err uintptr) {
 	return
 }
 
-func getGetProcAddress() uintptr
+//go:linkname syscall_loadlibrary syscall.loadlibrary
+//go:nosplit
+func syscall_loadlibrary(filename *uint16) (handle, err uintptr) {
+	lockOSThread()
+	defer unlockOSThread()
+	c := &getg().m.syscall
+	c.fn = getLoadLibrary()
+	c.n = 1
+	c.args = uintptr(noescape(unsafe.Pointer(&filename)))
+	cgocall(asmstdcallAddr, unsafe.Pointer(c))
+	handle = c.r1
+	if handle == 0 {
+		err = c.err
+	}
+	return
+}
 
+//go:linkname syscall_getprocaddress syscall.getprocaddress
 //go:nosplit
 func syscall_getprocaddress(handle uintptr, procname *byte) (outhandle, err uintptr) {
-	var c libcall
+	lockOSThread()
+	defer unlockOSThread()
+	c := &getg().m.syscall
 	c.fn = getGetProcAddress()
 	c.n = 2
-	c.args = uintptr(unsafe.Pointer(&handle))
-	cgocall_errno(unsafe.Pointer(funcPC(asmstdcall)), unsafe.Pointer(&c))
+	c.args = uintptr(noescape(unsafe.Pointer(&handle)))
+	cgocall(asmstdcallAddr, unsafe.Pointer(c))
 	outhandle = c.r1
 	if outhandle == 0 {
 		err = c.err
@@ -119,52 +174,80 @@ func syscall_getprocaddress(handle uintptr, procname *byte) (outhandle, err uint
 	return
 }
 
+//go:linkname syscall_Syscall syscall.Syscall
 //go:nosplit
 func syscall_Syscall(fn, nargs, a1, a2, a3 uintptr) (r1, r2, err uintptr) {
-	var c libcall
+	lockOSThread()
+	defer unlockOSThread()
+	c := &getg().m.syscall
 	c.fn = fn
 	c.n = nargs
-	c.args = uintptr(unsafe.Pointer(&a1))
-	cgocall_errno(unsafe.Pointer(funcPC(asmstdcall)), unsafe.Pointer(&c))
+	c.args = uintptr(noescape(unsafe.Pointer(&a1)))
+	cgocall(asmstdcallAddr, unsafe.Pointer(c))
 	return c.r1, c.r2, c.err
 }
 
+//go:linkname syscall_Syscall6 syscall.Syscall6
 //go:nosplit
 func syscall_Syscall6(fn, nargs, a1, a2, a3, a4, a5, a6 uintptr) (r1, r2, err uintptr) {
-	var c libcall
+	lockOSThread()
+	defer unlockOSThread()
+	c := &getg().m.syscall
 	c.fn = fn
 	c.n = nargs
-	c.args = uintptr(unsafe.Pointer(&a1))
-	cgocall_errno(unsafe.Pointer(funcPC(asmstdcall)), unsafe.Pointer(&c))
+	c.args = uintptr(noescape(unsafe.Pointer(&a1)))
+	cgocall(asmstdcallAddr, unsafe.Pointer(c))
 	return c.r1, c.r2, c.err
 }
 
+//go:linkname syscall_Syscall9 syscall.Syscall9
 //go:nosplit
 func syscall_Syscall9(fn, nargs, a1, a2, a3, a4, a5, a6, a7, a8, a9 uintptr) (r1, r2, err uintptr) {
-	var c libcall
+	lockOSThread()
+	defer unlockOSThread()
+	c := &getg().m.syscall
 	c.fn = fn
 	c.n = nargs
-	c.args = uintptr(unsafe.Pointer(&a1))
-	cgocall_errno(unsafe.Pointer(funcPC(asmstdcall)), unsafe.Pointer(&c))
+	c.args = uintptr(noescape(unsafe.Pointer(&a1)))
+	cgocall(asmstdcallAddr, unsafe.Pointer(c))
 	return c.r1, c.r2, c.err
 }
 
+//go:linkname syscall_Syscall12 syscall.Syscall12
 //go:nosplit
 func syscall_Syscall12(fn, nargs, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12 uintptr) (r1, r2, err uintptr) {
-	var c libcall
+	lockOSThread()
+	defer unlockOSThread()
+	c := &getg().m.syscall
 	c.fn = fn
 	c.n = nargs
-	c.args = uintptr(unsafe.Pointer(&a1))
-	cgocall_errno(unsafe.Pointer(funcPC(asmstdcall)), unsafe.Pointer(&c))
+	c.args = uintptr(noescape(unsafe.Pointer(&a1)))
+	cgocall(asmstdcallAddr, unsafe.Pointer(c))
 	return c.r1, c.r2, c.err
 }
 
+//go:linkname syscall_Syscall15 syscall.Syscall15
 //go:nosplit
 func syscall_Syscall15(fn, nargs, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15 uintptr) (r1, r2, err uintptr) {
-	var c libcall
+	lockOSThread()
+	defer unlockOSThread()
+	c := &getg().m.syscall
 	c.fn = fn
 	c.n = nargs
-	c.args = uintptr(unsafe.Pointer(&a1))
-	cgocall_errno(unsafe.Pointer(funcPC(asmstdcall)), unsafe.Pointer(&c))
+	c.args = uintptr(noescape(unsafe.Pointer(&a1)))
+	cgocall(asmstdcallAddr, unsafe.Pointer(c))
+	return c.r1, c.r2, c.err
+}
+
+//go:linkname syscall_Syscall18 syscall.Syscall18
+//go:nosplit
+func syscall_Syscall18(fn, nargs, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15, a16, a17, a18 uintptr) (r1, r2, err uintptr) {
+	lockOSThread()
+	defer unlockOSThread()
+	c := &getg().m.syscall
+	c.fn = fn
+	c.n = nargs
+	c.args = uintptr(noescape(unsafe.Pointer(&a1)))
+	cgocall(asmstdcallAddr, unsafe.Pointer(c))
 	return c.r1, c.r2, c.err
 }

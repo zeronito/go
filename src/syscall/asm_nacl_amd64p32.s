@@ -16,7 +16,7 @@
 #define NACL_SYSJMP(code) \
 	MOVL $(0x10000 + ((code)<<5)), AX; JMP AX
 
-TEXT syscall·Syscall(SB),NOSPLIT,$0-28
+TEXT ·Syscall(SB),NOSPLIT,$0-28
 	CALL	runtime·entersyscall(SB)
 	MOVL	trap+0(FP), AX
 	MOVL	a1+4(FP), DI
@@ -39,4 +39,4 @@ ok:
 	MOVL	DX, r2+20(FP)
 	MOVL	$0, err+24(FP)
 	CALL	runtime·exitsyscall(SB)
-	RET	
+	RET

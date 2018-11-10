@@ -8,18 +8,17 @@
 
 package big
 
+import "math/bits"
+
 // A Word represents a single digit of a multi-precision unsigned integer.
-type Word uintptr
+type Word uint
 
 const (
-	// Compute the size _S of a Word in bytes.
-	_m    = ^Word(0)
-	_logS = _m>>8&1 + _m>>16&1 + _m>>32&1
-	_S    = 1 << _logS
+	_S = _W / 8 // word size in bytes
 
-	_W = _S << 3 // word size in bits
-	_B = 1 << _W // digit base
-	_M = _B - 1  // digit mask
+	_W = bits.UintSize // word size in bits
+	_B = 1 << _W       // digit base
+	_M = _B - 1        // digit mask
 
 	_W2 = _W / 2   // half word size in bits
 	_B2 = 1 << _W2 // half digit base
@@ -70,56 +69,27 @@ func mulWW_g(x, y Word) (z1, z0 Word) {
 
 // z1<<_W + z0 = x*y + c
 func mulAddWWW_g(x, y, c Word) (z1, z0 Word) {
-	z1, zz0 := mulWW(x, y)
+	z1, zz0 := mulWW_g(x, y)
 	if z0 = zz0 + c; z0 < zz0 {
 		z1++
 	}
 	return
 }
 
-// Length of x in bits.
-func bitLen_g(x Word) (n int) {
-	for ; x >= 0x8000; x >>= 16 {
-		n += 16
-	}
-	if x >= 0x80 {
-		x >>= 8
-		n += 8
-	}
-	if x >= 0x8 {
-		x >>= 4
-		n += 4
-	}
-	if x >= 0x2 {
-		x >>= 2
-		n += 2
-	}
-	if x >= 0x1 {
-		n++
-	}
-	return
+// nlz returns the number of leading zeros in x.
+// Wraps bits.LeadingZeros call for convenience.
+func nlz(x Word) uint {
+	return uint(bits.LeadingZeros(uint(x)))
 }
 
-// log2 computes the integer binary logarithm of x.
-// The result is the integer n for which 2^n <= x < 2^(n+1).
-// If x == 0, the result is -1.
-func log2(x Word) int {
-	return bitLen(x) - 1
-}
-
-// Number of leading zeros in x.
-func leadingZeros(x Word) uint {
-	return uint(_W - bitLen(x))
-}
-
-// q = (u1<<_W + u0 - r)/y
+// q = (u1<<_W + u0 - r)/v
 // Adapted from Warren, Hacker's Delight, p. 152.
 func divWW_g(u1, u0, v Word) (q, r Word) {
 	if u1 >= v {
 		return 1<<_W - 1, 1<<_W - 1
 	}
 
-	s := leadingZeros(v)
+	s := nlz(v)
 	v <<= s
 
 	vn1 := v >> _W2
@@ -154,32 +124,81 @@ func divWW_g(u1, u0, v Word) (q, r Word) {
 	return q1*_B2 + q0, (un21*_B2 + un0 - q0*v) >> s
 }
 
+// Keep for performance debugging.
+// Using addWW_g is likely slower.
+const use_addWW_g = false
+
+// The resulting carry c is either 0 or 1.
 func addVV_g(z, x, y []Word) (c Word) {
-	for i := range z {
-		c, z[i] = addWW_g(x[i], y[i], c)
+	if use_addWW_g {
+		for i := range z {
+			c, z[i] = addWW_g(x[i], y[i], c)
+		}
+		return
+	}
+
+	for i, xi := range x[:len(z)] {
+		yi := y[i]
+		zi := xi + yi + c
+		z[i] = zi
+		// see "Hacker's Delight", section 2-12 (overflow detection)
+		c = (xi&yi | (xi|yi)&^zi) >> (_W - 1)
 	}
 	return
 }
 
+// The resulting carry c is either 0 or 1.
 func subVV_g(z, x, y []Word) (c Word) {
-	for i := range z {
-		c, z[i] = subWW_g(x[i], y[i], c)
+	if use_addWW_g {
+		for i := range z {
+			c, z[i] = subWW_g(x[i], y[i], c)
+		}
+		return
+	}
+
+	for i, xi := range x[:len(z)] {
+		yi := y[i]
+		zi := xi - yi - c
+		z[i] = zi
+		// see "Hacker's Delight", section 2-12 (overflow detection)
+		c = (yi&^xi | (yi|^xi)&zi) >> (_W - 1)
 	}
 	return
 }
 
+// The resulting carry c is either 0 or 1.
 func addVW_g(z, x []Word, y Word) (c Word) {
+	if use_addWW_g {
+		c = y
+		for i := range z {
+			c, z[i] = addWW_g(x[i], c, 0)
+		}
+		return
+	}
+
 	c = y
-	for i := range z {
-		c, z[i] = addWW_g(x[i], c, 0)
+	for i, xi := range x[:len(z)] {
+		zi := xi + c
+		z[i] = zi
+		c = xi &^ zi >> (_W - 1)
 	}
 	return
 }
 
 func subVW_g(z, x []Word, y Word) (c Word) {
+	if use_addWW_g {
+		c = y
+		for i := range z {
+			c, z[i] = subWW_g(x[i], c, 0)
+		}
+		return
+	}
+
 	c = y
-	for i := range z {
-		c, z[i] = subWW_g(x[i], c, 0)
+	for i, xi := range x[:len(z)] {
+		zi := xi - c
+		z[i] = zi
+		c = (zi &^ xi) >> (_W - 1)
 	}
 	return
 }
@@ -222,6 +241,7 @@ func mulAddVWW_g(z, x []Word, y, r Word) (c Word) {
 	return
 }
 
+// TODO(gri) Remove use of addWW_g here and then we can remove addWW_g and subWW_g.
 func addMulVVW_g(z, x []Word, y Word) (c Word) {
 	for i := range z {
 		z1, z0 := mulAddWWW_g(x[i], y, z[i])

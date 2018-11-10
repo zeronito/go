@@ -6,35 +6,15 @@ package syscall
 
 import "unsafe"
 
-func Getpagesize() int { return 4096 }
-
-func TimespecToNsec(ts Timespec) int64 { return int64(ts.Sec)*1e9 + int64(ts.Nsec) }
-
-func NsecToTimespec(nsec int64) (ts Timespec) {
-	ts.Sec = int32(nsec / 1e9)
-	ts.Nsec = int32(nsec % 1e9)
-	return
+func setTimespec(sec, nsec int64) Timespec {
+	return Timespec{Sec: int32(sec), Nsec: int32(nsec)}
 }
 
-func TimevalToNsec(tv Timeval) int64 { return int64(tv.Sec)*1e9 + int64(tv.Usec)*1e3 }
-
-func NsecToTimeval(nsec int64) (tv Timeval) {
-	nsec += 999 // round up to microsecond
-	tv.Usec = int32(nsec % 1e9 / 1e3)
-	tv.Sec = int32(nsec / 1e9)
-	return
+func setTimeval(sec, usec int64) Timeval {
+	return Timeval{Sec: int32(sec), Usec: int32(usec)}
 }
 
-//sysnb	gettimeofday(tp *Timeval) (sec int32, usec int32, err error)
-func Gettimeofday(tv *Timeval) (err error) {
-	// The tv passed to gettimeofday must be non-nil
-	// but is otherwise unused.  The answers come back
-	// in the two registers.
-	sec, usec, err := gettimeofday(tv)
-	tv.Sec = int32(sec)
-	tv.Usec = int32(usec)
-	return err
-}
+//sysnb	Gettimeofday(tp *Timeval) (err error)
 
 func SetKevent(k *Kevent_t, fd, mode, flags int) {
 	k.Ident = uint32(fd)
@@ -57,7 +37,7 @@ func (cmsg *Cmsghdr) SetLen(length int) {
 func sendfile(outfd int, infd int, offset *int64, count int) (written int, err error) {
 	var length = uint64(count)
 
-	_, _, e1 := Syscall9(SYS_SENDFILE, uintptr(infd), uintptr(outfd), uintptr(*offset), uintptr(*offset>>32), uintptr(unsafe.Pointer(&length)), 0, 0, 0, 0)
+	_, _, e1 := Syscall9(funcPC(libc_sendfile_trampoline), uintptr(infd), uintptr(outfd), uintptr(*offset), uintptr(*offset>>32), uintptr(unsafe.Pointer(&length)), 0, 0, 0, 0)
 
 	written = int(length)
 
@@ -66,5 +46,13 @@ func sendfile(outfd int, infd int, offset *int64, count int) (written int, err e
 	}
 	return
 }
+
+func libc_sendfile_trampoline()
+
+//go:linkname libc_sendfile libc_sendfile
+//go:cgo_import_dynamic libc_sendfile sendfile "/usr/lib/libSystem.B.dylib"
+
+// Implemented in the runtime package (runtime/sys_darwin_32.go)
+func syscall9(fn, a1, a2, a3, a4, a5, a6, a7, a8, a9 uintptr) (r1, r2 uintptr, err Errno)
 
 func Syscall9(num, a1, a2, a3, a4, a5, a6, a7, a8, a9 uintptr) (r1, r2 uintptr, err Errno) // sic

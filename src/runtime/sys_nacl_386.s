@@ -2,7 +2,8 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-#include "zasm_GOOS_GOARCH.h"
+#include "go_asm.h"
+#include "go_tls.h"
 #include "textflag.h"
 #include "syscall_nacl.h"
 
@@ -15,11 +16,13 @@ TEXT runtime·exit(SB),NOSPLIT,$4
 	NACL_SYSCALL(SYS_exit)
 	JMP 0(PC)
 
-TEXT runtime·exit1(SB),NOSPLIT,$4
-	MOVL code+0(FP), AX
+// func exitThread(wait *uint32)
+TEXT runtime·exitThread(SB),NOSPLIT,$4-4
+	MOVL wait+0(FP), AX
+	// SYS_thread_exit will clear *wait when the stack is free.
 	MOVL AX, 0(SP)
 	NACL_SYSCALL(SYS_thread_exit)
-	RET
+	JMP 0(PC)
 
 TEXT runtime·open(SB),NOSPLIT,$12
 	MOVL name+0(FP), AX
@@ -32,7 +35,7 @@ TEXT runtime·open(SB),NOSPLIT,$12
 	MOVL AX, ret+12(FP)
 	RET
 
-TEXT runtime·close(SB),NOSPLIT,$4
+TEXT runtime·closefd(SB),NOSPLIT,$4
 	MOVL fd+0(FP), AX
 	MOVL AX, 0(SP)
 	NACL_SYSCALL(SYS_close)
@@ -226,10 +229,18 @@ TEXT runtime·mmap(SB),NOSPLIT,$32
 	LEAL	24(SP), AX
 	MOVL	AX, 20(SP)
 	NACL_SYSCALL(SYS_mmap)
-	MOVL	AX, ret+24(FP)
+	CMPL	AX, $-4095
+	JNA	ok
+	NEGL	AX
+	MOVL	$0, p+24(FP)
+	MOVL	AX, err+28(FP)
+	RET
+ok:
+	MOVL	AX, p+24(FP)
+	MOVL	$0, err+28(FP)
 	RET
 
-TEXT time·now(SB),NOSPLIT,$20
+TEXT runtime·walltime(SB),NOSPLIT,$20
 	MOVL $0, 0(SP) // real time clock
 	LEAL 8(SP), AX
 	MOVL AX, 4(SP) // timespec
@@ -239,13 +250,13 @@ TEXT time·now(SB),NOSPLIT,$20
 	MOVL 16(SP), BX // nsec
 
 	// sec is in AX, nsec in BX
-	MOVL	AX, sec+0(FP)
-	MOVL	CX, sec+4(FP)
+	MOVL	AX, sec_lo+0(FP)
+	MOVL	CX, sec_hi+4(FP)
 	MOVL	BX, nsec+8(FP)
 	RET
 
 TEXT syscall·now(SB),NOSPLIT,$0
-	JMP time·now(SB)
+	JMP runtime·walltime(SB)
 
 TEXT runtime·nacl_clock_gettime(SB),NOSPLIT,$8
 	MOVL arg1+0(FP), AX
@@ -255,7 +266,7 @@ TEXT runtime·nacl_clock_gettime(SB),NOSPLIT,$8
 	NACL_SYSCALL(SYS_clock_gettime)
 	MOVL AX, ret+8(FP)
 	RET
-	
+
 TEXT runtime·nanotime(SB),NOSPLIT,$20
 	MOVL $0, 0(SP) // real time clock
 	LEAL 8(SP), AX
@@ -297,12 +308,12 @@ TEXT runtime·sigtramp(SB),NOSPLIT,$0
 
 	// save g
 	MOVL	DI, 20(SP)
-	
+
 	// g = m->gsignal
 	MOVL	g_m(DI), BX
 	MOVL	m_gsignal(BX), BX
 	MOVL	BX, g(CX)
-	
+
 	// copy arguments for sighandler
 	MOVL	$11, 0(SP) // signal
 	MOVL	$0, 4(SP) // siginfo
@@ -321,7 +332,7 @@ ret:
 	// Enable exceptions again.
 	NACL_SYSCALL(SYS_exception_clear_flag)
 
-	// NaCl has abidcated its traditional operating system responsibility
+	// NaCl has abdicated its traditional operating system responsibility
 	// and declined to implement 'sigreturn'. Instead the only way to return
 	// to the execution of our program is to restore the registers ourselves.
 	// Unfortunately, that is impossible to do with strict fidelity, because
@@ -345,7 +356,7 @@ ret:
 	// Today those registers are just PC and SP, but in case additional registers
 	// are relevant in the future (for example DX is the Go func context register)
 	// we restore as many registers as possible.
-	// 
+	//
 	// We smash BP, because that's what the linker smashes during RET.
 	//
 	LEAL	ctxt+4(FP), BP
@@ -361,3 +372,12 @@ ret:
 	// 36(BP) is saved EFLAGS, never to be seen again
 	MOVL	32(BP), BP // saved PC
 	JMP	BP
+
+// func getRandomData([]byte)
+TEXT runtime·getRandomData(SB),NOSPLIT,$8-12
+	MOVL arg_base+0(FP), AX
+	MOVL AX, 0(SP)
+	MOVL arg_len+4(FP), AX
+	MOVL AX, 4(SP)
+	NACL_SYSCALL(SYS_get_random_bytes)
+	RET

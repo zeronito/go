@@ -16,7 +16,7 @@
 #define NACL_SYSJMP(code) \
 	MOVW $(0x10000 + ((code)<<5)), R8; B (R8)
 
-TEXT syscall·Syscall(SB),NOSPLIT,$0-28
+TEXT ·Syscall(SB),NOSPLIT,$0-28
 	BL	runtime·entersyscall(SB)
 	MOVW	trap+0(FP), R8
 	MOVW	a1+4(FP), R0
@@ -41,4 +41,4 @@ ok:
 	MOVW	$0, R2
 	MOVW	R2, err+24(FP)
 	BL	runtime·exitsyscall(SB)
-	RET	
+	RET

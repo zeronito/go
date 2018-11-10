@@ -6,7 +6,8 @@
 // /usr/src/sys/kern/syscalls.master for syscall numbers.
 //
 
-#include "zasm_GOOS_GOARCH.h"
+#include "go_asm.h"
+#include "go_tls.h"
 #include "textflag.h"
 
 #define	CLOCK_MONOTONIC	$3
@@ -18,36 +19,42 @@ TEXT runtime·exit(SB),NOSPLIT,$-4
 	MOVL	$0xf1, 0xf1		// crash
 	RET
 
-TEXT runtime·exit1(SB),NOSPLIT,$8
-	MOVL	$0, 0(SP)
-	MOVL	$0, 4(SP)		// arg 1 - notdead
+// func exitThread(wait *uint32)
+TEXT runtime·exitThread(SB),NOSPLIT,$0-4
 	MOVL	$302, AX		// sys___threxit
 	INT	$0x80
-	JAE	2(PC)
 	MOVL	$0xf1, 0xf1		// crash
-	RET
+	JMP	0(PC)
 
 TEXT runtime·open(SB),NOSPLIT,$-4
 	MOVL	$5, AX
 	INT	$0x80
+	JAE	2(PC)
+	MOVL	$-1, AX
 	MOVL	AX, ret+12(FP)
 	RET
 
-TEXT runtime·close(SB),NOSPLIT,$-4
+TEXT runtime·closefd(SB),NOSPLIT,$-4
 	MOVL	$6, AX
 	INT	$0x80
+	JAE	2(PC)
+	MOVL	$-1, AX
 	MOVL	AX, ret+4(FP)
 	RET
 
 TEXT runtime·read(SB),NOSPLIT,$-4
 	MOVL	$3, AX
 	INT	$0x80
+	JAE	2(PC)
+	MOVL	$-1, AX
 	MOVL	AX, ret+12(FP)
 	RET
 
 TEXT runtime·write(SB),NOSPLIT,$-4
 	MOVL	$4, AX			// sys_write
 	INT	$0x80
+	JAE	2(PC)
+	MOVL	$-1, AX
 	MOVL	AX, ret+12(FP)
 	RET
 
@@ -70,14 +77,26 @@ TEXT runtime·usleep(SB),NOSPLIT,$24
 	INT	$0x80
 	RET
 
-TEXT runtime·raise(SB),NOSPLIT,$12
+TEXT runtime·raise(SB),NOSPLIT,$16
 	MOVL	$299, AX		// sys_getthrid
+	INT	$0x80
+	MOVL	$0, 0(SP)
+	MOVL	AX, 4(SP)		// arg 1 - tid
+	MOVL	sig+0(FP), AX
+	MOVL	AX, 8(SP)		// arg 2 - signum
+	MOVL	$0, 12(SP)		// arg 3 - tcb
+	MOVL	$119, AX		// sys_thrkill
+	INT	$0x80
+	RET
+
+TEXT runtime·raiseproc(SB),NOSPLIT,$12
+	MOVL	$20, AX			// sys_getpid
 	INT	$0x80
 	MOVL	$0, 0(SP)
 	MOVL	AX, 4(SP)		// arg 1 - pid
 	MOVL	sig+0(FP), AX
 	MOVL	AX, 8(SP)		// arg 2 - signum
-	MOVL	$37, AX			// sys_kill
+	MOVL	$122, AX		// sys_kill
 	INT	$0x80
 	RET
 
@@ -97,7 +116,13 @@ TEXT runtime·mmap(SB),NOSPLIT,$36
 	STOSL
 	MOVL	$197, AX		// sys_mmap
 	INT	$0x80
-	MOVL	AX, ret+24(FP)
+	JAE	ok
+	MOVL	$0, p+24(FP)
+	MOVL	AX, err+28(FP)
+	RET
+ok:
+	MOVL	AX, p+24(FP)
+	MOVL	$0, err+28(FP)
 	RET
 
 TEXT runtime·munmap(SB),NOSPLIT,$-4
@@ -111,7 +136,8 @@ TEXT runtime·madvise(SB),NOSPLIT,$-4
 	MOVL	$75, AX			// sys_madvise
 	INT	$0x80
 	JAE	2(PC)
-	MOVL	$0xf1, 0xf1		// crash
+	MOVL	$-1, AX
+	MOVL	AX, ret+12(FP)
 	RET
 
 TEXT runtime·setitimer(SB),NOSPLIT,$-4
@@ -119,8 +145,8 @@ TEXT runtime·setitimer(SB),NOSPLIT,$-4
 	INT	$0x80
 	RET
 
-// func now() (sec int64, nsec int32)
-TEXT time·now(SB), NOSPLIT, $32
+// func walltime() (sec int64, nsec int32)
+TEXT runtime·walltime(SB), NOSPLIT, $32
 	LEAL	12(SP), BX
 	MOVL	$0, 4(SP)		// arg 1 - clock_id
 	MOVL	BX, 8(SP)		// arg 2 - tp
@@ -128,9 +154,9 @@ TEXT time·now(SB), NOSPLIT, $32
 	INT	$0x80
 
 	MOVL	12(SP), AX		// sec - l32
-	MOVL	AX, sec+0(FP)
+	MOVL	AX, sec_lo+0(FP)
 	MOVL	16(SP), AX		// sec - h32
-	MOVL	AX, sec+4(FP)
+	MOVL	AX, sec_hi+4(FP)
 
 	MOVL	20(SP), BX		// nsec
 	MOVL	BX, nsec+8(FP)
@@ -167,7 +193,7 @@ TEXT runtime·sigaction(SB),NOSPLIT,$-4
 	MOVL	$0xf1, 0xf1		// crash
 	RET
 
-TEXT runtime·sigprocmask(SB),NOSPLIT,$-4
+TEXT runtime·obsdsigprocmask(SB),NOSPLIT,$-4
 	MOVL	$48, AX			// sys_sigprocmask
 	INT	$0x80
 	JAE	2(PC)
@@ -175,51 +201,44 @@ TEXT runtime·sigprocmask(SB),NOSPLIT,$-4
 	MOVL	AX, ret+8(FP)
 	RET
 
-TEXT runtime·sigtramp(SB),NOSPLIT,$44
-	get_tls(CX)
-
-	// check that g exists
-	MOVL	g(CX), DI
-	CMPL	DI, $0
-	JNE	6(PC)
-	MOVL	signo+0(FP), BX
+TEXT runtime·sigfwd(SB),NOSPLIT,$12-16
+	MOVL	fn+0(FP), AX
+	MOVL	sig+4(FP), BX
+	MOVL	info+8(FP), CX
+	MOVL	ctx+12(FP), DX
+	MOVL	SP, SI
+	SUBL	$32, SP
+	ANDL	$~15, SP	// align stack: handler might be a C function
 	MOVL	BX, 0(SP)
-	MOVL	$runtime·badsignal(SB), AX
+	MOVL	CX, 4(SP)
+	MOVL	DX, 8(SP)
+	MOVL	SI, 12(SP)	// save SI: handler might be a Go function
 	CALL	AX
-	JMP 	ret
+	MOVL	12(SP), AX
+	MOVL	AX, SP
+	RET
 
-	// save g
-	MOVL	DI, 20(SP)
-	
-	// g = m->gsignal
-	MOVL	g_m(DI), BX
-	MOVL	m_gsignal(BX), BX
-	MOVL	BX, g(CX)
+TEXT runtime·sigtramp(SB),NOSPLIT,$28
+	// Save callee-saved C registers, since the caller may be a C signal handler.
+	MOVL	BX, bx-4(SP)
+	MOVL	BP, bp-8(SP)
+	MOVL	SI, si-12(SP)
+	MOVL	DI, di-16(SP)
+	// We don't save mxcsr or the x87 control word because sigtrampgo doesn't
+	// modify them.
 
-	// copy arguments for call to sighandler
 	MOVL	signo+0(FP), BX
 	MOVL	BX, 0(SP)
 	MOVL	info+4(FP), BX
 	MOVL	BX, 4(SP)
 	MOVL	context+8(FP), BX
 	MOVL	BX, 8(SP)
-	MOVL	DI, 12(SP)
+	CALL	runtime·sigtrampgo(SB)
 
-	CALL	runtime·sighandler(SB)
-
-	// restore g
-	get_tls(CX)
-	MOVL	20(SP), BX
-	MOVL	BX, g(CX)
-
-ret:
-	// call sigreturn
-	MOVL	context+8(FP), AX
-	MOVL	$0, 0(SP)		// syscall gap
-	MOVL	AX, 4(SP)		// arg 1 - sigcontext
-	MOVL	$103, AX		// sys_sigreturn
-	INT	$0x80
-	MOVL	$0xf1, 0xf1		// crash
+	MOVL	di-16(SP), DI
+	MOVL	si-12(SP), SI
+	MOVL	bp-8(SP),  BP
+	MOVL	bx-4(SP),  BX
 	RET
 
 // int32 tfork(void *param, uintptr psize, M *mp, G *gp, void (*fn)(void));
@@ -276,8 +295,8 @@ TEXT runtime·tfork(SB),NOSPLIT,$12
 	CALL	runtime·settls(SB)
 	POPL	AX
 	POPAL
-	
-	// Now segment is established.  Initialize m, g.
+
+	// Now segment is established. Initialize m, g.
 	get_tls(AX)
 	MOVL	DX, g(AX)
 	MOVL	BX, g_m(DX)
@@ -294,14 +313,14 @@ TEXT runtime·tfork(SB),NOSPLIT,$12
 	// Call fn.
 	CALL	SI
 
-	CALL	runtime·exit1(SB)
+	// fn should never return.
 	MOVL	$0x1234, 0x1005
 	RET
 
 TEXT runtime·sigaltstack(SB),NOSPLIT,$-8
 	MOVL	$288, AX		// sys_sigaltstack
-	MOVL	new+4(SP), BX
-	MOVL	old+8(SP), CX
+	MOVL	new+0(FP), BX
+	MOVL	old+4(FP), CX
 	INT	$0x80
 	CMPL	AX, $0xfffff001
 	JLS	2(PC)
@@ -316,9 +335,9 @@ TEXT runtime·setldt(SB),NOSPLIT,$4
 	RET
 
 TEXT runtime·settls(SB),NOSPLIT,$8
-	// adjust for ELF: wants to use -8(GS) and -4(GS) for g and m
+	// adjust for ELF: wants to use -4(GS) for g
 	MOVL	tlsbase+0(FP), CX
-	ADDL	$8, CX
+	ADDL	$4, CX
 	MOVL	$0, 0(SP)		// syscall gap
 	MOVL	CX, 4(SP)		// arg 1 - tcb
 	MOVL	$329, AX		// sys___set_tcb

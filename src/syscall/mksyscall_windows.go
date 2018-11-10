@@ -22,7 +22,7 @@ like func declarations if //sys is replaced by func, but:
 
 * If the return parameter is an error number, it must be named err.
 
-* If go func name needs to be different from it's winapi dll name,
+* If go func name needs to be different from its winapi dll name,
   the winapi name could be specified at the end, after "=" sign, like
   //sys LoadLibrary(libname string) (handle uint32, err error) = LoadLibraryA
 
@@ -37,6 +37,8 @@ Usage:
 	mksyscall_windows [flags] [path ...]
 
 The flags are:
+	-output
+		Specify output file name (outputs to console if blank).
 	-trace
 		Generate print statement after every syscall.
 */
@@ -44,20 +46,30 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"errors"
 	"flag"
 	"fmt"
+	"go/format"
 	"go/parser"
 	"go/token"
 	"io"
+	"io/ioutil"
 	"log"
 	"os"
+	"path/filepath"
+	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"text/template"
 )
 
-var PrintTraceFlag = flag.Bool("trace", false, "generate print statement after every syscall")
+var (
+	filename       = flag.String("output", "", "output file name (standard output if omitted)")
+	printTraceFlag = flag.Bool("trace", false, "generate print statement after every syscall")
+	systemDLL      = flag.Bool("systemdll", true, "whether all DLLs should be loaded from the Windows system directory")
+)
 
 func trim(s string) string {
 	return strings.Trim(s, " \t")
@@ -269,7 +281,7 @@ func (r *Rets) SetReturnValuesCode() string {
 func (r *Rets) useLongHandleErrorCode(retvar string) string {
 	const code = `if %s {
 		if e1 != 0 {
-			err = error(e1)
+			err = errnoErr(e1)
 		} else {
 			err = %sEINVAL
 		}
@@ -379,7 +391,7 @@ func newFn(s string) (*Fn, error) {
 	f := &Fn{
 		Rets:       &Rets{},
 		src:        s,
-		PrintTrace: *PrintTraceFlag,
+		PrintTrace: *printTraceFlag,
 	}
 	// function name and args
 	prefix, body, s, found := extractSection(s, '(', ')')
@@ -585,17 +597,33 @@ func (f *Fn) HelperName() string {
 
 // Source files and functions.
 type Source struct {
-	Funcs []*Fn
-	Files []string
+	Funcs           []*Fn
+	Files           []string
+	StdLibImports   []string
+	ExternalImports []string
+}
+
+func (src *Source) Import(pkg string) {
+	src.StdLibImports = append(src.StdLibImports, pkg)
+	sort.Strings(src.StdLibImports)
+}
+
+func (src *Source) ExternalImport(pkg string) {
+	src.ExternalImports = append(src.ExternalImports, pkg)
+	sort.Strings(src.ExternalImports)
 }
 
 // ParseFiles parses files listed in fs and extracts all syscall
-// functions listed in  sys comments. It returns source files
+// functions listed in sys comments. It returns source files
 // and functions collection *Source if successful.
 func ParseFiles(fs []string) (*Source, error) {
 	src := &Source{
 		Funcs: make([]*Fn, 0),
 		Files: make([]string, 0),
+		StdLibImports: []string{
+			"unsafe",
+		},
+		ExternalImports: make([]string, 0),
 	}
 	for _, file := range fs {
 		if err := src.ParseFile(file); err != nil {
@@ -619,7 +647,7 @@ func (src *Source) DLLs() []string {
 	return r
 }
 
-// ParseFile adds adition file path to a source set src.
+// ParseFile adds additional file path to a source set src.
 func (src *Source) ParseFile(path string) error {
 	file, err := os.Open(path)
 	if err != nil {
@@ -666,14 +694,80 @@ func (src *Source) ParseFile(path string) error {
 	return nil
 }
 
+// IsStdRepo reports whether src is part of standard library.
+func (src *Source) IsStdRepo() (bool, error) {
+	if len(src.Files) == 0 {
+		return false, errors.New("no input files provided")
+	}
+	abspath, err := filepath.Abs(src.Files[0])
+	if err != nil {
+		return false, err
+	}
+	goroot := runtime.GOROOT()
+	if runtime.GOOS == "windows" {
+		abspath = strings.ToLower(abspath)
+		goroot = strings.ToLower(goroot)
+	}
+	sep := string(os.PathSeparator)
+	if !strings.HasSuffix(goroot, sep) {
+		goroot += sep
+	}
+	return strings.HasPrefix(abspath, goroot), nil
+}
+
 // Generate output source file from a source set src.
 func (src *Source) Generate(w io.Writer) error {
+	const (
+		pkgStd         = iota // any package in std library
+		pkgXSysWindows        // x/sys/windows package
+		pkgOther
+	)
+	isStdRepo, err := src.IsStdRepo()
+	if err != nil {
+		return err
+	}
+	var pkgtype int
+	switch {
+	case isStdRepo:
+		pkgtype = pkgStd
+	case packageName == "windows":
+		// TODO: this needs better logic than just using package name
+		pkgtype = pkgXSysWindows
+	default:
+		pkgtype = pkgOther
+	}
+	if *systemDLL {
+		switch pkgtype {
+		case pkgStd:
+			src.Import("internal/syscall/windows/sysdll")
+		case pkgXSysWindows:
+		default:
+			src.ExternalImport("golang.org/x/sys/windows")
+		}
+	}
+	if packageName != "syscall" {
+		src.Import("syscall")
+	}
 	funcMap := template.FuncMap{
-		"syscalldot":  syscalldot,
 		"packagename": packagename,
+		"syscalldot":  syscalldot,
+		"newlazydll": func(dll string) string {
+			arg := "\"" + dll + ".dll\""
+			if !*systemDLL {
+				return syscalldot() + "NewLazyDLL(" + arg + ")"
+			}
+			switch pkgtype {
+			case pkgStd:
+				return syscalldot() + "NewLazyDLL(sysdll.Add(" + arg + "))"
+			case pkgXSysWindows:
+				return "NewLazySystemDLL(" + arg + ")"
+			default:
+				return "windows.NewLazySystemDLL(" + arg + ")"
+			}
+		},
 	}
 	t := template.Must(template.New("main").Funcs(funcMap).Parse(srcTemplate))
-	err := t.Execute(w, src)
+	err = t.Execute(w, src)
 	if err != nil {
 		return errors.New("Failed to execute template: " + err.Error())
 	}
@@ -689,15 +783,31 @@ func usage() {
 func main() {
 	flag.Usage = usage
 	flag.Parse()
-	if len(os.Args) <= 1 {
+	if len(flag.Args()) <= 0 {
 		fmt.Fprintf(os.Stderr, "no files to parse provided\n")
 		usage()
 	}
-	src, err := ParseFiles(os.Args[1:])
+
+	src, err := ParseFiles(flag.Args())
 	if err != nil {
 		log.Fatal(err)
 	}
-	if err := src.Generate(os.Stdout); err != nil {
+
+	var buf bytes.Buffer
+	if err := src.Generate(&buf); err != nil {
+		log.Fatal(err)
+	}
+
+	data, err := format.Source(buf.Bytes())
+	if err != nil {
+		log.Fatal(err)
+	}
+	if *filename == "" {
+		_, err = os.Stdout.Write(data)
+	} else {
+		err = ioutil.WriteFile(*filename, data, 0644)
+	}
+	if err != nil {
 		log.Fatal(err)
 	}
 }
@@ -705,13 +815,44 @@ func main() {
 // TODO: use println instead to print in the following template
 const srcTemplate = `
 
-{{define "main"}}// go build mksyscall_windows.go && ./mksyscall_windows{{range .Files}} {{.}}{{end}}
-// MACHINE GENERATED BY THE COMMAND ABOVE; DO NOT EDIT
+{{define "main"}}// Code generated by 'go generate'; DO NOT EDIT.
 
 package {{packagename}}
 
-import "unsafe"{{if syscalldot}}
-import "syscall"{{end}}
+import (
+{{range .StdLibImports}}"{{.}}"
+{{end}}
+
+{{range .ExternalImports}}"{{.}}"
+{{end}}
+)
+
+var _ unsafe.Pointer
+
+// Do the interface allocations only once for common
+// Errno values.
+const (
+	errnoERROR_IO_PENDING = 997
+)
+
+var (
+	errERROR_IO_PENDING error = {{syscalldot}}Errno(errnoERROR_IO_PENDING)
+)
+
+// errnoErr returns common boxed Errno values, to prevent
+// allocations at runtime.
+func errnoErr(e {{syscalldot}}Errno) error {
+	switch e {
+	case 0:
+		return nil
+	case errnoERROR_IO_PENDING:
+		return errERROR_IO_PENDING
+	}
+	// TODO: add more here, after collecting data on the common
+	// error values see on Windows. (perhaps when running
+	// all.bat?)
+	return e
+}
 
 var (
 {{template "dlls" .}}
@@ -721,7 +862,7 @@ var (
 
 {{/* help functions */}}
 
-{{define "dlls"}}{{range .DLLs}}	mod{{.}} = {{syscalldot}}NewLazyDLL("{{.}}.dll")
+{{define "dlls"}}{{range .DLLs}}	mod{{.}} = {{newlazydll .}}
 {{end}}{{end}}
 
 {{define "funcnames"}}{{range .Funcs}}	proc{{.DLLFuncName}} = mod{{.DLLName}}.NewProc("{{.DLLFuncName}}")
