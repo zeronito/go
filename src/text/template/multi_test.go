@@ -242,11 +242,14 @@ func TestAddParseTree(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Add a new parse tree.
-	tree, err := parse.Parse("cloneText3", cloneText3, "", "", nil, builtins)
+	tree, err := parse.Parse("cloneText3", cloneText3, "", "", nil, builtins())
 	if err != nil {
 		t.Fatal(err)
 	}
 	added, err := root.AddParseTree("c", tree["c"])
+	if err != nil {
+		t.Fatal(err)
+	}
 	// Execute.
 	var b bytes.Buffer
 	err = added.ExecuteTemplate(&b, "a", 0)

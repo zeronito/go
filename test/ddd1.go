@@ -18,7 +18,7 @@ var (
 	_ = sum()
 	_ = sum(1.0, 2.0)
 	_ = sum(1.5)      // ERROR "integer"
-	_ = sum("hello")  // ERROR ".hello. .type string. as type int|incompatible"
+	_ = sum("hello")  // ERROR ".hello. .type untyped string. as type int|incompatible"
 	_ = sum([]int{1}) // ERROR "\[\]int literal.*as type int|incompatible"
 )
 
@@ -53,8 +53,7 @@ func bad(args ...int) {
 	_ = new(int...)	// ERROR "[.][.][.]"
 	n := 10
 	_ = make([]byte, n...)	// ERROR "[.][.][.]"
-	// TODO(rsc): enable after gofmt bug is fixed
-	//	_ = make([]byte, 10 ...)	// error "[.][.][.]"
+	_ = make([]byte, 10 ...)	// ERROR "[.][.][.]"
 	var x int
 	_ = unsafe.Pointer(&x...)	// ERROR "[.][.][.]"
 	_ = unsafe.Sizeof(x...)	// ERROR "[.][.][.]"
