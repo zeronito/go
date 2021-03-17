@@ -40,6 +40,42 @@ func NewTicker(d Duration) *Ticker {
 	return t
 }
 
+// NewTickerStartingAt returns a new Ticker containing a channel that
+// will send a time.Time on the channel after each tick.  Duration
+// specifies the period of the ticks, and start specifies the initial
+// tick time.  The ticker will adjust the time interval or drop ticks
+// to make up for slow receivers.  The duration d must be greater than
+// zero; if not, NewTicker will panic, and start is the time for the
+// first tick to fire.  If the start time has already passed, the
+// ticker will send instantly and then at every interval as if it
+// started at the start time.
+//
+// Note: Since this method calculates the duration until the start--
+// should the system get put to sleep or crosses a leap second, this
+// time may be off by a second or more.
+//
+// Stop the ticker to release associated resources.
+func NewTickerStartingAt(d Duration, start Time) *Ticker {
+	if d <= 0 {
+		panic(errors.New("non-positive interval for NewTickerStartingAt"))
+	}
+	// Give the channel a 1-element time buffer.
+	// If the client falls behind while reading, we drop ticks
+	// on the floor until the client catches up.
+	c := make(chan Time, 1)
+	t := &Ticker{
+		C: c,
+		r: runtimeTimer{
+			when:   startNano + int64(start.Sub(RuntimeStarted())),
+			period: int64(d),
+			f:      sendTime,
+			arg:    c,
+		},
+	}
+	startTimer(&t.r)
+	return t
+}
+
 // Stop turns off a ticker. After Stop, no more ticks will be sent.
 // Stop does not close the channel, to prevent a concurrent goroutine
 // reading from the channel from seeing an erroneous "tick".
