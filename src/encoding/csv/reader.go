@@ -16,8 +16,8 @@
 //
 // Carriage returns before newline characters are silently removed.
 //
-// Blank lines are ignored. A line with only whitespace characters (excluding
-// the ending newline character) is not considered a blank line.
+// Blank lines are ignored by default. A line with only whitespace characters
+// (excluding the ending newline character) is not considered a blank line.
 //
 // Fields which start and stop with the quote character " are called
 // quoted-fields. The beginning and ending quote are not part of the
@@ -142,6 +142,10 @@ type Reader struct {
 	// By default, each call to Read returns newly allocated memory owned by the caller.
 	ReuseRecord bool
 
+	// If InterpretBlankLines is true, blank lines are interpreted as a single empty field,
+	// the default is to skip these lines.
+	InterpretBlankLines bool
+
 	TrailingComma bool // Deprecated: No longer used.
 
 	r *bufio.Reader
@@ -259,7 +263,7 @@ func (r *Reader) readRecord(dst []string) ([]string, error) {
 		return nil, errInvalidDelim
 	}
 
-	// Read line (automatically skipping past empty lines and any comments).
+	// Read line. Automatically skip comments. Skip empty lines unless InterpretBlankLines is set.
 	var line, fullLine []byte
 	var errRead error
 	for errRead == nil {
@@ -268,7 +272,7 @@ func (r *Reader) readRecord(dst []string) ([]string, error) {
 			line = nil
 			continue // Skip comment lines
 		}
-		if errRead == nil && len(line) == lengthNL(line) {
+		if !r.InterpretBlankLines && errRead == nil && len(line) == lengthNL(line) {
 			line = nil
 			continue // Skip empty lines
 		}
