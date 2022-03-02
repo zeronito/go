@@ -97,12 +97,23 @@ func (littleEndian) GoString() string { return "binary.LittleEndian" }
 
 type bigEndian struct{}
 
+func (bigEndian) Int16(b []byte) int16 { //uint to int
+	_ = b[1]                            // bounds check hint to compiler; see golang.org/issue/14808
+	return int16(b[1]) | int16(b[0])<<8 //uint to int
+}
+
 func (bigEndian) Uint16(b []byte) uint16 {
 	_ = b[1] // bounds check hint to compiler; see golang.org/issue/14808
 	return uint16(b[1]) | uint16(b[0])<<8
 }
 
 func (bigEndian) PutUint16(b []byte, v uint16) {
+	_ = b[1] // early bounds check to guarantee safety of writes below
+	b[0] = byte(v >> 8)
+	b[1] = byte(v)
+}
+
+func (bigEndian) Putint16(b []byte, v int16) { //uint to int
 	_ = b[1] // early bounds check to guarantee safety of writes below
 	b[0] = byte(v >> 8)
 	b[1] = byte(v)
