@@ -704,6 +704,7 @@ func genFuncInfoSyms(ctxt *Link) {
 			Locals:   uint32(fn.Locals),
 			FuncID:   fn.FuncID,
 			FuncFlag: fn.FuncFlag,
+			PoolOff:  fn.PoolOff,
 		}
 		pc := &fn.Pcln
 		i := 0

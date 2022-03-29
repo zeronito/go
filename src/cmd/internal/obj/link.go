@@ -490,6 +490,8 @@ type FuncInfo struct {
 	WrapInfo           *LSym // for wrapper, info of wrapped function
 
 	FuncInfoSym *LSym
+
+	PoolOff []uint32
 }
 
 // NewFuncInfo allocates and returns a FuncInfo for LSym.
