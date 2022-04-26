@@ -3176,6 +3176,7 @@ top:
 		}
 	}
 	if gp == nil && gcBlackenEnabled != 0 {
+		// we're in the GC mark phase, check if the P need to run background mark worker
 		gp = gcController.findRunnableGCWorker(_g_.m.p.ptr())
 		if gp != nil {
 			tryWakeP = true
