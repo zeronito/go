@@ -6,10 +6,10 @@ package runtime_test
 
 import (
 	"fmt"
+	"internal/goarch"
 	"math"
 	"reflect"
 	"runtime"
-	"runtime/internal/sys"
 	"sort"
 	"strconv"
 	"strings"
@@ -21,7 +21,7 @@ func TestHmapSize(t *testing.T) {
 	// The structure of hmap is defined in runtime/map.go
 	// and in cmd/compile/internal/gc/reflect.go and must be in sync.
 	// The size of hmap should be 48 bytes on 64 bit and 28 bytes on 32 bit platforms.
-	var hmapSize = uintptr(8 + 5*sys.PtrSize)
+	var hmapSize = uintptr(8 + 5*goarch.PtrSize)
 	if runtime.RuntimeHmapSize != hmapSize {
 		t.Errorf("sizeof(runtime.hmap{})==%d, want %d", runtime.RuntimeHmapSize, hmapSize)
 	}
@@ -29,8 +29,9 @@ func TestHmapSize(t *testing.T) {
 }
 
 // negative zero is a good test because:
-//  1) 0 and -0 are equal, yet have distinct representations.
-//  2) 0 is represented as all zeros, -0 isn't.
+//  1. 0 and -0 are equal, yet have distinct representations.
+//  2. 0 is represented as all zeros, -0 isn't.
+//
 // I'm not sure the language spec actually requires this behavior,
 // but it's what the current map implementation does.
 func TestNegativeZero(t *testing.T) {
@@ -473,7 +474,7 @@ func TestMapNanGrowIterator(t *testing.T) {
 	nan := math.NaN()
 	const nBuckets = 16
 	// To fill nBuckets buckets takes LOAD * nBuckets keys.
-	nKeys := int(nBuckets * *runtime.HashLoad)
+	nKeys := int(nBuckets * runtime.HashLoad)
 
 	// Get map to full point with nan keys.
 	for i := 0; i < nKeys; i++ {
@@ -672,8 +673,6 @@ func TestIgnoreBogusMapHint(t *testing.T) {
 	}
 }
 
-var mapSink map[int]int
-
 var mapBucketTests = [...]struct {
 	n        int // n is the number of map elements
 	noescape int // number of expected buckets for non-escaping map
@@ -709,7 +708,7 @@ func TestMapBuckets(t *testing.T) {
 			if got := runtime.MapBucketsCount(localMap); got != tt.noescape {
 				t.Errorf("no escape: n=%d want %d buckets, got %d", tt.n, tt.noescape, got)
 			}
-			escapingMap := map[int]int{}
+			escapingMap := runtime.Escape(map[int]int{})
 			if count := runtime.MapBucketsCount(escapingMap); count > 1 && runtime.MapBucketsPointerIsNil(escapingMap) {
 				t.Errorf("escape: buckets pointer is nil for n=%d buckets", count)
 			}
@@ -719,7 +718,6 @@ func TestMapBuckets(t *testing.T) {
 			if got := runtime.MapBucketsCount(escapingMap); got != tt.escape {
 				t.Errorf("escape n=%d want %d buckets, got %d", tt.n, tt.escape, got)
 			}
-			mapSink = escapingMap
 		}
 	})
 	t.Run("nohint", func(t *testing.T) {
@@ -734,7 +732,7 @@ func TestMapBuckets(t *testing.T) {
 			if got := runtime.MapBucketsCount(localMap); got != tt.noescape {
 				t.Errorf("no escape: n=%d want %d buckets, got %d", tt.n, tt.noescape, got)
 			}
-			escapingMap := make(map[int]int)
+			escapingMap := runtime.Escape(make(map[int]int))
 			if count := runtime.MapBucketsCount(escapingMap); count > 1 && runtime.MapBucketsPointerIsNil(escapingMap) {
 				t.Errorf("escape: buckets pointer is nil for n=%d buckets", count)
 			}
@@ -744,7 +742,6 @@ func TestMapBuckets(t *testing.T) {
 			if got := runtime.MapBucketsCount(escapingMap); got != tt.escape {
 				t.Errorf("escape: n=%d want %d buckets, got %d", tt.n, tt.escape, got)
 			}
-			mapSink = escapingMap
 		}
 	})
 	t.Run("makemap", func(t *testing.T) {
@@ -759,7 +756,7 @@ func TestMapBuckets(t *testing.T) {
 			if got := runtime.MapBucketsCount(localMap); got != tt.noescape {
 				t.Errorf("no escape: n=%d want %d buckets, got %d", tt.n, tt.noescape, got)
 			}
-			escapingMap := make(map[int]int, tt.n)
+			escapingMap := runtime.Escape(make(map[int]int, tt.n))
 			if count := runtime.MapBucketsCount(escapingMap); count > 1 && runtime.MapBucketsPointerIsNil(escapingMap) {
 				t.Errorf("escape: buckets pointer is nil for n=%d buckets", count)
 			}
@@ -769,7 +766,6 @@ func TestMapBuckets(t *testing.T) {
 			if got := runtime.MapBucketsCount(escapingMap); got != tt.escape {
 				t.Errorf("escape: n=%d want %d buckets, got %d", tt.n, tt.escape, got)
 			}
-			mapSink = escapingMap
 		}
 	})
 	t.Run("makemap64", func(t *testing.T) {
@@ -784,7 +780,7 @@ func TestMapBuckets(t *testing.T) {
 			if got := runtime.MapBucketsCount(localMap); got != tt.noescape {
 				t.Errorf("no escape: n=%d want %d buckets, got %d", tt.n, tt.noescape, got)
 			}
-			escapingMap := make(map[int]int, tt.n)
+			escapingMap := runtime.Escape(make(map[int]int, tt.n))
 			if count := runtime.MapBucketsCount(escapingMap); count > 1 && runtime.MapBucketsPointerIsNil(escapingMap) {
 				t.Errorf("escape: buckets pointer is nil for n=%d buckets", count)
 			}
@@ -794,7 +790,6 @@ func TestMapBuckets(t *testing.T) {
 			if got := runtime.MapBucketsCount(escapingMap); got != tt.escape {
 				t.Errorf("escape: n=%d want %d buckets, got %d", tt.n, tt.escape, got)
 			}
-			mapSink = escapingMap
 		}
 	})
 
@@ -993,6 +988,27 @@ func benchmarkMapDeleteStr(b *testing.B, n int) {
 	}
 }
 
+func benchmarkMapDeletePointer(b *testing.B, n int) {
+	i2p := make([]*int, n)
+	for i := 0; i < n; i++ {
+		i2p[i] = new(int)
+	}
+	a := make(map[*int]int, n)
+	b.ResetTimer()
+	k := 0
+	for i := 0; i < b.N; i++ {
+		if len(a) == 0 {
+			b.StopTimer()
+			for j := 0; j < n; j++ {
+				a[i2p[j]] = j
+			}
+			k = i
+			b.StartTimer()
+		}
+		delete(a, i2p[i-k])
+	}
+}
+
 func runWith(f func(*testing.B, int), v ...int) func(*testing.B) {
 	return func(b *testing.B) {
 		for _, n := range v {
@@ -1023,12 +1039,13 @@ func BenchmarkMapDelete(b *testing.B) {
 	b.Run("Int32", runWith(benchmarkMapDeleteInt32, 100, 1000, 10000))
 	b.Run("Int64", runWith(benchmarkMapDeleteInt64, 100, 1000, 10000))
 	b.Run("Str", runWith(benchmarkMapDeleteStr, 100, 1000, 10000))
+	b.Run("Pointer", runWith(benchmarkMapDeletePointer, 100, 1000, 10000))
 }
 
 func TestDeferDeleteSlow(t *testing.T) {
 	ks := []complex128{0, 1, 2, 3}
 
-	m := make(map[interface{}]int)
+	m := make(map[any]int)
 	for i, k := range ks {
 		m[k] = i
 	}
@@ -1171,14 +1188,14 @@ func TestMapInterfaceKey(t *testing.T) {
 		c64  complex64
 		c128 complex128
 		s    string
-		i0   interface{}
+		i0   any
 		i1   interface {
 			String() string
 		}
 		a [4]string
 	}
 
-	m := map[interface{}]bool{}
+	m := map[any]bool{}
 	// Put a bunch of data in m, so that a bad hash is likely to
 	// lead to a bad bucket, which will lead to a missed lookup.
 	for i := 0; i < 1000; i++ {

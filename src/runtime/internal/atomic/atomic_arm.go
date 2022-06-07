@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// +build arm
+//go:build arm
 
 package atomic
 
@@ -12,6 +12,7 @@ import (
 )
 
 // Export some functions via linkname to assembly in sync/atomic.
+//
 //go:linkname Xchg
 //go:linkname Xchguintptr
 
@@ -43,6 +44,7 @@ func addrLock(addr *uint64) *spinlock {
 }
 
 // Atomic add and return new value.
+//
 //go:nosplit
 func Xadd(val *uint32, delta int32) uint32 {
 	for {
@@ -80,6 +82,9 @@ func Store(addr *uint32, v uint32)
 
 //go:noescape
 func StoreRel(addr *uint32, v uint32)
+
+//go:noescape
+func StoreReluintptr(addr *uintptr, v uintptr)
 
 //go:nosplit
 func goCas64(addr *uint64, old, new uint64) bool {
@@ -180,6 +185,26 @@ func And8(addr *uint8, v uint8) {
 }
 
 //go:nosplit
+func Or(addr *uint32, v uint32) {
+	for {
+		old := *addr
+		if Cas(addr, old, old|v) {
+			return
+		}
+	}
+}
+
+//go:nosplit
+func And(addr *uint32, v uint32) {
+	for {
+		old := *addr
+		if Cas(addr, old, old&v) {
+			return
+		}
+	}
+}
+
+//go:nosplit
 func armcas(ptr *uint32, old, new uint32) bool
 
 //go:noescape
@@ -193,6 +218,9 @@ func Load8(addr *uint8) uint8
 
 //go:noescape
 func LoadAcq(addr *uint32) uint32
+
+//go:noescape
+func LoadAcquintptr(ptr *uintptr) uintptr
 
 //go:noescape
 func Cas64(addr *uint64, old, new uint64) bool

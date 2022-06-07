@@ -127,7 +127,7 @@ func permuteInitialBlock(block uint64) uint64 {
 	b2 = (block & 0xff00ff00)
 	block ^= b1<<32 ^ b2 ^ b1<<8 ^ b2<<24 // exchange b0 b4 with b3 b7
 
-	// block is now b1 b3 b5 b7 b0 b2 b4 b7, the permutation:
+	// block is now b1 b3 b5 b7 b0 b2 b4 b6, the permutation:
 	//                  ...  8
 	//                  ... 24
 	//                  ... 40
@@ -248,9 +248,7 @@ func (c *desCipher) generateSubkeys(keyBytes []byte) {
 // By doing so, we can have the input blocks (four bits each), and the key blocks (six bits each) well-aligned without
 // extra shifts/rotations for alignments.
 func unpack(x uint64) uint64 {
-	var result uint64
-
-	result = ((x>>(6*1))&0xff)<<(8*0) |
+	return ((x>>(6*1))&0xff)<<(8*0) |
 		((x>>(6*3))&0xff)<<(8*1) |
 		((x>>(6*5))&0xff)<<(8*2) |
 		((x>>(6*7))&0xff)<<(8*3) |
@@ -258,6 +256,4 @@ func unpack(x uint64) uint64 {
 		((x>>(6*2))&0xff)<<(8*5) |
 		((x>>(6*4))&0xff)<<(8*6) |
 		((x>>(6*6))&0xff)<<(8*7)
-
-	return result
 }

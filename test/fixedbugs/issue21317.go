@@ -1,3 +1,4 @@
+// +build !js,gc
 // run
 
 // Copyright 2017 The Go Authors. All rights reserved.
@@ -16,15 +17,10 @@ import (
 	"log"
 	"os"
 	"os/exec"
-	"runtime"
 	"strings"
 )
 
 func main() {
-	if runtime.Compiler != "gc" || runtime.GOOS == "nacl" || runtime.GOOS == "js" {
-		return
-	}
-
 	f, err := ioutil.TempFile("", "issue21317.go")
 	if err != nil {
 		log.Fatal(err)
@@ -42,7 +38,7 @@ func main() {
 	defer os.RemoveAll(f.Name())
 
 	// compile and test output
-	cmd := exec.Command("go", "tool", "compile", f.Name())
+	cmd := exec.Command("go", "tool", "compile", "-p=main", f.Name())
 	out, err := cmd.CombinedOutput()
 	if err == nil {
 		log.Fatalf("expected cmd/compile to fail")

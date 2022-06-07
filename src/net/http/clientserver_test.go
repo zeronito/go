@@ -9,18 +9,20 @@ package http_test
 import (
 	"bytes"
 	"compress/gzip"
+	"context"
 	"crypto/rand"
 	"crypto/sha1"
 	"crypto/tls"
 	"fmt"
 	"hash"
 	"io"
-	"io/ioutil"
 	"log"
 	"net"
 	. "net/http"
 	"net/http/httptest"
+	"net/http/httptrace"
 	"net/http/httputil"
+	"net/textproto"
 	"net/url"
 	"os"
 	"reflect"
@@ -53,7 +55,7 @@ func (t *clientServerTest) getURL(u string) string {
 		t.t.Fatal(err)
 	}
 	defer res.Body.Close()
-	slurp, err := ioutil.ReadAll(res.Body)
+	slurp, err := io.ReadAll(res.Body)
 	if err != nil {
 		t.t.Fatal(err)
 	}
@@ -82,7 +84,7 @@ func optWithServerLog(lg *log.Logger) func(*httptest.Server) {
 	}
 }
 
-func newClientServerTest(t *testing.T, h2 bool, h Handler, opts ...interface{}) *clientServerTest {
+func newClientServerTest(t *testing.T, h2 bool, h Handler, opts ...any) *clientServerTest {
 	if h2 {
 		CondSkipHTTP2(t)
 	}
@@ -152,7 +154,7 @@ func TestChunkedResponseHeaders_h2(t *testing.T) { testChunkedResponseHeaders(t,
 
 func testChunkedResponseHeaders(t *testing.T, h2 bool) {
 	defer afterTest(t)
-	log.SetOutput(ioutil.Discard) // is noisy otherwise
+	log.SetOutput(io.Discard) // is noisy otherwise
 	defer log.SetOutput(os.Stderr)
 	cst := newClientServerTest(t, h2, HandlerFunc(func(w ResponseWriter, r *Request) {
 		w.Header().Set("Content-Length", "intentional gibberish") // we check that this is deleted
@@ -190,7 +192,7 @@ type h12Compare struct {
 	ReqFunc            reqFunc                           // optional
 	CheckResponse      func(proto string, res *Response) // optional
 	EarlyCheckResponse func(proto string, res *Response) // optional; pre-normalize
-	Opts               []interface{}
+	Opts               []any
 }
 
 func (tt h12Compare) reqFunc() reqFunc {
@@ -266,11 +268,11 @@ func (tt h12Compare) normalizeRes(t *testing.T, res *Response, wantProto string)
 	} else {
 		t.Errorf("got %q response; want %q", res.Proto, wantProto)
 	}
-	slurp, err := ioutil.ReadAll(res.Body)
+	slurp, err := io.ReadAll(res.Body)
 
 	res.Body.Close()
 	res.Body = slurpResult{
-		ReadCloser: ioutil.NopCloser(bytes.NewReader(slurp)),
+		ReadCloser: io.NopCloser(bytes.NewReader(slurp)),
 		body:       slurp,
 		err:        err,
 	}
@@ -442,7 +444,7 @@ func TestH12_AutoGzip(t *testing.T) {
 
 func TestH12_AutoGzip_Disabled(t *testing.T) {
 	h12Compare{
-		Opts: []interface{}{
+		Opts: []any{
 			func(tr *Transport) { tr.DisableCompression = true },
 		},
 		Handler: func(w ResponseWriter, r *Request) {
@@ -477,7 +479,7 @@ func test304Responses(t *testing.T, h2 bool) {
 	if len(res.TransferEncoding) > 0 {
 		t.Errorf("expected no TransferEncoding; got %v", res.TransferEncoding)
 	}
-	body, err := ioutil.ReadAll(res.Body)
+	body, err := io.ReadAll(res.Body)
 	if err != nil {
 		t.Error(err)
 	}
@@ -564,7 +566,7 @@ func testCancelRequestMidBody(t *testing.T, h2 bool) {
 
 	close(cancel)
 
-	rest, err := ioutil.ReadAll(res.Body)
+	rest, err := io.ReadAll(res.Body)
 	all := string(firstRead) + string(rest)
 	if all != "Hello" {
 		t.Errorf("Read %q (%q + %q); want Hello", all, firstRead, rest)
@@ -587,7 +589,7 @@ func testTrailersClientToServer(t *testing.T, h2 bool) {
 		}
 		sort.Strings(decl)
 
-		slurp, err := ioutil.ReadAll(r.Body)
+		slurp, err := io.ReadAll(r.Body)
 		if err != nil {
 			t.Errorf("Server reading request body: %v", err)
 		}
@@ -721,7 +723,7 @@ func testResponseBodyReadAfterClose(t *testing.T, h2 bool) {
 		t.Fatal(err)
 	}
 	res.Body.Close()
-	data, err := ioutil.ReadAll(res.Body)
+	data, err := io.ReadAll(res.Body)
 	if len(data) != 0 || err == nil {
 		t.Fatalf("ReadAll returned %q, %v; want error", data, err)
 	}
@@ -740,7 +742,7 @@ func testConcurrentReadWriteReqBody(t *testing.T, h2 bool) {
 		// Read in one goroutine.
 		go func() {
 			defer wg.Done()
-			data, err := ioutil.ReadAll(r.Body)
+			data, err := io.ReadAll(r.Body)
 			if string(data) != reqBody {
 				t.Errorf("Handler read %q; want %q", data, reqBody)
 			}
@@ -770,7 +772,7 @@ func testConcurrentReadWriteReqBody(t *testing.T, h2 bool) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	data, err := ioutil.ReadAll(res.Body)
+	data, err := io.ReadAll(res.Body)
 	defer res.Body.Close()
 	if err != nil {
 		t.Fatal(err)
@@ -887,7 +889,7 @@ func testTransportUserAgent(t *testing.T, h2 bool) {
 			t.Errorf("%d. RoundTrip = %v", i, err)
 			continue
 		}
-		slurp, err := ioutil.ReadAll(res.Body)
+		slurp, err := io.ReadAll(res.Body)
 		res.Body.Close()
 		if err != nil {
 			t.Errorf("%d. read body = %v", i, err)
@@ -1009,11 +1011,17 @@ func TestTransportDiscardsUnneededConns(t *testing.T) {
 			defer wg.Done()
 			resp, err := c.Get(cst.ts.URL)
 			if err != nil {
-				t.Errorf("Get: %v", err)
-				return
+				// Try to work around spurious connection reset on loaded system.
+				// See golang.org/issue/33585 and golang.org/issue/36797.
+				time.Sleep(10 * time.Millisecond)
+				resp, err = c.Get(cst.ts.URL)
+				if err != nil {
+					t.Errorf("Get: %v", err)
+					return
+				}
 			}
 			defer resp.Body.Close()
-			slurp, err := ioutil.ReadAll(resp.Body)
+			slurp, err := io.ReadAll(resp.Body)
 			if err != nil {
 				t.Error(err)
 			}
@@ -1058,7 +1066,7 @@ func testTransportGCRequest(t *testing.T, h2, body bool) {
 	setParallel(t)
 	defer afterTest(t)
 	cst := newClientServerTest(t, h2, HandlerFunc(func(w ResponseWriter, r *Request) {
-		ioutil.ReadAll(r.Body)
+		io.ReadAll(r.Body)
 		if body {
 			io.WriteString(w, "Hello.")
 		}
@@ -1074,7 +1082,7 @@ func testTransportGCRequest(t *testing.T, h2, body bool) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := ioutil.ReadAll(res.Body); err != nil {
+		if _, err := io.ReadAll(res.Body); err != nil {
 			t.Fatal(err)
 		}
 		if err := res.Body.Close(); err != nil {
@@ -1135,7 +1143,7 @@ func testTransportRejectsInvalidHeaders(t *testing.T, h2 bool) {
 		res, err := cst.c.Do(req)
 		var body []byte
 		if err == nil {
-			body, _ = ioutil.ReadAll(res.Body)
+			body, _ = io.ReadAll(res.Body)
 			res.Body.Close()
 		}
 		var dialed bool
@@ -1163,7 +1171,7 @@ func TestInterruptWithPanic_ErrAbortHandler_h1(t *testing.T) {
 func TestInterruptWithPanic_ErrAbortHandler_h2(t *testing.T) {
 	testInterruptWithPanic(t, h2Mode, ErrAbortHandler)
 }
-func testInterruptWithPanic(t *testing.T, h2 bool, panicValue interface{}) {
+func testInterruptWithPanic(t *testing.T, h2 bool, panicValue any) {
 	setParallel(t)
 	const msg = "hello"
 	defer afterTest(t)
@@ -1192,7 +1200,7 @@ func testInterruptWithPanic(t *testing.T, h2 bool, panicValue interface{}) {
 	}
 	gotHeaders <- true
 	defer res.Body.Close()
-	slurp, err := ioutil.ReadAll(res.Body)
+	slurp, err := io.ReadAll(res.Body)
 	if string(slurp) != msg {
 		t.Errorf("client read %q; want %q", slurp, msg)
 	}
@@ -1357,7 +1365,7 @@ func testServerUndeclaredTrailers(t *testing.T, h2 bool) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := io.Copy(ioutil.Discard, res.Body); err != nil {
+	if _, err := io.Copy(io.Discard, res.Body); err != nil {
 		t.Fatal(err)
 	}
 	res.Body.Close()
@@ -1375,7 +1383,7 @@ func testServerUndeclaredTrailers(t *testing.T, h2 bool) {
 func TestBadResponseAfterReadingBody(t *testing.T) {
 	defer afterTest(t)
 	cst := newClientServerTest(t, false, HandlerFunc(func(w ResponseWriter, r *Request) {
-		_, err := io.Copy(ioutil.Discard, r.Body)
+		_, err := io.Copy(io.Discard, r.Body)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1468,7 +1476,7 @@ func testWriteHeaderAfterWrite(t *testing.T, h2, hijack bool) {
 		t.Fatal(err)
 	}
 	defer res.Body.Close()
-	body, err := ioutil.ReadAll(res.Body)
+	body, err := io.ReadAll(res.Body)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1513,7 +1521,7 @@ func TestBidiStreamReverseProxy(t *testing.T) {
 	}))
 	defer proxy.close()
 
-	bodyRes := make(chan interface{}, 1) // error or hash.Hash
+	bodyRes := make(chan any, 1) // error or hash.Hash
 	pr, pw := io.Pipe()
 	req, _ := NewRequest("PUT", proxy.ts.URL, pr)
 	const size = 4 << 20
@@ -1576,4 +1584,127 @@ func TestH12_WebSocketUpgrade(t *testing.T) {
 			res.Proto = "HTTP/IGNORE" // skip later checks that Proto must be 1.1 vs 2.0
 		},
 	}.run(t)
+}
+
+func TestIdentityTransferEncoding_h1(t *testing.T) { testIdentityTransferEncoding(t, h1Mode) }
+func TestIdentityTransferEncoding_h2(t *testing.T) { testIdentityTransferEncoding(t, h2Mode) }
+
+func testIdentityTransferEncoding(t *testing.T, h2 bool) {
+	setParallel(t)
+	defer afterTest(t)
+
+	const body = "body"
+	cst := newClientServerTest(t, h2, HandlerFunc(func(w ResponseWriter, r *Request) {
+		gotBody, _ := io.ReadAll(r.Body)
+		if got, want := string(gotBody), body; got != want {
+			t.Errorf("got request body = %q; want %q", got, want)
+		}
+		w.Header().Set("Transfer-Encoding", "identity")
+		w.WriteHeader(StatusOK)
+		w.(Flusher).Flush()
+		io.WriteString(w, body)
+	}))
+	defer cst.close()
+	req, _ := NewRequest("GET", cst.ts.URL, strings.NewReader(body))
+	res, err := cst.c.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	gotBody, err := io.ReadAll(res.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := string(gotBody), body; got != want {
+		t.Errorf("got response body = %q; want %q", got, want)
+	}
+}
+
+func TestEarlyHintsRequest_h1(t *testing.T) { testEarlyHintsRequest(t, h1Mode) }
+func TestEarlyHintsRequest_h2(t *testing.T) { testEarlyHintsRequest(t, h2Mode) }
+func testEarlyHintsRequest(t *testing.T, h2 bool) {
+	defer afterTest(t)
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	cst := newClientServerTest(t, h2, HandlerFunc(func(w ResponseWriter, r *Request) {
+		h := w.Header()
+
+		h.Add("Content-Length", "123") // must be ignored
+		h.Add("Link", "</style.css>; rel=preload; as=style")
+		h.Add("Link", "</script.js>; rel=preload; as=script")
+		w.WriteHeader(StatusEarlyHints)
+
+		wg.Wait()
+
+		h.Add("Link", "</foo.js>; rel=preload; as=script")
+		w.WriteHeader(StatusEarlyHints)
+
+		w.Write([]byte("Hello"))
+	}))
+	defer cst.close()
+
+	checkLinkHeaders := func(t *testing.T, expected, got []string) {
+		t.Helper()
+
+		if len(expected) != len(got) {
+			t.Errorf("got %d expected %d", len(got), len(expected))
+		}
+
+		for i := range expected {
+			if expected[i] != got[i] {
+				t.Errorf("got %q expected %q", got[i], expected[i])
+			}
+		}
+	}
+
+	checkExcludedHeaders := func(t *testing.T, header textproto.MIMEHeader) {
+		t.Helper()
+
+		for _, h := range []string{"Content-Length", "Transfer-Encoding"} {
+			if v, ok := header[h]; ok {
+				t.Errorf("%s is %q; must not be sent", h, v)
+			}
+		}
+	}
+
+	var respCounter uint8
+	trace := &httptrace.ClientTrace{
+		Got1xxResponse: func(code int, header textproto.MIMEHeader) error {
+			switch respCounter {
+			case 0:
+				checkLinkHeaders(t, []string{"</style.css>; rel=preload; as=style", "</script.js>; rel=preload; as=script"}, header["Link"])
+				checkExcludedHeaders(t, header)
+
+				wg.Done()
+			case 1:
+				checkLinkHeaders(t, []string{"</style.css>; rel=preload; as=style", "</script.js>; rel=preload; as=script", "</foo.js>; rel=preload; as=script"}, header["Link"])
+				checkExcludedHeaders(t, header)
+
+			default:
+				t.Error("Unexpected 1xx response")
+			}
+
+			respCounter++
+
+			return nil
+		},
+	}
+	req, _ := NewRequestWithContext(httptrace.WithClientTrace(context.Background(), trace), "GET", cst.ts.URL, nil)
+
+	res, err := cst.c.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+
+	checkLinkHeaders(t, []string{"</style.css>; rel=preload; as=style", "</script.js>; rel=preload; as=script", "</foo.js>; rel=preload; as=script"}, res.Header["Link"])
+	if cl := res.Header.Get("Content-Length"); cl != "123" {
+		t.Errorf("Content-Length is %q; want 123", cl)
+	}
+
+	body, _ := io.ReadAll(res.Body)
+	if string(body) != "Hello" {
+		t.Errorf("Read body %q; want Hello", body)
+	}
 }

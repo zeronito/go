@@ -13,12 +13,16 @@
 TEXT runtime·sys_umtx_op(SB),NOSPLIT,$-4
 	MOVL	$454, AX
 	INT	$0x80
+	JAE	2(PC)
+	NEGL	AX
 	MOVL	AX, ret+20(FP)
 	RET
 
 TEXT runtime·thr_new(SB),NOSPLIT,$-4
 	MOVL	$455, AX
 	INT	$0x80
+	JAE	2(PC)
+	NEGL	AX
 	MOVL	AX, ret+8(FP)
 	RET
 
@@ -97,21 +101,6 @@ TEXT runtime·read(SB),NOSPLIT,$-4
 	MOVL	AX, ret+12(FP)
 	RET
 
-// func pipe() (r, w int32, errno int32)
-TEXT runtime·pipe(SB),NOSPLIT,$8-12
-	MOVL	$42, AX
-	INT	$0x80
-	JAE	ok
-	MOVL	$0, r+0(FP)
-	MOVL	$0, w+4(FP)
-	MOVL	AX, errno+8(FP)
-	RET
-ok:
-	MOVL	AX, r+0(FP)
-	MOVL	DX, w+4(FP)
-	MOVL	$0, errno+8(FP)
-	RET
-
 // func pipe2(flags int32) (r, w int32, errno int32)
 TEXT runtime·pipe2(SB),NOSPLIT,$12-16
 	MOVL	$542, AX
@@ -120,6 +109,8 @@ TEXT runtime·pipe2(SB),NOSPLIT,$12-16
 	MOVL	flags+0(FP), BX
 	MOVL	BX, 8(SP)
 	INT	$0x80
+	JAE	2(PC)
+	NEGL	AX
 	MOVL	AX, errno+12(FP)
 	RET
 
@@ -262,7 +253,7 @@ TEXT runtime·sigfwd(SB),NOSPLIT,$12-16
 	RET
 
 // Called by OS using C ABI.
-TEXT runtime·sigtramp(SB),NOSPLIT,$12
+TEXT runtime·sigtramp(SB),NOSPLIT|TOPFRAME,$12
 	NOP	SP	// tell vet SP changed - stop checking offsets
 	MOVL	16(SP), BX	// signo
 	MOVL	BX, 0(SP)
@@ -435,23 +426,6 @@ TEXT runtime·closeonexec(SB),NOSPLIT,$32
 	INT	$0x80
 	JAE	2(PC)
 	NEGL	AX
-	RET
-
-// func runtime·setNonblock(fd int32)
-TEXT runtime·setNonblock(SB),NOSPLIT,$16-4
-	MOVL	$92, AX // fcntl
-	MOVL	fd+0(FP), BX // fd
-	MOVL	BX, 4(SP)
-	MOVL	$3, 8(SP) // F_GETFL
-	MOVL	$0, 12(SP)
-	INT	$0x80
-	MOVL	fd+0(FP), BX // fd
-	MOVL	BX, 4(SP)
-	MOVL	$4, 8(SP) // F_SETFL
-	ORL	$4, AX // O_NONBLOCK
-	MOVL	AX, 12(SP)
-	MOVL	$92, AX // fcntl
-	INT	$0x80
 	RET
 
 // func cpuset_getaffinity(level int, which int, id int64, size int, mask *byte) int32

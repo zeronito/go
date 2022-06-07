@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// +build js,wasm
+//go:build js && wasm
 
 package js
 
@@ -10,11 +10,9 @@ import "sync"
 
 var (
 	funcsMu    sync.Mutex
-	funcs             = make(map[uint32]func(Value, []Value) interface{})
+	funcs             = make(map[uint32]func(Value, []Value) any)
 	nextFuncID uint32 = 1
 )
-
-var _ Wrapper = Func{} // Func must implement Wrapper
 
 // Func is a wrapped Go function to be called by JavaScript.
 type Func struct {
@@ -39,8 +37,8 @@ type Func struct {
 // immediate deadlock. Therefore a blocking function should explicitly start a
 // new goroutine.
 //
-// Func.Release must be called to free up resources when the function will not be used any more.
-func FuncOf(fn func(this Value, args []Value) interface{}) Func {
+// Func.Release must be called to free up resources when the function will not be invoked any more.
+func FuncOf(fn func(this Value, args []Value) any) Func {
 	funcsMu.Lock()
 	id := nextFuncID
 	nextFuncID++
@@ -54,6 +52,7 @@ func FuncOf(fn func(this Value, args []Value) interface{}) Func {
 
 // Release frees up resources allocated for the function.
 // The function must not be invoked after calling Release.
+// It is allowed to call Release while the function is still running.
 func (c Func) Release() {
 	funcsMu.Lock()
 	delete(funcs, c.id)

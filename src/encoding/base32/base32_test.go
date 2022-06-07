@@ -8,7 +8,6 @@ import (
 	"bytes"
 	"errors"
 	"io"
-	"io/ioutil"
 	"strings"
 	"testing"
 )
@@ -43,7 +42,7 @@ var bigtest = testpair{
 	"KR3WC4ZAMJZGS3DMNFTSYIDBNZSCA5DIMUQHG3DJORUHSIDUN53GK4Y=",
 }
 
-func testEqual(t *testing.T, msg string, args ...interface{}) bool {
+func testEqual(t *testing.T, msg string, args ...any) bool {
 	t.Helper()
 	if args[len(args)-2] != args[len(args)-1] {
 		t.Errorf(msg, args...)
@@ -361,9 +360,9 @@ func TestBig(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Encoder.Close() = %v want nil", err)
 	}
-	decoded, err := ioutil.ReadAll(NewDecoder(StdEncoding, encoded))
+	decoded, err := io.ReadAll(NewDecoder(StdEncoding, encoded))
 	if err != nil {
-		t.Fatalf("ioutil.ReadAll(NewDecoder(...)): %v", err)
+		t.Fatalf("io.ReadAll(NewDecoder(...)): %v", err)
 	}
 
 	if !bytes.Equal(raw, decoded) {
@@ -428,14 +427,14 @@ LNEBUWIIDFON2CA3DBMJXXE5LNFY==
 	encodedShort := strings.ReplaceAll(encoded, "\n", "")
 
 	dec := NewDecoder(StdEncoding, strings.NewReader(encoded))
-	res1, err := ioutil.ReadAll(dec)
+	res1, err := io.ReadAll(dec)
 	if err != nil {
 		t.Errorf("ReadAll failed: %v", err)
 	}
 
 	dec = NewDecoder(StdEncoding, strings.NewReader(encodedShort))
 	var res2 []byte
-	res2, err = ioutil.ReadAll(dec)
+	res2, err = io.ReadAll(dec)
 	if err != nil {
 		t.Errorf("ReadAll failed: %v", err)
 	}
@@ -619,11 +618,63 @@ func TestBufferedDecodingSameError(t *testing.T) {
 			}()
 
 			decoder := NewDecoder(StdEncoding, pr)
-			_, err := ioutil.ReadAll(decoder)
+			_, err := io.ReadAll(decoder)
 
 			if err != testcase.expected {
 				t.Errorf("Expected %v, got %v; case %s %+v", testcase.expected, err, testcase.prefix, chunks)
 			}
+		}
+	}
+}
+
+func TestBufferedDecodingPadding(t *testing.T) {
+	testcases := []struct {
+		chunks        []string
+		expectedError string
+	}{
+		{[]string{
+			"I4======",
+			"==",
+		}, "unexpected EOF"},
+
+		{[]string{
+			"I4======N4======",
+		}, "illegal base32 data at input byte 2"},
+
+		{[]string{
+			"I4======",
+			"N4======",
+		}, "illegal base32 data at input byte 0"},
+
+		{[]string{
+			"I4======",
+			"========",
+		}, "illegal base32 data at input byte 0"},
+
+		{[]string{
+			"I4I4I4I4",
+			"I4======",
+			"I4======",
+		}, "illegal base32 data at input byte 0"},
+	}
+
+	for _, testcase := range testcases {
+		testcase := testcase
+		pr, pw := io.Pipe()
+		go func() {
+			for _, chunk := range testcase.chunks {
+				_, _ = pw.Write([]byte(chunk))
+			}
+			_ = pw.Close()
+		}()
+
+		decoder := NewDecoder(StdEncoding, pr)
+		_, err := io.ReadAll(decoder)
+
+		if err == nil && len(testcase.expectedError) != 0 {
+			t.Errorf("case %q: got nil error, want %v", testcase.chunks, testcase.expectedError)
+		} else if err.Error() != testcase.expectedError {
+			t.Errorf("case %q: got %v, want %v", testcase.chunks, err, testcase.expectedError)
 		}
 	}
 }
@@ -718,7 +769,7 @@ func TestDecodeReadAll(t *testing.T) {
 				encoded = strings.ReplaceAll(encoded, "=", "")
 			}
 
-			decReader, err := ioutil.ReadAll(NewDecoder(encoding, strings.NewReader(encoded)))
+			decReader, err := io.ReadAll(NewDecoder(encoding, strings.NewReader(encoded)))
 			if err != nil {
 				t.Errorf("NewDecoder error: %v", err)
 			}

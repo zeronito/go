@@ -2,11 +2,12 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+//go:build ignore
 // +build ignore
 
 // detect attempts to autodetect the correct
 // values of the environment variables
-// used by go_darwin_arm_exec.
+// used by go_ios_exec.
 // detect shells out to ideviceinfo, a third party program that can
 // be obtained by following the instructions at
 // https://github.com/libimobiledevice/libimobiledevice.
@@ -16,7 +17,6 @@ import (
 	"bytes"
 	"crypto/x509"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"os/exec"
 	"strings"
@@ -38,7 +38,7 @@ func main() {
 	fmt.Println("# will be overwritten when running Go programs.")
 	for _, mp := range mps {
 		fmt.Println()
-		f, err := ioutil.TempFile("", "go_ios_detect_")
+		f, err := os.CreateTemp("", "go_ios_detect_")
 		check(err)
 		fname := f.Name()
 		defer os.Remove(fname)

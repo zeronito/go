@@ -9,6 +9,7 @@ package rsa
 import (
 	"bytes"
 	"crypto"
+	"crypto/internal/boring"
 	"errors"
 	"hash"
 	"io"
@@ -207,20 +208,34 @@ func emsaPSSVerify(mHash, em []byte, emBits, sLen int, hash hash.Hash) error {
 // Note that hashed must be the result of hashing the input message using the
 // given hash function. salt is a random sequence of bytes whose length will be
 // later used to verify the signature.
-func signPSSWithSalt(rand io.Reader, priv *PrivateKey, hash crypto.Hash, hashed, salt []byte) (s []byte, err error) {
+func signPSSWithSalt(rand io.Reader, priv *PrivateKey, hash crypto.Hash, hashed, salt []byte) ([]byte, error) {
 	emBits := priv.N.BitLen() - 1
 	em, err := emsaPSSEncode(hashed, emBits, salt, hash.New())
 	if err != nil {
-		return
+		return nil, err
 	}
+
+	if boring.Enabled {
+		bkey, err := boringPrivateKey(priv)
+		if err != nil {
+			return nil, err
+		}
+		// Note: BoringCrypto takes care of the "AndCheck" part of "decryptAndCheck".
+		// (It's not just decrypt.)
+		s, err := boring.DecryptRSANoPadding(bkey, em)
+		if err != nil {
+			return nil, err
+		}
+		return s, nil
+	}
+
 	m := new(big.Int).SetBytes(em)
 	c, err := decryptAndCheck(rand, priv, m)
 	if err != nil {
-		return
+		return nil, err
 	}
-	s = make([]byte, priv.Size())
-	copyWithLeftPad(s, c.Bytes())
-	return
+	s := make([]byte, priv.Size())
+	return c.FillBytes(s), nil
 }
 
 const (
@@ -270,10 +285,19 @@ func SignPSS(rand io.Reader, priv *PrivateKey, hash crypto.Hash, digest []byte, 
 	saltLength := opts.saltLength()
 	switch saltLength {
 	case PSSSaltLengthAuto:
-		saltLength = priv.Size() - 2 - hash.Size()
+		saltLength = (priv.N.BitLen()-1+7)/8 - 2 - hash.Size()
 	case PSSSaltLengthEqualsHash:
 		saltLength = hash.Size()
 	}
+
+	if boring.Enabled && rand == boring.RandReader {
+		bkey, err := boringPrivateKey(priv)
+		if err != nil {
+			return nil, err
+		}
+		return boring.SignRSAPSS(bkey, hash, digest, saltLength)
+	}
+	boring.UnreachableExceptTests()
 
 	salt := make([]byte, saltLength)
 	if _, err := io.ReadFull(rand, salt); err != nil {
@@ -289,6 +313,16 @@ func SignPSS(rand io.Reader, priv *PrivateKey, hash crypto.Hash, digest []byte, 
 // argument may be nil, in which case sensible defaults are used. opts.Hash is
 // ignored.
 func VerifyPSS(pub *PublicKey, hash crypto.Hash, digest []byte, sig []byte, opts *PSSOptions) error {
+	if boring.Enabled {
+		bkey, err := boringPublicKey(pub)
+		if err != nil {
+			return err
+		}
+		if err := boring.VerifyRSAPSS(bkey, hash, digest, sig, opts.saltLength()); err != nil {
+			return ErrVerification
+		}
+		return nil
+	}
 	if len(sig) != pub.Size() {
 		return ErrVerification
 	}
@@ -296,11 +330,9 @@ func VerifyPSS(pub *PublicKey, hash crypto.Hash, digest []byte, sig []byte, opts
 	m := encrypt(new(big.Int), pub, s)
 	emBits := pub.N.BitLen() - 1
 	emLen := (emBits + 7) / 8
-	emBytes := m.Bytes()
-	if emLen < len(emBytes) {
+	if m.BitLen() > emLen*8 {
 		return ErrVerification
 	}
-	em := make([]byte, emLen)
-	copyWithLeftPad(em, emBytes)
+	em := m.FillBytes(make([]byte, emLen))
 	return emsaPSSVerify(digest, em, emBits, opts.saltLength(), hash.New())
 }

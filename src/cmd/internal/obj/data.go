@@ -1,6 +1,6 @@
 // Derived from Inferno utils/6l/obj.c and utils/6l/span.c
-// https://bitbucket.org/inferno-os/inferno-os/src/default/utils/6l/obj.c
-// https://bitbucket.org/inferno-os/inferno-os/src/default/utils/6l/span.c
+// https://bitbucket.org/inferno-os/inferno-os/src/master/utils/6l/obj.c
+// https://bitbucket.org/inferno-os/inferno-os/src/master/utils/6l/span.c
 //
 //	Copyright © 1994-1999 Lucent Technologies Inc.  All rights reserved.
 //	Portions Copyright © 1995-1997 C H Forsyth (forsyth@terzarima.net)
@@ -133,6 +133,13 @@ func (s *LSym) writeAddr(ctxt *Link, off int64, siz int, rsym *LSym, roff int64,
 // rsym and roff specify the relocation for the address.
 func (s *LSym) WriteAddr(ctxt *Link, off int64, siz int, rsym *LSym, roff int64) {
 	s.writeAddr(ctxt, off, siz, rsym, roff, objabi.R_ADDR)
+}
+
+// WriteWeakAddr writes an address of size siz into s at offset off.
+// rsym and roff specify the relocation for the address.
+// This is a weak reference.
+func (s *LSym) WriteWeakAddr(ctxt *Link, off int64, siz int, rsym *LSym, roff int64) {
+	s.writeAddr(ctxt, off, siz, rsym, roff, objabi.R_WEAKADDR)
 }
 
 // WriteCURelativeAddr writes a pointer-sized address into s at offset off.

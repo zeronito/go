@@ -12,6 +12,7 @@ import (
 	"go/importer"
 	"go/parser"
 	"go/token"
+	"internal/goexperiment"
 	"internal/testenv"
 	"strings"
 	"testing"
@@ -76,7 +77,7 @@ func TestEvalArith(t *testing.T) {
 		`false == false`,
 		`12345678 + 87654321 == 99999999`,
 		`10 * 20 == 200`,
-		`(1<<1000)*2 >> 100 == 2<<900`,
+		`(1<<500)*2 >> 100 == 2<<400`,
 		`"foo" + "bar" == "foobar"`,
 		`"abc" <= "bcd"`,
 		`len([10]struct{}{}) == 2*5`,
@@ -111,7 +112,7 @@ func TestEvalPos(t *testing.T) {
 			x = a + len(s)
 			return float64(x)
 			/* true => true, untyped bool */
-			/* fmt.Println => , func(a ...interface{}) (n int, err error) */
+			/* fmt.Println => , func(a ...any) (n int, err error) */
 			/* c => 3, untyped float */
 			/* T => , p.T */
 			/* a => , int */
@@ -155,9 +156,9 @@ func TestEvalPos(t *testing.T) {
 		import "io"
 		type R = io.Reader
 		func _() {
-			/* interface{R}.Read => , func(interface{io.Reader}, p []byte) (n int, err error) */
+			/* interface{R}.Read => , func(_ interface{io.Reader}, p []byte) (n int, err error) */
 			_ = func() {
-				/* interface{io.Writer}.Write => , func(interface{io.Writer}, p []byte) (n int, err error) */
+				/* interface{io.Writer}.Write => , func(_ interface{io.Writer}, p []byte) (n int, err error) */
 				type io interface {} // must not shadow io in line above
 			}
 			type R interface {} // must not shadow R in first line of this function body
@@ -195,10 +196,10 @@ func TestEvalPos(t *testing.T) {
 	}
 }
 
-// split splits string s at the first occurrence of s.
+// split splits string s at the first occurrence of s, trimming spaces.
 func split(s, sep string) (string, string) {
-	i := strings.Index(s, sep)
-	return strings.TrimSpace(s[:i]), strings.TrimSpace(s[i+len(sep):])
+	before, after, _ := strings.Cut(s, sep)
+	return strings.TrimSpace(before), strings.TrimSpace(after)
 }
 
 func TestCheckExpr(t *testing.T) {
@@ -208,7 +209,7 @@ func TestCheckExpr(t *testing.T) {
 	// expr is an identifier or selector expression that is passed
 	// to CheckExpr at the position of the comment, and object is
 	// the string form of the object it denotes.
-	const src = `
+	src := `
 package p
 
 import "fmt"
@@ -218,7 +219,7 @@ type T []int
 type S struct{ X int }
 
 func f(a int, s string) S {
-	/* fmt.Println => func fmt.Println(a ...interface{}) (n int, err error) */
+	/* fmt.Println => func fmt.Println(a ...any) (n int, err error) */
 	/* fmt.Stringer.String => func (fmt.Stringer).String() string */
 	fmt.Println("calling f")
 
@@ -234,6 +235,13 @@ func f(a int, s string) S {
 
 	return S{}
 }`
+
+	// The unified IR importer always sets interface method receiver
+	// parameters to point to the Interface type, rather than the Named.
+	// See #49906.
+	if goexperiment.Unified {
+		src = strings.ReplaceAll(src, "func (fmt.Stringer).", "func (interface).")
+	}
 
 	fset := token.NewFileSet()
 	f, err := parser.ParseFile(fset, "p", src, parser.ParseComments)

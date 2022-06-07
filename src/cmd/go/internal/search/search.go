@@ -7,8 +7,10 @@ package search
 import (
 	"cmd/go/internal/base"
 	"cmd/go/internal/cfg"
+	"cmd/go/internal/fsys"
 	"fmt"
 	"go/build"
+	"io/fs"
 	"os"
 	"path"
 	"path/filepath"
@@ -127,9 +129,12 @@ func (m *Match) MatchPackages() {
 		if m.pattern == "cmd" {
 			root += "cmd" + string(filepath.Separator)
 		}
-		err := filepath.Walk(root, func(path string, fi os.FileInfo, err error) error {
-			if err != nil || path == src {
-				return nil
+		err := fsys.Walk(root, func(path string, fi fs.FileInfo, err error) error {
+			if err != nil {
+				return err // Likely a permission error, which could interfere with matching.
+			}
+			if path == src {
+				return nil // GOROOT/src and GOPATH/src cannot contain packages.
 			}
 
 			want := true
@@ -150,8 +155,8 @@ func (m *Match) MatchPackages() {
 			}
 
 			if !fi.IsDir() {
-				if fi.Mode()&os.ModeSymlink != 0 && want {
-					if target, err := os.Stat(path); err == nil && target.IsDir() {
+				if fi.Mode()&fs.ModeSymlink != 0 && want && strings.Contains(m.pattern, "...") {
+					if target, err := fsys.Stat(path); err == nil && target.IsDir() {
 						fmt.Fprintf(os.Stderr, "warning: ignoring symlink %s\n", path)
 					}
 				}
@@ -197,12 +202,6 @@ func (m *Match) MatchPackages() {
 	}
 }
 
-var modRoot string
-
-func SetModRoot(dir string) {
-	modRoot = dir
-}
-
 // MatchDirs sets m.Dirs to a non-nil slice containing all directories that
 // potentially match a local pattern. The pattern must begin with an absolute
 // path, or "./", or "../". On Windows, the pattern may use slash or backslash
@@ -210,7 +209,7 @@ func SetModRoot(dir string) {
 //
 // If any errors may have caused the set of directories to be incomplete,
 // MatchDirs appends those errors to m.Errs.
-func (m *Match) MatchDirs() {
+func (m *Match) MatchDirs(modRoots []string) {
 	m.Dirs = []string{}
 	if !m.IsLocal() {
 		m.AddError(fmt.Errorf("internal error: MatchDirs: %s is not a valid filesystem pattern", m.pattern))
@@ -248,25 +247,37 @@ func (m *Match) MatchDirs() {
 	// We need to preserve the ./ for pattern matching
 	// and in the returned import paths.
 
-	if modRoot != "" {
+	if len(modRoots) > 1 {
 		abs, err := filepath.Abs(dir)
 		if err != nil {
 			m.AddError(err)
 			return
 		}
-		if !hasFilepathPrefix(abs, modRoot) {
-			m.AddError(fmt.Errorf("directory %s is outside module root (%s)", abs, modRoot))
-			return
+		var found bool
+		for _, modRoot := range modRoots {
+			if modRoot != "" && hasFilepathPrefix(abs, modRoot) {
+				found = true
+			}
+		}
+		if !found {
+			plural := ""
+			if len(modRoots) > 1 {
+				plural = "s"
+			}
+			m.AddError(fmt.Errorf("directory %s is outside module root%s (%s)", abs, plural, strings.Join(modRoots, ", ")))
 		}
 	}
 
-	err := filepath.Walk(dir, func(path string, fi os.FileInfo, err error) error {
-		if err != nil || !fi.IsDir() {
+	err := fsys.Walk(dir, func(path string, fi fs.FileInfo, err error) error {
+		if err != nil {
+			return err // Likely a permission error, which could interfere with matching.
+		}
+		if !fi.IsDir() {
 			return nil
 		}
 		top := false
 		if path == dir {
-			// filepath.Walk starts at dir and recurses. For the recursive case,
+			// Walk starts at dir and recurses. For the recursive case,
 			// the path is the result of filepath.Join, which calls filepath.Clean.
 			// The initial case is not Cleaned, though, so we do this explicitly.
 			//
@@ -287,7 +298,7 @@ func (m *Match) MatchDirs() {
 
 		if !top && cfg.ModulesEnabled {
 			// Ignore other modules found in subdirectories.
-			if fi, err := os.Stat(filepath.Join(path, "go.mod")); err == nil && !fi.IsDir() {
+			if fi, err := fsys.Stat(filepath.Join(path, "go.mod")); err == nil && !fi.IsDir() {
 				return filepath.SkipDir
 			}
 		}
@@ -416,19 +427,19 @@ func WarnUnmatched(matches []*Match) {
 
 // ImportPaths returns the matching paths to use for the given command line.
 // It calls ImportPathsQuiet and then WarnUnmatched.
-func ImportPaths(patterns []string) []*Match {
-	matches := ImportPathsQuiet(patterns)
+func ImportPaths(patterns, modRoots []string) []*Match {
+	matches := ImportPathsQuiet(patterns, modRoots)
 	WarnUnmatched(matches)
 	return matches
 }
 
 // ImportPathsQuiet is like ImportPaths but does not warn about patterns with no matches.
-func ImportPathsQuiet(patterns []string) []*Match {
+func ImportPathsQuiet(patterns, modRoots []string) []*Match {
 	var out []*Match
 	for _, a := range CleanPatterns(patterns) {
 		m := NewMatch(a)
 		if m.IsLocal() {
-			m.MatchDirs()
+			m.MatchDirs(modRoots)
 
 			// Change the file import path to a regular import path if the package
 			// is in GOPATH or GOROOT. We don't report errors here; LoadImport
@@ -437,7 +448,7 @@ func ImportPathsQuiet(patterns []string) []*Match {
 			for i, dir := range m.Dirs {
 				absDir := dir
 				if !filepath.IsAbs(dir) {
-					absDir = filepath.Join(base.Cwd, dir)
+					absDir = filepath.Join(base.Cwd(), dir)
 				}
 				if bp, _ := cfg.BuildContext.ImportDir(absDir, build.FindOnly); bp.ImportPath != "" && bp.ImportPath != "." {
 					m.Pkgs[i] = bp.ImportPath
@@ -563,7 +574,6 @@ func IsRelativePath(pattern string) bool {
 // If so, InDir returns an equivalent path relative to dir.
 // If not, InDir returns an empty string.
 // InDir makes some effort to succeed even in the presence of symbolic links.
-// TODO(rsc): Replace internal/test.inDir with a call to this function for Go 1.12.
 func InDir(path, dir string) string {
 	if rel := inDirLex(path, dir); rel != "" {
 		return rel

@@ -37,21 +37,28 @@
 // functions, are the atomic equivalents of "return *addr" and
 // "*addr = val".
 //
+// In the terminology of the Go memory model, if the effect of
+// an atomic operation A is observed by atomic operation B,
+// then A “synchronizes before” B.
+// Additionally, all the atomic operations executed in a program
+// behave as though executed in some sequentially consistent order.
+// This definition provides the same semantics as
+// C++'s sequentially consistent atomics and Java's volatile variables.
 package atomic
 
 import (
 	"unsafe"
 )
 
-// BUG(rsc): On x86-32, the 64-bit functions use instructions unavailable before the Pentium MMX.
+// BUG(rsc): On 386, the 64-bit functions use instructions unavailable before the Pentium MMX.
 //
 // On non-Linux ARM, the 64-bit functions use instructions unavailable before the ARMv6k core.
 //
-// On ARM, x86-32, and 32-bit MIPS,
-// it is the caller's responsibility to arrange for 64-bit
-// alignment of 64-bit words accessed atomically. The first word in a
-// variable or in an allocated struct, array, or slice can be relied upon to be
-// 64-bit aligned.
+// On ARM, 386, and 32-bit MIPS, it is the caller's responsibility to arrange
+// for 64-bit alignment of 64-bit words accessed atomically via the primitive
+// atomic functions (types Int64 and Uint64 are automatically aligned).
+// The first word in a variable or in an allocated struct, array, or slice can
+// be relied upon to be 64-bit aligned.
 
 // SwapInt32 atomically stores new into *addr and returns the previous *addr value.
 func SwapInt32(addr *int32, new int32) (old int32)

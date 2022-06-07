@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"math"
 	"math/rand"
 	"reflect"
 	"strconv"
@@ -404,6 +405,7 @@ var splittests = []SplitTest{
 	{faces, "~", -1, []string{faces}},
 	{"1 2 3 4", " ", 3, []string{"1", "2", "3 4"}},
 	{"1 2", " ", 3, []string{"1", "2"}},
+	{"", "T", math.MaxInt / 4, []string{""}},
 }
 
 func TestSplit(t *testing.T) {
@@ -808,7 +810,9 @@ var trimTests = []struct {
 	{"TrimLeft", "abba", "ab", ""},
 	{"TrimRight", "abba", "ab", ""},
 	{"TrimLeft", "abba", "a", "bba"},
+	{"TrimLeft", "abba", "b", "abba"},
 	{"TrimRight", "abba", "a", "abb"},
+	{"TrimRight", "abba", "b", "abba"},
 	{"Trim", "<tag>", "<>", "tag"},
 	{"Trim", "* listitem", " *", "listitem"},
 	{"Trim", `"quote"`, `"`, "quote"},
@@ -1577,7 +1581,30 @@ var CountTests = []struct {
 func TestCount(t *testing.T) {
 	for _, tt := range CountTests {
 		if num := Count(tt.s, tt.sep); num != tt.num {
-			t.Errorf("Count(\"%s\", \"%s\") = %d, want %d", tt.s, tt.sep, num, tt.num)
+			t.Errorf("Count(%q, %q) = %d, want %d", tt.s, tt.sep, num, tt.num)
+		}
+	}
+}
+
+var cutTests = []struct {
+	s, sep        string
+	before, after string
+	found         bool
+}{
+	{"abc", "b", "a", "c", true},
+	{"abc", "a", "", "bc", true},
+	{"abc", "c", "ab", "", true},
+	{"abc", "abc", "", "", true},
+	{"abc", "", "", "abc", true},
+	{"abc", "d", "abc", "", false},
+	{"", "d", "", "", false},
+	{"", "", "", "", true},
+}
+
+func TestCut(t *testing.T) {
+	for _, tt := range cutTests {
+		if before, after, found := Cut(tt.s, tt.sep); before != tt.before || after != tt.after || found != tt.found {
+			t.Errorf("Cut(%q, %q) = %q, %q, %v, want %q, %q, %v", tt.s, tt.sep, before, after, found, tt.before, tt.after, tt.found)
 		}
 	}
 }
@@ -1860,6 +1887,13 @@ func BenchmarkTrimASCII(b *testing.B) {
 	}
 }
 
+func BenchmarkTrimByte(b *testing.B) {
+	x := "  the quick brown fox   "
+	for i := 0; i < b.N; i++ {
+		Trim(x, " ")
+	}
+}
+
 func BenchmarkIndexPeriodic(b *testing.B) {
 	key := "aa"
 	for _, skip := range [...]int{2, 4, 8, 16, 32, 64} {
@@ -1898,5 +1932,14 @@ func BenchmarkTrimSpace(b *testing.B) {
 				TrimSpace(test.input)
 			}
 		})
+	}
+}
+
+var stringSink string
+
+func BenchmarkReplaceAll(b *testing.B) {
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		stringSink = ReplaceAll("banana", "a", "<>")
 	}
 }

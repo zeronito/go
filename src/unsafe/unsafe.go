@@ -3,10 +3,10 @@
 // license that can be found in the LICENSE file.
 
 /*
-	Package unsafe contains operations that step around the type safety of Go programs.
+Package unsafe contains operations that step around the type safety of Go programs.
 
-	Packages that import unsafe may be non-portable and are not protected by the
-	Go 1 compatibility guidelines.
+Packages that import unsafe may be non-portable and are not protected by the
+Go 1 compatibility guidelines.
 */
 package unsafe
 
@@ -14,12 +14,17 @@ package unsafe
 // part of the unsafe package. It represents the type of an arbitrary Go expression.
 type ArbitraryType int
 
+// IntegerType is here for the purposes of documentation only and is not actually
+// part of the unsafe package. It represents any arbitrary integer type.
+type IntegerType int
+
 // Pointer represents a pointer to an arbitrary type. There are four special operations
 // available for type Pointer that are not available for other types:
-//	- A pointer value of any type can be converted to a Pointer.
-//	- A Pointer can be converted to a pointer value of any type.
-//	- A uintptr can be converted to a Pointer.
-//	- A Pointer can be converted to a uintptr.
+//   - A pointer value of any type can be converted to a Pointer.
+//   - A Pointer can be converted to a pointer value of any type.
+//   - A uintptr can be converted to a Pointer.
+//   - A Pointer can be converted to a uintptr.
+//
 // Pointer therefore allows a program to defeat the type system and read and write
 // arbitrary memory. It should be used with extreme care.
 //
@@ -176,7 +181,6 @@ type ArbitraryType int
 //	hdr.Data = uintptr(unsafe.Pointer(p))
 //	hdr.Len = n
 //	s := *(*string)(unsafe.Pointer(&hdr)) // p possibly already lost
-//
 type Pointer *ArbitraryType
 
 // Sizeof takes an expression x of any type and returns the size in bytes
@@ -184,6 +188,7 @@ type Pointer *ArbitraryType
 // The size does not include any memory possibly referenced by x.
 // For instance, if x is a slice, Sizeof returns the size of the slice
 // descriptor, not the size of the memory referenced by the slice.
+// For a struct, the size includes any padding introduced by field alignment.
 // The return value of Sizeof is a Go constant.
 func Sizeof(x ArbitraryType) uintptr
 
@@ -203,3 +208,27 @@ func Offsetof(x ArbitraryType) uintptr
 // value returned by reflect.TypeOf(s.f).FieldAlign().
 // The return value of Alignof is a Go constant.
 func Alignof(x ArbitraryType) uintptr
+
+// The function Add adds len to ptr and returns the updated pointer
+// Pointer(uintptr(ptr) + uintptr(len)).
+// The len argument must be of integer type or an untyped constant.
+// A constant len argument must be representable by a value of type int;
+// if it is an untyped constant it is given type int.
+// The rules for valid uses of Pointer still apply.
+func Add(ptr Pointer, len IntegerType) Pointer
+
+// The function Slice returns a slice whose underlying array starts at ptr
+// and whose length and capacity are len.
+// Slice(ptr, len) is equivalent to
+//
+//	(*[len]ArbitraryType)(unsafe.Pointer(ptr))[:]
+//
+// except that, as a special case, if ptr is nil and len is zero,
+// Slice returns nil.
+//
+// The len argument must be of integer type or an untyped constant.
+// A constant len argument must be non-negative and representable by a value of type int;
+// if it is an untyped constant it is given type int.
+// At run time, if len is negative, or if ptr is nil and len is not zero,
+// a run-time panic occurs.
+func Slice(ptr *ArbitraryType, len IntegerType) []ArbitraryType

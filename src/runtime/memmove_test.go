@@ -286,6 +286,9 @@ var bufSizes = []int{
 	0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
 	32, 64, 128, 256, 512, 1024, 2048, 4096,
 }
+var bufSizesOverlap = []int{
+	32, 64, 128, 256, 512, 1024, 2048, 4096,
+}
 
 func BenchmarkMemmove(b *testing.B) {
 	benchmarkSizes(b, bufSizes, func(b *testing.B, n int) {
@@ -293,6 +296,15 @@ func BenchmarkMemmove(b *testing.B) {
 		y := make([]byte, n)
 		for i := 0; i < b.N; i++ {
 			copy(x, y)
+		}
+	})
+}
+
+func BenchmarkMemmoveOverlap(b *testing.B) {
+	benchmarkSizes(b, bufSizesOverlap, func(b *testing.B, n int) {
+		x := make([]byte, n+16)
+		for i := 0; i < b.N; i++ {
+			copy(x[16:n+16], x[:n])
 		}
 	})
 }
@@ -307,12 +319,30 @@ func BenchmarkMemmoveUnalignedDst(b *testing.B) {
 	})
 }
 
+func BenchmarkMemmoveUnalignedDstOverlap(b *testing.B) {
+	benchmarkSizes(b, bufSizesOverlap, func(b *testing.B, n int) {
+		x := make([]byte, n+16)
+		for i := 0; i < b.N; i++ {
+			copy(x[16:n+16], x[1:n+1])
+		}
+	})
+}
+
 func BenchmarkMemmoveUnalignedSrc(b *testing.B) {
 	benchmarkSizes(b, bufSizes, func(b *testing.B, n int) {
 		x := make([]byte, n)
 		y := make([]byte, n+1)
 		for i := 0; i < b.N; i++ {
 			copy(x, y[1:])
+		}
+	})
+}
+
+func BenchmarkMemmoveUnalignedSrcOverlap(b *testing.B) {
+	benchmarkSizes(b, bufSizesOverlap, func(b *testing.B, n int) {
+		x := make([]byte, n+1)
+		for i := 0; i < b.N; i++ {
+			copy(x[1:n+1], x[:n])
 		}
 	})
 }
@@ -379,6 +409,63 @@ func BenchmarkGoMemclr(b *testing.B) {
 			}
 		}
 	})
+}
+
+func BenchmarkMemclrRange(b *testing.B) {
+	type RunData struct {
+		data []int
+	}
+
+	benchSizes := []RunData{
+		RunData{[]int{1043, 1078, 1894, 1582, 1044, 1165, 1467, 1100, 1919, 1562, 1932, 1645,
+			1412, 1038, 1576, 1200, 1029, 1336, 1095, 1494, 1350, 1025, 1502, 1548, 1316, 1296,
+			1868, 1639, 1546, 1626, 1642, 1308, 1726, 1665, 1678, 1187, 1515, 1598, 1353, 1237,
+			1977, 1452, 2012, 1914, 1514, 1136, 1975, 1618, 1536, 1695, 1600, 1733, 1392, 1099,
+			1358, 1996, 1224, 1783, 1197, 1838, 1460, 1556, 1554, 2020}}, // 1kb-2kb
+		RunData{[]int{3964, 5139, 6573, 7775, 6553, 2413, 3466, 5394, 2469, 7336, 7091, 6745,
+			4028, 5643, 6164, 3475, 4138, 6908, 7559, 3335, 5660, 4122, 3945, 2082, 7564, 6584,
+			5111, 2288, 6789, 2797, 4928, 7986, 5163, 5447, 2999, 4968, 3174, 3202, 7908, 8137,
+			4735, 6161, 4646, 7592, 3083, 5329, 3687, 2754, 3599, 7231, 6455, 2549, 8063, 2189,
+			7121, 5048, 4277, 6626, 6306, 2815, 7473, 3963, 7549, 7255}}, // 2kb-8kb
+		RunData{[]int{16304, 15936, 15760, 4736, 9136, 11184, 10160, 5952, 14560, 15744,
+			6624, 5872, 13088, 14656, 14192, 10304, 4112, 10384, 9344, 4496, 11392, 7024,
+			5200, 10064, 14784, 5808, 13504, 10480, 8512, 4896, 13264, 5600}}, // 4kb-16kb
+		RunData{[]int{164576, 233136, 220224, 183280, 214112, 217248, 228560, 201728}}, // 128kb-256kb
+	}
+
+	for _, t := range benchSizes {
+		total := 0
+		minLen := 0
+		maxLen := 0
+
+		for _, clrLen := range t.data {
+			if clrLen > maxLen {
+				maxLen = clrLen
+			}
+			if clrLen < minLen || minLen == 0 {
+				minLen = clrLen
+			}
+			total += clrLen
+		}
+		buffer := make([]byte, maxLen)
+
+		text := ""
+		if minLen >= (1 << 20) {
+			text = fmt.Sprint(minLen>>20, "M ", (maxLen+(1<<20-1))>>20, "M")
+		} else if minLen >= (1 << 10) {
+			text = fmt.Sprint(minLen>>10, "K ", (maxLen+(1<<10-1))>>10, "K")
+		} else {
+			text = fmt.Sprint(minLen, " ", maxLen)
+		}
+		b.Run(text, func(b *testing.B) {
+			b.SetBytes(int64(total))
+			for i := 0; i < b.N; i++ {
+				for _, clrLen := range t.data {
+					MemclrBytes(buffer[:clrLen])
+				}
+			}
+		})
+	}
 }
 
 func BenchmarkClearFat8(b *testing.B) {
@@ -538,21 +625,30 @@ func BenchmarkCopyFat1024(b *testing.B) {
 	}
 }
 
+// BenchmarkIssue18740 ensures that memmove uses 4 and 8 byte load/store to move 4 and 8 bytes.
+// It used to do 2 2-byte load/stores, which leads to a pipeline stall
+// when we try to read the result with one 4-byte load.
 func BenchmarkIssue18740(b *testing.B) {
-	// This tests that memmove uses one 4-byte load/store to move 4 bytes.
-	// It used to do 2 2-byte load/stores, which leads to a pipeline stall
-	// when we try to read the result with one 4-byte load.
-	var buf [4]byte
-	for j := 0; j < b.N; j++ {
-		s := uint32(0)
-		for i := 0; i < 4096; i += 4 {
-			copy(buf[:], g[i:])
-			s += binary.LittleEndian.Uint32(buf[:])
-		}
-		sink = uint64(s)
+	benchmarks := []struct {
+		name  string
+		nbyte int
+		f     func([]byte) uint64
+	}{
+		{"2byte", 2, func(buf []byte) uint64 { return uint64(binary.LittleEndian.Uint16(buf)) }},
+		{"4byte", 4, func(buf []byte) uint64 { return uint64(binary.LittleEndian.Uint32(buf)) }},
+		{"8byte", 8, func(buf []byte) uint64 { return binary.LittleEndian.Uint64(buf) }},
+	}
+
+	var g [4096]byte
+	for _, bm := range benchmarks {
+		buf := make([]byte, bm.nbyte)
+		b.Run(bm.name, func(b *testing.B) {
+			for j := 0; j < b.N; j++ {
+				for i := 0; i < 4096; i += bm.nbyte {
+					copy(buf[:], g[i:])
+					sink += bm.f(buf[:])
+				}
+			}
+		})
 	}
 }
-
-// TODO: 2 byte and 8 byte benchmarks also.
-
-var g [4096]byte

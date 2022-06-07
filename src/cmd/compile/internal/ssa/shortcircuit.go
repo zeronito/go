@@ -58,20 +58,7 @@ func shortcircuit(f *Func) {
 	//   if v goto t else u
 	// We can redirect p to go directly to t instead of b.
 	// (If v is not live after b).
-	for changed := true; changed; {
-		changed = false
-		for i := len(f.Blocks) - 1; i >= 0; i-- {
-			b := f.Blocks[i]
-			if fuseBlockPlain(b) {
-				changed = true
-				continue
-			}
-			changed = shortcircuitBlock(b) || changed
-		}
-		if changed {
-			f.invalidateCFG()
-		}
-	}
+	fuse(f, fuseTypePlain|fuseTypeShortCircuit)
 }
 
 // shortcircuitBlock checks for a CFG in which an If block
@@ -80,11 +67,11 @@ func shortcircuit(f *Func) {
 //
 // (1) Look for a CFG of the form
 //
-//   p   other pred(s)
-//    \ /
-//     b
-//    / \
-//   t   other succ
+//	p   other pred(s)
+//	 \ /
+//	  b
+//	 / \
+//	t   other succ
 //
 // in which b is an If block containing a single phi value with a single use (b's Control),
 // which has a ConstBool arg.
@@ -93,21 +80,21 @@ func shortcircuit(f *Func) {
 //
 // Rewrite this into
 //
-//   p   other pred(s)
-//   |  /
-//   | b
-//   |/ \
-//   t   u
+//	p   other pred(s)
+//	|  /
+//	| b
+//	|/ \
+//	t   u
 //
 // and remove the appropriate phi arg(s).
 //
 // (2) Look for a CFG of the form
 //
-//   p   q
-//    \ /
-//     b
-//    / \
-//   t   u
+//	p   q
+//	 \ /
+//	  b
+//	 / \
+//	t   u
 //
 // in which b is as described in (1).
 // However, b may also contain other phi values.
@@ -151,6 +138,24 @@ func shortcircuitBlock(b *Block) bool {
 	if len(b.Values) != nval+nOtherPhi {
 		return false
 	}
+	if nOtherPhi > 0 {
+		// Check for any phi which is the argument of another phi.
+		// These cases are tricky, as substitutions done by replaceUses
+		// are no longer trivial to do in any ordering. See issue 45175.
+		m := make(map[*Value]bool, 1+nOtherPhi)
+		for _, v := range b.Values {
+			if v.Op == OpPhi {
+				m[v] = true
+			}
+		}
+		for v := range m {
+			for _, a := range v.Args {
+				if a != v && m[a] {
+					return false
+				}
+			}
+		}
+	}
 
 	// Locate index of first const phi arg.
 	cidx := -1
@@ -191,11 +196,7 @@ func shortcircuitBlock(b *Block) bool {
 
 	// Remove b's incoming edge from p.
 	b.removePred(cidx)
-	n := len(b.Preds)
-	ctl.Args[cidx].Uses--
-	ctl.Args[cidx] = ctl.Args[n]
-	ctl.Args[n] = nil
-	ctl.Args = ctl.Args[:n]
+	b.removePhiArg(ctl, cidx)
 
 	// Redirect p's outgoing edge to t.
 	p.Succs[pi] = Edge{t, len(t.Preds)}
@@ -237,7 +238,11 @@ func shortcircuitBlock(b *Block) bool {
 					}
 				}
 			}
-			phielimValue(phi)
+			if phi.Uses != 0 {
+				phielimValue(phi)
+			} else {
+				phi.reset(OpInvalid)
+			}
 			i-- // v.moveTo put a new value at index i; reprocess
 		}
 
@@ -270,15 +275,17 @@ func shortcircuitBlock(b *Block) bool {
 // and the CFG modifications must not proceed.
 // The returned function assumes that shortcircuitBlock has completed its CFG modifications.
 func shortcircuitPhiPlan(b *Block, ctl *Value, cidx int, ti int64) func(*Value, int) {
-	const go115shortcircuitPhis = true
-	if !go115shortcircuitPhis {
-		return nil
-	}
-
 	// t is the "taken" branch: the successor we always go to when coming in from p.
 	t := b.Succs[ti].b
 	// u is the "untaken" branch: the successor we never go to when coming in from p.
 	u := b.Succs[1^ti].b
+
+	// In the following CFG matching, ensure that b's preds are entirely distinct from b's succs.
+	// This is probably a stronger condition than required, but this happens extremely rarely,
+	// and it makes it easier to avoid getting deceived by pretty ASCII charts. See #44465.
+	if p0, p1 := b.Preds[0].b, b.Preds[1].b; p0 == t || p1 == t || p0 == u || p1 == u {
+		return nil
+	}
 
 	// Look for some common CFG structures
 	// in which the outbound paths from b merge,

@@ -12,7 +12,6 @@ import (
 	"go/parser"
 	"go/token"
 	"io"
-	"io/ioutil"
 	"log"
 	"os"
 	"sort"
@@ -41,8 +40,8 @@ Finally, to generate modified source code with coverage annotations
 `
 
 func usage() {
-	fmt.Fprintln(os.Stderr, usageMessage)
-	fmt.Fprintln(os.Stderr, "Flags:")
+	fmt.Fprint(os.Stderr, usageMessage)
+	fmt.Fprintln(os.Stderr, "\nFlags:")
 	flag.PrintDefaults()
 	fmt.Fprintln(os.Stderr, "\n  Only one of -html, -func, or -mode may be set.")
 	os.Exit(2)
@@ -304,7 +303,7 @@ func (f *File) Visit(node ast.Node) ast.Visitor {
 
 func annotate(name string) {
 	fset := token.NewFileSet()
-	content, err := ioutil.ReadFile(name)
+	content, err := os.ReadFile(name)
 	if err != nil {
 		log.Fatalf("cover: %s: %s", name, err)
 	}
@@ -378,7 +377,7 @@ func (f *File) newCounter(start, end token.Pos, numStmt int) string {
 //	S1
 //	if cond {
 //		S2
-// 	}
+//	}
 //	S3
 //
 // counters will be added before S1 and before S3. The block containing S2

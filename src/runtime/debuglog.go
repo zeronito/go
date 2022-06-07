@@ -72,7 +72,9 @@ func dlog() *dlogger {
 
 	// If that failed, allocate a new logger.
 	if l == nil {
-		l = (*dlogger)(sysAlloc(unsafe.Sizeof(dlogger{}), nil))
+		// Use sysAllocOS instead of sysAlloc because we want to interfere
+		// with the runtime as little as possible, and sysAlloc updates accounting.
+		l = (*dlogger)(sysAllocOS(unsafe.Sizeof(dlogger{})))
 		if l == nil {
 			throw("failed to allocate debug log")
 		}
@@ -266,7 +268,7 @@ func (l *dlogger) hex(x uint64) *dlogger {
 }
 
 //go:nosplit
-func (l *dlogger) p(x interface{}) *dlogger {
+func (l *dlogger) p(x any) *dlogger {
 	if !dlogEnabled {
 		return l
 	}
@@ -665,13 +667,17 @@ func (r *debugLogReader) printVal() bool {
 		print("..(", r.uvarint(), " more bytes)..")
 
 	case debugLogPC:
-		printDebugLogPC(uintptr(r.uvarint()))
+		printDebugLogPC(uintptr(r.uvarint()), false)
 
 	case debugLogTraceback:
 		n := int(r.uvarint())
 		for i := 0; i < n; i++ {
 			print("\n\t")
-			printDebugLogPC(uintptr(r.uvarint()))
+			// gentraceback PCs are always return PCs.
+			// Convert them to call PCs.
+			//
+			// TODO(austin): Expand inlined frames.
+			printDebugLogPC(uintptr(r.uvarint()), true)
 		}
 	}
 
@@ -710,7 +716,9 @@ func printDebugLog() {
 		lost     uint64
 		nextTick uint64
 	}
-	state1 := sysAlloc(unsafe.Sizeof(readState{})*uintptr(n), nil)
+	// Use sysAllocOS instead of sysAlloc because we want to interfere
+	// with the runtime as little as possible, and sysAlloc updates accounting.
+	state1 := sysAllocOS(unsafe.Sizeof(readState{}) * uintptr(n))
 	if state1 == nil {
 		println("failed to allocate read state for", n, "logs")
 		printunlock()
@@ -769,7 +777,8 @@ func printDebugLog() {
 			// Logged before runtimeInitTime was set.
 			pnano = 0
 		}
-		print(string(itoaDiv(tmpbuf[:], uint64(pnano), 9)))
+		pnanoBytes := itoaDiv(tmpbuf[:], uint64(pnano), 9)
+		print(slicebytetostringtmp((*byte)(noescape(unsafe.Pointer(&pnanoBytes[0]))), len(pnanoBytes)))
 		print(" P ", p, "] ")
 
 		for i := 0; s.begin < s.end; i++ {
@@ -794,15 +803,23 @@ func printDebugLog() {
 	printunlock()
 }
 
-func printDebugLogPC(pc uintptr) {
-	print(hex(pc))
+// printDebugLogPC prints a single symbolized PC. If returnPC is true,
+// pc is a return PC that must first be converted to a call PC.
+func printDebugLogPC(pc uintptr, returnPC bool) {
 	fn := findfunc(pc)
+	if returnPC && (!fn.valid() || pc > fn.entry()) {
+		// TODO(austin): Don't back up if the previous frame
+		// was a sigpanic.
+		pc--
+	}
+
+	print(hex(pc))
 	if !fn.valid() {
 		print(" [unknown PC]")
 	} else {
 		name := funcname(fn)
 		file, line := funcline(fn, pc)
-		print(" [", name, "+", hex(pc-fn.entry),
+		print(" [", name, "+", hex(pc-fn.entry()),
 			" ", file, ":", line, "]")
 	}
 }

@@ -5,8 +5,9 @@
 package ssa
 
 import (
-	"cmd/internal/objabi"
+	"cmd/compile/internal/ir"
 	"cmd/internal/src"
+	"internal/buildcfg"
 )
 
 // nilcheckelim eliminates unnecessary nil checks.
@@ -171,10 +172,7 @@ func nilcheckelim(f *Func) {
 				b.Pos = b.Pos.WithIsStmt()
 				pendingLines.remove(b.Pos)
 			}
-			for j := i; j < len(b.Values); j++ {
-				b.Values[j] = nil
-			}
-			b.Values = b.Values[:i]
+			b.truncateValues(i)
 
 			// Add all dominated blocks to the work list.
 			for w := sdom[node.block.ID].child; w != nil; w = sdom[w.ID].sibling {
@@ -194,7 +192,7 @@ func nilcheckelim(f *Func) {
 const minZeroPage = 4096
 
 // faultOnLoad is true if a load to an address below minZeroPage will trigger a SIGSEGV.
-var faultOnLoad = objabi.GOOS != "aix"
+var faultOnLoad = buildcfg.GOOS != "aix"
 
 // nilcheckelim2 eliminates unnecessary nil checks.
 // Runs after lowering and scheduling.
@@ -238,7 +236,7 @@ func nilcheckelim2(f *Func) {
 				continue
 			}
 			if v.Type.IsMemory() || v.Type.IsTuple() && v.Type.FieldType(1).IsMemory() {
-				if v.Op == OpVarKill || v.Op == OpVarLive || (v.Op == OpVarDef && !v.Aux.(GCNode).Typ().HasHeapPointer()) {
+				if v.Op == OpVarKill || v.Op == OpVarLive || (v.Op == OpVarDef && !v.Aux.(*ir.Name).Type().HasPointers()) {
 					// These ops don't really change memory.
 					continue
 					// Note: OpVarDef requires that the defined variable not have pointers.
@@ -331,10 +329,7 @@ func nilcheckelim2(f *Func) {
 			b.Pos = b.Pos.WithIsStmt()
 		}
 
-		for j := i; j < len(b.Values); j++ {
-			b.Values[j] = nil
-		}
-		b.Values = b.Values[:i]
+		b.truncateValues(i)
 
 		// TODO: if b.Kind == BlockPlain, start the analysis in the subsequent block to find
 		// more unnecessary nil checks.  Would fix test/nilptr3.go:159.

@@ -34,8 +34,8 @@ func init() {
 // testableNetwork reports whether network is testable on the current
 // platform configuration.
 func testableNetwork(network string) bool {
-	ss := strings.Split(network, ":")
-	switch ss[0] {
+	net, _, _ := strings.Cut(network, ":")
+	switch net {
 	case "ip+nopriv":
 	case "ip", "ip4", "ip6":
 		switch runtime.GOOS {
@@ -59,7 +59,7 @@ func testableNetwork(network string) bool {
 		}
 	case "unixpacket":
 		switch runtime.GOOS {
-		case "aix", "android", "darwin", "plan9", "windows":
+		case "aix", "android", "darwin", "ios", "plan9", "windows":
 			return false
 		case "netbsd":
 			// It passes on amd64 at least. 386 fails (Issue 22927). arm is unknown.
@@ -68,7 +68,7 @@ func testableNetwork(network string) bool {
 			}
 		}
 	}
-	switch ss[0] {
+	switch net {
 	case "tcp4", "udp4", "ip4":
 		if !supportsIPv4() {
 			return false
@@ -82,13 +82,13 @@ func testableNetwork(network string) bool {
 }
 
 func iOS() bool {
-	return runtime.GOOS == "darwin" && runtime.GOARCH == "arm64"
+	return runtime.GOOS == "ios"
 }
 
 // testableAddress reports whether address of network is testable on
 // the current platform configuration.
 func testableAddress(network, address string) bool {
-	switch ss := strings.Split(network, ":"); ss[0] {
+	switch net, _, _ := strings.Cut(network, ":"); net {
 	case "unix", "unixgram", "unixpacket":
 		// Abstract unix domain sockets, a Linux-ism.
 		if address[0] == '@' && runtime.GOOS != "linux" {
@@ -107,7 +107,7 @@ func testableListenArgs(network, address, client string) bool {
 
 	var err error
 	var addr Addr
-	switch ss := strings.Split(network, ":"); ss[0] {
+	switch net, _, _ := strings.Cut(network, ":"); net {
 	case "tcp", "tcp4", "tcp6":
 		addr, err = ResolveTCPAddr("tcp", address)
 	case "udp", "udp4", "udp6":
@@ -173,7 +173,7 @@ func testableListenArgs(network, address, client string) bool {
 	return true
 }
 
-func condFatalf(t *testing.T, network string, format string, args ...interface{}) {
+func condFatalf(t *testing.T, network string, format string, args ...any) {
 	t.Helper()
 	// A few APIs like File and Read/WriteMsg{UDP,IP} are not
 	// fully implemented yet on Plan 9 and Windows.

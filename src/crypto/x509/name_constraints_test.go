@@ -14,7 +14,6 @@ import (
 	"encoding/hex"
 	"encoding/pem"
 	"fmt"
-	"io/ioutil"
 	"math/big"
 	"net"
 	"net/url"
@@ -615,7 +614,8 @@ var nameConstraintsTests = []nameConstraintsTest{
 		},
 	},
 
-	// #30: without SANs, a certificate with a CN is rejected in a constrained chain.
+	// #30: without SANs, a certificate with a CN is still accepted in a
+	// constrained chain, since we ignore the CN in VerifyHostname.
 	{
 		roots: []constraintsSpec{
 			{
@@ -631,7 +631,6 @@ var nameConstraintsTests = []nameConstraintsTest{
 			sans: []string{},
 			cn:   "foo.com",
 		},
-		expectedError: "leaf doesn't have a SAN extension",
 	},
 
 	// #31: IPv6 addresses work in constraints: roots can permit them as
@@ -1280,8 +1279,8 @@ var nameConstraintsTests = []nameConstraintsTest{
 		expectedError: "incompatible key usage",
 	},
 
-	// #67: in order to support COMODO chains, SGC key usages permit
-	// serverAuth and clientAuth.
+	// #67: SGC key usages used to permit serverAuth and clientAuth,
+	// but don't anymore.
 	{
 		roots: []constraintsSpec{
 			{},
@@ -1297,10 +1296,11 @@ var nameConstraintsTests = []nameConstraintsTest{
 			sans: []string{"dns:example.com"},
 			ekus: []string{"serverAuth", "clientAuth"},
 		},
+		expectedError: "incompatible key usage",
 	},
 
-	// #68: in order to support COMODO chains, SGC key usages permit
-	// serverAuth and clientAuth.
+	// #68: SGC key usages used to permit serverAuth and clientAuth,
+	// but don't anymore.
 	{
 		roots: make([]constraintsSpec, 1),
 		intermediates: [][]constraintsSpec{
@@ -1314,6 +1314,7 @@ var nameConstraintsTests = []nameConstraintsTest{
 			sans: []string{"dns:example.com"},
 			ekus: []string{"serverAuth", "clientAuth"},
 		},
+		expectedError: "incompatible key usage",
 	},
 
 	// #69: an empty DNS constraint should allow anything.
@@ -1438,7 +1439,8 @@ var nameConstraintsTests = []nameConstraintsTest{
 		expectedError: "incompatible key usage",
 	},
 
-	// #76: However, MSSGC in a leaf should match a request for serverAuth.
+	// #76: MSSGC in a leaf used to match a request for serverAuth, but doesn't
+	// anymore.
 	{
 		roots: make([]constraintsSpec, 1),
 		intermediates: [][]constraintsSpec{
@@ -1451,6 +1453,7 @@ var nameConstraintsTests = []nameConstraintsTest{
 			ekus: []string{"msSGC"},
 		},
 		requestedEKUs: []ExtKeyUsage{ExtKeyUsageServerAuth},
+		expectedError: "incompatible key usage",
 	},
 
 	// An invalid DNS SAN should be detected only at validation time so
@@ -1595,26 +1598,6 @@ var nameConstraintsTests = []nameConstraintsTest{
 			sans: []string{"dns:foo.com"},
 			cn:   "foo.bar",
 		},
-	},
-
-	// #85: without SANs, a certificate with a valid CN is accepted in a
-	// constrained chain if x509ignoreCN is set.
-	{
-		roots: []constraintsSpec{
-			{
-				ok: []string{"dns:foo.com", "dns:.foo.com"},
-			},
-		},
-		intermediates: [][]constraintsSpec{
-			{
-				{},
-			},
-		},
-		leaf: leafSpec{
-			sans: []string{},
-			cn:   "foo.com",
-		},
-		ignoreCN: true,
 	},
 }
 
@@ -1866,12 +1849,8 @@ func parseEKUs(ekuStrs []string) (ekus []ExtKeyUsage, unknowns []asn1.ObjectIden
 }
 
 func TestConstraintCases(t *testing.T) {
-	defer func(savedIgnoreCN bool) {
-		ignoreCN = savedIgnoreCN
-	}(ignoreCN)
-
 	privateKeys := sync.Pool{
-		New: func() interface{} {
+		New: func() any {
 			priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 			if err != nil {
 				panic(err)
@@ -1881,131 +1860,136 @@ func TestConstraintCases(t *testing.T) {
 	}
 
 	for i, test := range nameConstraintsTests {
-		rootPool := NewCertPool()
-		rootKey := privateKeys.Get().(*ecdsa.PrivateKey)
-		rootName := "Root " + strconv.Itoa(i)
+		t.Run(fmt.Sprintf("#%d", i), func(t *testing.T) {
+			rootPool := NewCertPool()
+			rootKey := privateKeys.Get().(*ecdsa.PrivateKey)
+			rootName := "Root " + strconv.Itoa(i)
 
-		// keys keeps track of all the private keys used in a given
-		// test and puts them back in the privateKeys pool at the end.
-		keys := []*ecdsa.PrivateKey{rootKey}
+			// keys keeps track of all the private keys used in a given
+			// test and puts them back in the privateKeys pool at the end.
+			keys := []*ecdsa.PrivateKey{rootKey}
 
-		// At each level (root, intermediate(s), leaf), parent points to
-		// an example parent certificate and parentKey the key for the
-		// parent level. Since all certificates at a given level have
-		// the same name and public key, any parent certificate is
-		// sufficient to get the correct issuer name and authority
-		// key ID.
-		var parent *Certificate
-		parentKey := rootKey
+			// At each level (root, intermediate(s), leaf), parent points to
+			// an example parent certificate and parentKey the key for the
+			// parent level. Since all certificates at a given level have
+			// the same name and public key, any parent certificate is
+			// sufficient to get the correct issuer name and authority
+			// key ID.
+			var parent *Certificate
+			parentKey := rootKey
 
-		for _, root := range test.roots {
-			rootCert, err := makeConstraintsCACert(root, rootName, rootKey, nil, rootKey)
-			if err != nil {
-				t.Fatalf("#%d: failed to create root: %s", i, err)
-			}
-
-			parent = rootCert
-			rootPool.AddCert(rootCert)
-		}
-
-		intermediatePool := NewCertPool()
-
-		for level, intermediates := range test.intermediates {
-			levelKey := privateKeys.Get().(*ecdsa.PrivateKey)
-			keys = append(keys, levelKey)
-			levelName := "Intermediate level " + strconv.Itoa(level)
-			var last *Certificate
-
-			for _, intermediate := range intermediates {
-				caCert, err := makeConstraintsCACert(intermediate, levelName, levelKey, parent, parentKey)
+			for _, root := range test.roots {
+				rootCert, err := makeConstraintsCACert(root, rootName, rootKey, nil, rootKey)
 				if err != nil {
-					t.Fatalf("#%d: failed to create %q: %s", i, levelName, err)
+					t.Fatalf("failed to create root: %s", err)
 				}
 
-				last = caCert
-				intermediatePool.AddCert(caCert)
+				parent = rootCert
+				rootPool.AddCert(rootCert)
 			}
 
-			parent = last
-			parentKey = levelKey
-		}
+			intermediatePool := NewCertPool()
 
-		leafKey := privateKeys.Get().(*ecdsa.PrivateKey)
-		keys = append(keys, leafKey)
+			for level, intermediates := range test.intermediates {
+				levelKey := privateKeys.Get().(*ecdsa.PrivateKey)
+				keys = append(keys, levelKey)
+				levelName := "Intermediate level " + strconv.Itoa(level)
+				var last *Certificate
 
-		leafCert, err := makeConstraintsLeafCert(test.leaf, leafKey, parent, parentKey)
-		if err != nil {
-			t.Fatalf("#%d: cannot create leaf: %s", i, err)
-		}
+				for _, intermediate := range intermediates {
+					caCert, err := makeConstraintsCACert(intermediate, levelName, levelKey, parent, parentKey)
+					if err != nil {
+						t.Fatalf("failed to create %q: %s", levelName, err)
+					}
 
-		// Skip tests with CommonName set because OpenSSL will try to match it
-		// against name constraints, while we ignore it when it's not hostname-looking.
-		if !test.noOpenSSL && testNameConstraintsAgainstOpenSSL && test.leaf.cn == "" {
-			output, err := testChainAgainstOpenSSL(leafCert, intermediatePool, rootPool)
-			if err == nil && len(test.expectedError) > 0 {
-				t.Errorf("#%d: unexpectedly succeeded against OpenSSL", i)
-				if debugOpenSSLFailure {
-					return
+					last = caCert
+					intermediatePool.AddCert(caCert)
 				}
+
+				parent = last
+				parentKey = levelKey
 			}
 
+			leafKey := privateKeys.Get().(*ecdsa.PrivateKey)
+			keys = append(keys, leafKey)
+
+			leafCert, err := makeConstraintsLeafCert(test.leaf, leafKey, parent, parentKey)
 			if err != nil {
-				if _, ok := err.(*exec.ExitError); !ok {
-					t.Errorf("#%d: OpenSSL failed to run: %s", i, err)
-				} else if len(test.expectedError) == 0 {
-					t.Errorf("#%d: OpenSSL unexpectedly failed: %v", i, output)
+				t.Fatalf("cannot create leaf: %s", err)
+			}
+
+			// Skip tests with CommonName set because OpenSSL will try to match it
+			// against name constraints, while we ignore it when it's not hostname-looking.
+			if !test.noOpenSSL && testNameConstraintsAgainstOpenSSL && test.leaf.cn == "" {
+				output, err := testChainAgainstOpenSSL(t, leafCert, intermediatePool, rootPool)
+				if err == nil && len(test.expectedError) > 0 {
+					t.Error("unexpectedly succeeded against OpenSSL")
 					if debugOpenSSLFailure {
 						return
 					}
 				}
+
+				if err != nil {
+					if _, ok := err.(*exec.ExitError); !ok {
+						t.Errorf("OpenSSL failed to run: %s", err)
+					} else if len(test.expectedError) == 0 {
+						t.Errorf("OpenSSL unexpectedly failed: %v", output)
+						if debugOpenSSLFailure {
+							return
+						}
+					}
+				}
 			}
-		}
 
-		ignoreCN = test.ignoreCN
-		verifyOpts := VerifyOptions{
-			Roots:         rootPool,
-			Intermediates: intermediatePool,
-			CurrentTime:   time.Unix(1500, 0),
-			KeyUsages:     test.requestedEKUs,
-		}
-		_, err = leafCert.Verify(verifyOpts)
+			verifyOpts := VerifyOptions{
+				Roots:         rootPool,
+				Intermediates: intermediatePool,
+				CurrentTime:   time.Unix(1500, 0),
+				KeyUsages:     test.requestedEKUs,
+			}
+			_, err = leafCert.Verify(verifyOpts)
 
-		logInfo := true
-		if len(test.expectedError) == 0 {
-			if err != nil {
-				t.Errorf("#%d: unexpected failure: %s", i, err)
+			logInfo := true
+			if len(test.expectedError) == 0 {
+				if err != nil {
+					t.Errorf("unexpected failure: %s", err)
+				} else {
+					logInfo = false
+				}
 			} else {
-				logInfo = false
+				if err == nil {
+					t.Error("unexpected success")
+				} else if !strings.Contains(err.Error(), test.expectedError) {
+					t.Errorf("expected error containing %q, but got: %s", test.expectedError, err)
+				} else {
+					logInfo = false
+				}
 			}
-		} else {
-			if err == nil {
-				t.Errorf("#%d: unexpected success", i)
-			} else if !strings.Contains(err.Error(), test.expectedError) {
-				t.Errorf("#%d: expected error containing %q, but got: %s", i, test.expectedError, err)
-			} else {
-				logInfo = false
-			}
-		}
 
-		if logInfo {
-			certAsPEM := func(cert *Certificate) string {
-				var buf bytes.Buffer
-				pem.Encode(&buf, &pem.Block{Type: "CERTIFICATE", Bytes: cert.Raw})
-				return buf.String()
+			if logInfo {
+				certAsPEM := func(cert *Certificate) string {
+					var buf bytes.Buffer
+					pem.Encode(&buf, &pem.Block{Type: "CERTIFICATE", Bytes: cert.Raw})
+					return buf.String()
+				}
+				t.Errorf("root:\n%s", certAsPEM(rootPool.mustCert(t, 0)))
+				if intermediates := allCerts(t, intermediatePool); len(intermediates) > 0 {
+					for ii, intermediate := range intermediates {
+						t.Errorf("intermediate %d:\n%s", ii, certAsPEM(intermediate))
+					}
+				}
+				t.Errorf("leaf:\n%s", certAsPEM(leafCert))
 			}
-			t.Errorf("#%d: root:\n%s", i, certAsPEM(rootPool.certs[0]))
-			t.Errorf("#%d: leaf:\n%s", i, certAsPEM(leafCert))
-		}
 
-		for _, key := range keys {
-			privateKeys.Put(key)
-		}
-		keys = keys[:0]
+			for _, key := range keys {
+				privateKeys.Put(key)
+			}
+		})
 	}
 }
 
 func writePEMsToTempFile(certs []*Certificate) *os.File {
-	file, err := ioutil.TempFile("", "name_constraints_test")
+	file, err := os.CreateTemp("", "name_constraints_test")
 	if err != nil {
 		panic("cannot create tempfile")
 	}
@@ -2019,10 +2003,10 @@ func writePEMsToTempFile(certs []*Certificate) *os.File {
 	return file
 }
 
-func testChainAgainstOpenSSL(leaf *Certificate, intermediates, roots *CertPool) (string, error) {
+func testChainAgainstOpenSSL(t *testing.T, leaf *Certificate, intermediates, roots *CertPool) (string, error) {
 	args := []string{"verify", "-no_check_time"}
 
-	rootsFile := writePEMsToTempFile(roots.certs)
+	rootsFile := writePEMsToTempFile(allCerts(t, roots))
 	if debugOpenSSLFailure {
 		println("roots file:", rootsFile.Name())
 	} else {
@@ -2030,8 +2014,8 @@ func testChainAgainstOpenSSL(leaf *Certificate, intermediates, roots *CertPool) 
 	}
 	args = append(args, "-CAfile", rootsFile.Name())
 
-	if len(intermediates.certs) > 0 {
-		intermediatesFile := writePEMsToTempFile(intermediates.certs)
+	if intermediates.len() > 0 {
+		intermediatesFile := writePEMsToTempFile(allCerts(t, intermediates))
 		if debugOpenSSLFailure {
 			println("intermediates file:", intermediatesFile.Name())
 		} else {

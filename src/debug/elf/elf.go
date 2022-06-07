@@ -123,8 +123,8 @@ const (
 	ELFOSABI_NONE       OSABI = 0   /* UNIX System V ABI */
 	ELFOSABI_HPUX       OSABI = 1   /* HP-UX operating system */
 	ELFOSABI_NETBSD     OSABI = 2   /* NetBSD */
-	ELFOSABI_LINUX      OSABI = 3   /* GNU/Linux */
-	ELFOSABI_HURD       OSABI = 4   /* GNU/Hurd */
+	ELFOSABI_LINUX      OSABI = 3   /* Linux */
+	ELFOSABI_HURD       OSABI = 4   /* Hurd */
 	ELFOSABI_86OPEN     OSABI = 5   /* 86Open common IA32 ABI */
 	ELFOSABI_SOLARIS    OSABI = 6   /* Solaris */
 	ELFOSABI_AIX        OSABI = 7   /* AIX */
@@ -384,6 +384,7 @@ const (
 	EM_RISCV         Machine = 243 /* RISC-V */
 	EM_LANAI         Machine = 244 /* Lanai 32-bit processor */
 	EM_BPF           Machine = 247 /* Linux BPF – in-kernel virtual machine */
+	EM_LOONGARCH     Machine = 258 /* LoongArch */
 
 	/* Non-standard or deprecated. */
 	EM_486         Machine = 6      /* Intel i486. */
@@ -575,6 +576,7 @@ var machineStrings = []intName{
 	{243, "EM_RISCV"},
 	{244, "EM_LANAI"},
 	{247, "EM_BPF"},
+	{258, "EM_LOONGARCH"},
 
 	/* Non-standard or deprecated. */
 	{6, "EM_486"},
@@ -644,6 +646,7 @@ const (
 	SHT_GNU_VERSYM     SectionType = 0x6fffffff /* GNU version symbol table */
 	SHT_HIOS           SectionType = 0x6fffffff /* Last of OS specific semantics */
 	SHT_LOPROC         SectionType = 0x70000000 /* reserved range for processor */
+	SHT_MIPS_ABIFLAGS  SectionType = 0x7000002a /* .MIPS.abiflags */
 	SHT_HIPROC         SectionType = 0x7fffffff /* specific section header types */
 	SHT_LOUSER         SectionType = 0x80000000 /* reserved range for application */
 	SHT_HIUSER         SectionType = 0xffffffff /* specific indexes */
@@ -675,6 +678,7 @@ var shtStrings = []intName{
 	{0x6ffffffe, "SHT_GNU_VERNEED"},
 	{0x6fffffff, "SHT_GNU_VERSYM"},
 	{0x70000000, "SHT_LOPROC"},
+	{0x7000002a, "SHT_MIPS_ABIFLAGS"},
 	{0x7fffffff, "SHT_HIPROC"},
 	{0x80000000, "SHT_LOUSER"},
 	{0xffffffff, "SHT_HIUSER"},
@@ -745,18 +749,51 @@ func (i CompressionType) GoString() string { return stringName(uint32(i), compre
 type ProgType int
 
 const (
-	PT_NULL    ProgType = 0          /* Unused entry. */
-	PT_LOAD    ProgType = 1          /* Loadable segment. */
-	PT_DYNAMIC ProgType = 2          /* Dynamic linking information segment. */
-	PT_INTERP  ProgType = 3          /* Pathname of interpreter. */
-	PT_NOTE    ProgType = 4          /* Auxiliary information. */
-	PT_SHLIB   ProgType = 5          /* Reserved (not used). */
-	PT_PHDR    ProgType = 6          /* Location of program header itself. */
-	PT_TLS     ProgType = 7          /* Thread local storage segment */
-	PT_LOOS    ProgType = 0x60000000 /* First OS-specific. */
-	PT_HIOS    ProgType = 0x6fffffff /* Last OS-specific. */
-	PT_LOPROC  ProgType = 0x70000000 /* First processor-specific type. */
-	PT_HIPROC  ProgType = 0x7fffffff /* Last processor-specific type. */
+	PT_NULL    ProgType = 0 /* Unused entry. */
+	PT_LOAD    ProgType = 1 /* Loadable segment. */
+	PT_DYNAMIC ProgType = 2 /* Dynamic linking information segment. */
+	PT_INTERP  ProgType = 3 /* Pathname of interpreter. */
+	PT_NOTE    ProgType = 4 /* Auxiliary information. */
+	PT_SHLIB   ProgType = 5 /* Reserved (not used). */
+	PT_PHDR    ProgType = 6 /* Location of program header itself. */
+	PT_TLS     ProgType = 7 /* Thread local storage segment */
+
+	PT_LOOS ProgType = 0x60000000 /* First OS-specific. */
+
+	PT_GNU_EH_FRAME ProgType = 0x6474e550 /* Frame unwind information */
+	PT_GNU_STACK    ProgType = 0x6474e551 /* Stack flags */
+	PT_GNU_RELRO    ProgType = 0x6474e552 /* Read only after relocs */
+	PT_GNU_PROPERTY ProgType = 0x6474e553 /* GNU property */
+	PT_GNU_MBIND_LO ProgType = 0x6474e555 /* Mbind segments start */
+	PT_GNU_MBIND_HI ProgType = 0x6474f554 /* Mbind segments finish */
+
+	PT_PAX_FLAGS ProgType = 0x65041580 /* PAX flags */
+
+	PT_OPENBSD_RANDOMIZE ProgType = 0x65a3dbe6 /* Random data */
+	PT_OPENBSD_WXNEEDED  ProgType = 0x65a3dbe7 /* W^X violations */
+	PT_OPENBSD_BOOTDATA  ProgType = 0x65a41be6 /* Boot arguments */
+
+	PT_SUNW_EH_FRAME ProgType = 0x6474e550 /* Frame unwind information */
+	PT_SUNWSTACK     ProgType = 0x6ffffffb /* Stack segment */
+
+	PT_HIOS ProgType = 0x6fffffff /* Last OS-specific. */
+
+	PT_LOPROC ProgType = 0x70000000 /* First processor-specific type. */
+
+	PT_ARM_ARCHEXT ProgType = 0x70000000 /* Architecture compatibility */
+	PT_ARM_EXIDX   ProgType = 0x70000001 /* Exception unwind tables */
+
+	PT_AARCH64_ARCHEXT ProgType = 0x70000000 /* Architecture compatibility */
+	PT_AARCH64_UNWIND  ProgType = 0x70000001 /* Exception unwind tables */
+
+	PT_MIPS_REGINFO  ProgType = 0x70000000 /* Register usage */
+	PT_MIPS_RTPROC   ProgType = 0x70000001 /* Runtime procedures */
+	PT_MIPS_OPTIONS  ProgType = 0x70000002 /* Options */
+	PT_MIPS_ABIFLAGS ProgType = 0x70000003 /* ABI flags */
+
+	PT_S390_PGSTE ProgType = 0x70000000 /* 4k page table size */
+
+	PT_HIPROC ProgType = 0x7fffffff /* Last processor-specific type. */
 )
 
 var ptStrings = []intName{
@@ -769,8 +806,19 @@ var ptStrings = []intName{
 	{6, "PT_PHDR"},
 	{7, "PT_TLS"},
 	{0x60000000, "PT_LOOS"},
+	{0x6474e550, "PT_GNU_EH_FRAME"},
+	{0x6474e551, "PT_GNU_STACK"},
+	{0x6474e552, "PT_GNU_RELRO"},
+	{0x6474e553, "PT_GNU_PROPERTY"},
+	{0x65041580, "PT_PAX_FLAGS"},
+	{0x65a3dbe6, "PT_OPENBSD_RANDOMIZE"},
+	{0x65a3dbe7, "PT_OPENBSD_WXNEEDED"},
+	{0x65a41be6, "PT_OPENBSD_BOOTDATA"},
+	{0x6ffffffb, "PT_SUNWSTACK"},
 	{0x6fffffff, "PT_HIOS"},
 	{0x70000000, "PT_LOPROC"},
+	// We don't list the processor-dependent ProgTypes,
+	// as the values overlap.
 	{0x7fffffff, "PT_HIPROC"},
 }
 
@@ -837,15 +885,114 @@ const (
 	   the interpretation of the d_un union
 	   as follows: even == 'd_ptr', even == 'd_val'
 	   or none */
-	DT_PREINIT_ARRAY   DynTag = 32         /* Address of the array of pointers to pre-initialization functions. */
-	DT_PREINIT_ARRAYSZ DynTag = 33         /* Size in bytes of the array of pre-initialization functions. */
-	DT_LOOS            DynTag = 0x6000000d /* First OS-specific */
-	DT_HIOS            DynTag = 0x6ffff000 /* Last OS-specific */
-	DT_VERSYM          DynTag = 0x6ffffff0
-	DT_VERNEED         DynTag = 0x6ffffffe
-	DT_VERNEEDNUM      DynTag = 0x6fffffff
-	DT_LOPROC          DynTag = 0x70000000 /* First processor-specific type. */
-	DT_HIPROC          DynTag = 0x7fffffff /* Last processor-specific type. */
+	DT_PREINIT_ARRAY   DynTag = 32 /* Address of the array of pointers to pre-initialization functions. */
+	DT_PREINIT_ARRAYSZ DynTag = 33 /* Size in bytes of the array of pre-initialization functions. */
+	DT_SYMTAB_SHNDX    DynTag = 34 /* Address of SHT_SYMTAB_SHNDX section. */
+
+	DT_LOOS DynTag = 0x6000000d /* First OS-specific */
+	DT_HIOS DynTag = 0x6ffff000 /* Last OS-specific */
+
+	DT_VALRNGLO       DynTag = 0x6ffffd00
+	DT_GNU_PRELINKED  DynTag = 0x6ffffdf5
+	DT_GNU_CONFLICTSZ DynTag = 0x6ffffdf6
+	DT_GNU_LIBLISTSZ  DynTag = 0x6ffffdf7
+	DT_CHECKSUM       DynTag = 0x6ffffdf8
+	DT_PLTPADSZ       DynTag = 0x6ffffdf9
+	DT_MOVEENT        DynTag = 0x6ffffdfa
+	DT_MOVESZ         DynTag = 0x6ffffdfb
+	DT_FEATURE        DynTag = 0x6ffffdfc
+	DT_POSFLAG_1      DynTag = 0x6ffffdfd
+	DT_SYMINSZ        DynTag = 0x6ffffdfe
+	DT_SYMINENT       DynTag = 0x6ffffdff
+	DT_VALRNGHI       DynTag = 0x6ffffdff
+
+	DT_ADDRRNGLO    DynTag = 0x6ffffe00
+	DT_GNU_HASH     DynTag = 0x6ffffef5
+	DT_TLSDESC_PLT  DynTag = 0x6ffffef6
+	DT_TLSDESC_GOT  DynTag = 0x6ffffef7
+	DT_GNU_CONFLICT DynTag = 0x6ffffef8
+	DT_GNU_LIBLIST  DynTag = 0x6ffffef9
+	DT_CONFIG       DynTag = 0x6ffffefa
+	DT_DEPAUDIT     DynTag = 0x6ffffefb
+	DT_AUDIT        DynTag = 0x6ffffefc
+	DT_PLTPAD       DynTag = 0x6ffffefd
+	DT_MOVETAB      DynTag = 0x6ffffefe
+	DT_SYMINFO      DynTag = 0x6ffffeff
+	DT_ADDRRNGHI    DynTag = 0x6ffffeff
+
+	DT_VERSYM     DynTag = 0x6ffffff0
+	DT_RELACOUNT  DynTag = 0x6ffffff9
+	DT_RELCOUNT   DynTag = 0x6ffffffa
+	DT_FLAGS_1    DynTag = 0x6ffffffb
+	DT_VERDEF     DynTag = 0x6ffffffc
+	DT_VERDEFNUM  DynTag = 0x6ffffffd
+	DT_VERNEED    DynTag = 0x6ffffffe
+	DT_VERNEEDNUM DynTag = 0x6fffffff
+
+	DT_LOPROC DynTag = 0x70000000 /* First processor-specific type. */
+
+	DT_MIPS_RLD_VERSION           DynTag = 0x70000001
+	DT_MIPS_TIME_STAMP            DynTag = 0x70000002
+	DT_MIPS_ICHECKSUM             DynTag = 0x70000003
+	DT_MIPS_IVERSION              DynTag = 0x70000004
+	DT_MIPS_FLAGS                 DynTag = 0x70000005
+	DT_MIPS_BASE_ADDRESS          DynTag = 0x70000006
+	DT_MIPS_MSYM                  DynTag = 0x70000007
+	DT_MIPS_CONFLICT              DynTag = 0x70000008
+	DT_MIPS_LIBLIST               DynTag = 0x70000009
+	DT_MIPS_LOCAL_GOTNO           DynTag = 0x7000000a
+	DT_MIPS_CONFLICTNO            DynTag = 0x7000000b
+	DT_MIPS_LIBLISTNO             DynTag = 0x70000010
+	DT_MIPS_SYMTABNO              DynTag = 0x70000011
+	DT_MIPS_UNREFEXTNO            DynTag = 0x70000012
+	DT_MIPS_GOTSYM                DynTag = 0x70000013
+	DT_MIPS_HIPAGENO              DynTag = 0x70000014
+	DT_MIPS_RLD_MAP               DynTag = 0x70000016
+	DT_MIPS_DELTA_CLASS           DynTag = 0x70000017
+	DT_MIPS_DELTA_CLASS_NO        DynTag = 0x70000018
+	DT_MIPS_DELTA_INSTANCE        DynTag = 0x70000019
+	DT_MIPS_DELTA_INSTANCE_NO     DynTag = 0x7000001a
+	DT_MIPS_DELTA_RELOC           DynTag = 0x7000001b
+	DT_MIPS_DELTA_RELOC_NO        DynTag = 0x7000001c
+	DT_MIPS_DELTA_SYM             DynTag = 0x7000001d
+	DT_MIPS_DELTA_SYM_NO          DynTag = 0x7000001e
+	DT_MIPS_DELTA_CLASSSYM        DynTag = 0x70000020
+	DT_MIPS_DELTA_CLASSSYM_NO     DynTag = 0x70000021
+	DT_MIPS_CXX_FLAGS             DynTag = 0x70000022
+	DT_MIPS_PIXIE_INIT            DynTag = 0x70000023
+	DT_MIPS_SYMBOL_LIB            DynTag = 0x70000024
+	DT_MIPS_LOCALPAGE_GOTIDX      DynTag = 0x70000025
+	DT_MIPS_LOCAL_GOTIDX          DynTag = 0x70000026
+	DT_MIPS_HIDDEN_GOTIDX         DynTag = 0x70000027
+	DT_MIPS_PROTECTED_GOTIDX      DynTag = 0x70000028
+	DT_MIPS_OPTIONS               DynTag = 0x70000029
+	DT_MIPS_INTERFACE             DynTag = 0x7000002a
+	DT_MIPS_DYNSTR_ALIGN          DynTag = 0x7000002b
+	DT_MIPS_INTERFACE_SIZE        DynTag = 0x7000002c
+	DT_MIPS_RLD_TEXT_RESOLVE_ADDR DynTag = 0x7000002d
+	DT_MIPS_PERF_SUFFIX           DynTag = 0x7000002e
+	DT_MIPS_COMPACT_SIZE          DynTag = 0x7000002f
+	DT_MIPS_GP_VALUE              DynTag = 0x70000030
+	DT_MIPS_AUX_DYNAMIC           DynTag = 0x70000031
+	DT_MIPS_PLTGOT                DynTag = 0x70000032
+	DT_MIPS_RWPLT                 DynTag = 0x70000034
+	DT_MIPS_RLD_MAP_REL           DynTag = 0x70000035
+
+	DT_PPC_GOT DynTag = 0x70000000
+	DT_PPC_OPT DynTag = 0x70000001
+
+	DT_PPC64_GLINK DynTag = 0x70000000
+	DT_PPC64_OPD   DynTag = 0x70000001
+	DT_PPC64_OPDSZ DynTag = 0x70000002
+	DT_PPC64_OPT   DynTag = 0x70000003
+
+	DT_SPARC_REGISTER DynTag = 0x70000001
+
+	DT_AUXILIARY DynTag = 0x7ffffffd
+	DT_USED      DynTag = 0x7ffffffe
+	DT_FILTER    DynTag = 0x7fffffff
+
+	DT_HIPROC DynTag = 0x7fffffff /* Last processor-specific type. */
 )
 
 var dtStrings = []intName{
@@ -883,13 +1030,49 @@ var dtStrings = []intName{
 	{32, "DT_ENCODING"},
 	{32, "DT_PREINIT_ARRAY"},
 	{33, "DT_PREINIT_ARRAYSZ"},
+	{34, "DT_SYMTAB_SHNDX"},
 	{0x6000000d, "DT_LOOS"},
 	{0x6ffff000, "DT_HIOS"},
+	{0x6ffffd00, "DT_VALRNGLO"},
+	{0x6ffffdf5, "DT_GNU_PRELINKED"},
+	{0x6ffffdf6, "DT_GNU_CONFLICTSZ"},
+	{0x6ffffdf7, "DT_GNU_LIBLISTSZ"},
+	{0x6ffffdf8, "DT_CHECKSUM"},
+	{0x6ffffdf9, "DT_PLTPADSZ"},
+	{0x6ffffdfa, "DT_MOVEENT"},
+	{0x6ffffdfb, "DT_MOVESZ"},
+	{0x6ffffdfc, "DT_FEATURE"},
+	{0x6ffffdfd, "DT_POSFLAG_1"},
+	{0x6ffffdfe, "DT_SYMINSZ"},
+	{0x6ffffdff, "DT_SYMINENT"},
+	{0x6ffffdff, "DT_VALRNGHI"},
+	{0x6ffffe00, "DT_ADDRRNGLO"},
+	{0x6ffffef5, "DT_GNU_HASH"},
+	{0x6ffffef6, "DT_TLSDESC_PLT"},
+	{0x6ffffef7, "DT_TLSDESC_GOT"},
+	{0x6ffffef8, "DT_GNU_CONFLICT"},
+	{0x6ffffef9, "DT_GNU_LIBLIST"},
+	{0x6ffffefa, "DT_CONFIG"},
+	{0x6ffffefb, "DT_DEPAUDIT"},
+	{0x6ffffefc, "DT_AUDIT"},
+	{0x6ffffefd, "DT_PLTPAD"},
+	{0x6ffffefe, "DT_MOVETAB"},
+	{0x6ffffeff, "DT_SYMINFO"},
+	{0x6ffffeff, "DT_ADDRRNGHI"},
 	{0x6ffffff0, "DT_VERSYM"},
+	{0x6ffffff9, "DT_RELACOUNT"},
+	{0x6ffffffa, "DT_RELCOUNT"},
+	{0x6ffffffb, "DT_FLAGS_1"},
+	{0x6ffffffc, "DT_VERDEF"},
+	{0x6ffffffd, "DT_VERDEFNUM"},
 	{0x6ffffffe, "DT_VERNEED"},
 	{0x6fffffff, "DT_VERNEEDNUM"},
 	{0x70000000, "DT_LOPROC"},
-	{0x7fffffff, "DT_HIPROC"},
+	// We don't list the processor-dependent DynTags,
+	// as the values overlap.
+	{0x7ffffffd, "DT_AUXILIARY"},
+	{0x7ffffffe, "DT_USED"},
+	{0x7fffffff, "DT_FILTER"},
 }
 
 func (i DynTag) String() string   { return stringName(uint32(i), dtStrings, false) }
@@ -1969,6 +2152,118 @@ var rmipsStrings = []intName{
 func (i R_MIPS) String() string   { return stringName(uint32(i), rmipsStrings, false) }
 func (i R_MIPS) GoString() string { return stringName(uint32(i), rmipsStrings, true) }
 
+// Relocation types for LARCH.
+type R_LARCH int
+
+const (
+	R_LARCH_NONE                       R_LARCH = 0
+	R_LARCH_32                         R_LARCH = 1
+	R_LARCH_64                         R_LARCH = 2
+	R_LARCH_RELATIVE                   R_LARCH = 3
+	R_LARCH_COPY                       R_LARCH = 4
+	R_LARCH_JUMP_SLOT                  R_LARCH = 5
+	R_LARCH_TLS_DTPMOD32               R_LARCH = 6
+	R_LARCH_TLS_DTPMOD64               R_LARCH = 7
+	R_LARCH_TLS_DTPREL32               R_LARCH = 8
+	R_LARCH_TLS_DTPREL64               R_LARCH = 9
+	R_LARCH_TLS_TPREL32                R_LARCH = 10
+	R_LARCH_TLS_TPREL64                R_LARCH = 11
+	R_LARCH_IRELATIVE                  R_LARCH = 12
+	R_LARCH_MARK_LA                    R_LARCH = 20
+	R_LARCH_MARK_PCREL                 R_LARCH = 21
+	R_LARCH_SOP_PUSH_PCREL             R_LARCH = 22
+	R_LARCH_SOP_PUSH_ABSOLUTE          R_LARCH = 23
+	R_LARCH_SOP_PUSH_DUP               R_LARCH = 24
+	R_LARCH_SOP_PUSH_GPREL             R_LARCH = 25
+	R_LARCH_SOP_PUSH_TLS_TPREL         R_LARCH = 26
+	R_LARCH_SOP_PUSH_TLS_GOT           R_LARCH = 27
+	R_LARCH_SOP_PUSH_TLS_GD            R_LARCH = 28
+	R_LARCH_SOP_PUSH_PLT_PCREL         R_LARCH = 29
+	R_LARCH_SOP_ASSERT                 R_LARCH = 30
+	R_LARCH_SOP_NOT                    R_LARCH = 31
+	R_LARCH_SOP_SUB                    R_LARCH = 32
+	R_LARCH_SOP_SL                     R_LARCH = 33
+	R_LARCH_SOP_SR                     R_LARCH = 34
+	R_LARCH_SOP_ADD                    R_LARCH = 35
+	R_LARCH_SOP_AND                    R_LARCH = 36
+	R_LARCH_SOP_IF_ELSE                R_LARCH = 37
+	R_LARCH_SOP_POP_32_S_10_5          R_LARCH = 38
+	R_LARCH_SOP_POP_32_U_10_12         R_LARCH = 39
+	R_LARCH_SOP_POP_32_S_10_12         R_LARCH = 40
+	R_LARCH_SOP_POP_32_S_10_16         R_LARCH = 41
+	R_LARCH_SOP_POP_32_S_10_16_S2      R_LARCH = 42
+	R_LARCH_SOP_POP_32_S_5_20          R_LARCH = 43
+	R_LARCH_SOP_POP_32_S_0_5_10_16_S2  R_LARCH = 44
+	R_LARCH_SOP_POP_32_S_0_10_10_16_S2 R_LARCH = 45
+	R_LARCH_SOP_POP_32_U               R_LARCH = 46
+	R_LARCH_ADD8                       R_LARCH = 47
+	R_LARCH_ADD16                      R_LARCH = 48
+	R_LARCH_ADD24                      R_LARCH = 49
+	R_LARCH_ADD32                      R_LARCH = 50
+	R_LARCH_ADD64                      R_LARCH = 51
+	R_LARCH_SUB8                       R_LARCH = 52
+	R_LARCH_SUB16                      R_LARCH = 53
+	R_LARCH_SUB24                      R_LARCH = 54
+	R_LARCH_SUB32                      R_LARCH = 55
+	R_LARCH_SUB64                      R_LARCH = 56
+)
+
+var rlarchStrings = []intName{
+	{0, "R_LARCH_NONE"},
+	{1, "R_LARCH_32"},
+	{2, "R_LARCH_64"},
+	{3, "R_LARCH_RELATIVE"},
+	{4, "R_LARCH_COPY"},
+	{5, "R_LARCH_JUMP_SLOT"},
+	{6, "R_LARCH_TLS_DTPMOD32"},
+	{7, "R_LARCH_TLS_DTPMOD64"},
+	{8, "R_LARCH_TLS_DTPREL32"},
+	{9, "R_LARCH_TLS_DTPREL64"},
+	{10, "R_LARCH_TLS_TPREL32"},
+	{11, "R_LARCH_TLS_TPREL64"},
+	{12, "R_LARCH_IRELATIVE"},
+	{20, "R_LARCH_MARK_LA"},
+	{21, "R_LARCH_MARK_PCREL"},
+	{22, "R_LARCH_SOP_PUSH_PCREL"},
+	{23, "R_LARCH_SOP_PUSH_ABSOLUTE"},
+	{24, "R_LARCH_SOP_PUSH_DUP"},
+	{25, "R_LARCH_SOP_PUSH_GPREL"},
+	{26, "R_LARCH_SOP_PUSH_TLS_TPREL"},
+	{27, "R_LARCH_SOP_PUSH_TLS_GOT"},
+	{28, "R_LARCH_SOP_PUSH_TLS_GD"},
+	{29, "R_LARCH_SOP_PUSH_PLT_PCREL"},
+	{30, "R_LARCH_SOP_ASSERT"},
+	{31, "R_LARCH_SOP_NOT"},
+	{32, "R_LARCH_SOP_SUB"},
+	{33, "R_LARCH_SOP_SL"},
+	{34, "R_LARCH_SOP_SR"},
+	{35, "R_LARCH_SOP_ADD"},
+	{36, "R_LARCH_SOP_AND"},
+	{37, "R_LARCH_SOP_IF_ELSE"},
+	{38, "R_LARCH_SOP_POP_32_S_10_5"},
+	{39, "R_LARCH_SOP_POP_32_U_10_12"},
+	{40, "R_LARCH_SOP_POP_32_S_10_12"},
+	{41, "R_LARCH_SOP_POP_32_S_10_16"},
+	{42, "R_LARCH_SOP_POP_32_S_10_16_S2"},
+	{43, "R_LARCH_SOP_POP_32_S_5_20"},
+	{44, "R_LARCH_SOP_POP_32_S_0_5_10_16_S2"},
+	{45, "R_LARCH_SOP_POP_32_S_0_10_10_16_S2"},
+	{46, "R_LARCH_SOP_POP_32_U"},
+	{47, "R_LARCH_ADD8"},
+	{48, "R_LARCH_ADD16"},
+	{49, "R_LARCH_ADD24"},
+	{50, "R_LARCH_ADD32"},
+	{51, "R_LARCH_ADD64"},
+	{52, "R_LARCH_SUB8"},
+	{53, "R_LARCH_SUB16"},
+	{54, "R_LARCH_SUB24"},
+	{55, "R_LARCH_SUB32"},
+	{56, "R_LARCH_SUB64"},
+}
+
+func (i R_LARCH) String() string   { return stringName(uint32(i), rlarchStrings, false) }
+func (i R_LARCH) GoString() string { return stringName(uint32(i), rlarchStrings, true) }
+
 // Relocation types for PowerPC.
 //
 // Values that are shared by both R_PPC and R_PPC64 are prefixed with
@@ -2168,6 +2463,7 @@ const (
 	R_PPC64_GOT16_HI           R_PPC64 = 16 // R_POWERPC_GOT16_HI
 	R_PPC64_GOT16_HA           R_PPC64 = 17 // R_POWERPC_GOT16_HA
 	R_PPC64_JMP_SLOT           R_PPC64 = 21 // R_POWERPC_JMP_SLOT
+	R_PPC64_RELATIVE           R_PPC64 = 22 // R_POWERPC_RELATIVE
 	R_PPC64_REL32              R_PPC64 = 26 // R_POWERPC_REL32
 	R_PPC64_ADDR64             R_PPC64 = 38
 	R_PPC64_ADDR16_HIGHER      R_PPC64 = 39
@@ -2276,6 +2572,7 @@ var rppc64Strings = []intName{
 	{16, "R_PPC64_GOT16_HI"},
 	{17, "R_PPC64_GOT16_HA"},
 	{21, "R_PPC64_JMP_SLOT"},
+	{22, "R_PPC64_RELATIVE"},
 	{26, "R_PPC64_REL32"},
 	{38, "R_PPC64_ADDR64"},
 	{39, "R_PPC64_ADDR16_HIGHER"},

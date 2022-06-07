@@ -1,5 +1,5 @@
 // Inferno utils/5l/obj.c
-// https://bitbucket.org/inferno-os/inferno-os/src/default/utils/5l/obj.c
+// https://bitbucket.org/inferno-os/inferno-os/src/master/utils/5l/obj.c
 //
 //	Copyright © 1994-1999 Lucent Technologies Inc.  All rights reserved.
 //	Portions Copyright © 1995-1997 C H Forsyth (forsyth@terzarima.net)
@@ -45,15 +45,18 @@ func Init() (*sys.Arch, ld.Arch) {
 		Minalign:   minAlign,
 		Dwarfregsp: dwarfRegSP,
 		Dwarfreglr: dwarfRegLR,
+		TrampLimit: 0x1c00000, // 24-bit signed offset * 4, leave room for PLT etc.
+
+		Plan9Magic: 0x647,
 
 		Adddynrel:        adddynrel,
 		Archinit:         archinit,
 		Archreloc:        archreloc,
 		Archrelocvariant: archrelocvariant,
+		Extreloc:         extreloc,
 		Trampoline:       trampoline,
-		Asmb:             asmb,
-		Asmb2:            asmb2,
 		Elfreloc1:        elfreloc1,
+		ElfrelocSize:     8,
 		Elfsetupplt:      elfsetupplt,
 		Gentext:          gentext,
 		Machoreloc1:      machoreloc1,

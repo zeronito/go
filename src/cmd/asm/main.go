@@ -8,6 +8,7 @@ import (
 	"bufio"
 	"flag"
 	"fmt"
+	"internal/buildcfg"
 	"log"
 	"os"
 
@@ -25,22 +26,26 @@ func main() {
 	log.SetFlags(0)
 	log.SetPrefix("asm: ")
 
-	GOARCH := objabi.GOARCH
+	buildcfg.Check()
+	GOARCH := buildcfg.GOARCH
 
-	architecture := arch.Set(GOARCH)
+	flags.Parse()
+
+	architecture := arch.Set(GOARCH, *flags.Shared || *flags.Dynlink)
 	if architecture == nil {
 		log.Fatalf("unrecognized architecture %s", GOARCH)
 	}
 
-	flags.Parse()
-
 	ctxt := obj.Linknew(architecture.LinkArch)
-	if *flags.PrintOut {
-		ctxt.Debugasm = 1
-	}
+	ctxt.Debugasm = flags.PrintOut
+	ctxt.Debugvlog = flags.DebugV
 	ctxt.Flag_dynlink = *flags.Dynlink
+	ctxt.Flag_linkshared = *flags.Linkshared
 	ctxt.Flag_shared = *flags.Shared || *flags.Dynlink
-	ctxt.Flag_go115newobj = *flags.Go115Newobj
+	ctxt.Flag_maymorestack = flags.DebugFlags.MayMoreStack
+	ctxt.Debugpcln = flags.DebugFlags.PCTab
+	ctxt.IsAsm = true
+	ctxt.Pkgpath = *flags.Importpath
 	switch *flags.Spectre {
 	default:
 		log.Printf("unknown setting -spectre=%s", *flags.Spectre)
@@ -67,7 +72,7 @@ func main() {
 	defer buf.Close()
 
 	if !*flags.SymABIs {
-		fmt.Fprintf(buf, "go object %s %s %s\n", objabi.GOOS, objabi.GOARCH, objabi.Version)
+		buf.WriteString(objabi.HeaderString())
 		fmt.Fprintf(buf, "!\n")
 	}
 
@@ -75,7 +80,8 @@ func main() {
 	var failedFile string
 	for _, f := range flag.Args() {
 		lexer := lex.NewLexer(f)
-		parser := asm.NewParser(ctxt, architecture, lexer)
+		parser := asm.NewParser(ctxt, architecture, lexer,
+			*flags.CompilingRuntime)
 		ctxt.DiagFunc = func(format string, args ...interface{}) {
 			diag = true
 			log.Printf(format, args...)
@@ -96,8 +102,8 @@ func main() {
 		}
 	}
 	if ok && !*flags.SymABIs {
-		ctxt.NumberSyms(true)
-		obj.WriteObjFile(ctxt, buf, "")
+		ctxt.NumberSyms()
+		obj.WriteObjFile(ctxt, buf)
 	}
 	if !ok || diag {
 		if failedFile != "" {

@@ -25,6 +25,14 @@ import (
 // recursive read locking. This is to ensure that the lock eventually becomes
 // available; a blocked Lock call excludes new readers from acquiring the
 // lock.
+//
+// In the terminology of the Go memory model,
+// the n'th call to Unlock “synchronizes before” the m'th call to Lock
+// for any n < m, just as for Mutex.
+// For any call to RLock, there exists an n such that
+// the n'th call to Unlock “synchronizes before” that call to RLock,
+// and the corresponding call to RUnlock “synchronizes before”
+// the n+1'th call to Lock.
 type RWMutex struct {
 	w           Mutex  // held if there are pending writers
 	writerSem   uint32 // semaphore for writers to wait for completing readers
@@ -34,6 +42,19 @@ type RWMutex struct {
 }
 
 const rwmutexMaxReaders = 1 << 30
+
+// Happens-before relationships are indicated to the race detector via:
+// - Unlock  -> Lock:  readerSem
+// - Unlock  -> RLock: readerSem
+// - RUnlock -> Lock:  writerSem
+//
+// The methods below temporarily disable handling of race synchronization
+// events in order to provide the more precise model above to the race
+// detector.
+//
+// For example, atomic.AddInt32 in RLock should not appear to provide
+// acquire-release semantics, which would incorrectly synchronize racing
+// readers, thus potentially missing races.
 
 // RLock locks rw for reading.
 //
@@ -52,6 +73,34 @@ func (rw *RWMutex) RLock() {
 	if race.Enabled {
 		race.Enable()
 		race.Acquire(unsafe.Pointer(&rw.readerSem))
+	}
+}
+
+// TryRLock tries to lock rw for reading and reports whether it succeeded.
+//
+// Note that while correct uses of TryRLock do exist, they are rare,
+// and use of TryRLock is often a sign of a deeper problem
+// in a particular use of mutexes.
+func (rw *RWMutex) TryRLock() bool {
+	if race.Enabled {
+		_ = rw.w.state
+		race.Disable()
+	}
+	for {
+		c := atomic.LoadInt32(&rw.readerCount)
+		if c < 0 {
+			if race.Enabled {
+				race.Enable()
+			}
+			return false
+		}
+		if atomic.CompareAndSwapInt32(&rw.readerCount, c, c+1) {
+			if race.Enabled {
+				race.Enable()
+				race.Acquire(unsafe.Pointer(&rw.readerSem))
+			}
+			return true
+		}
 	}
 }
 
@@ -77,7 +126,7 @@ func (rw *RWMutex) RUnlock() {
 func (rw *RWMutex) rUnlockSlow(r int32) {
 	if r+1 == 0 || r+1 == -rwmutexMaxReaders {
 		race.Enable()
-		throw("sync: RUnlock of unlocked RWMutex")
+		fatal("sync: RUnlock of unlocked RWMutex")
 	}
 	// A writer is pending.
 	if atomic.AddInt32(&rw.readerWait, -1) == 0 {
@@ -109,6 +158,37 @@ func (rw *RWMutex) Lock() {
 	}
 }
 
+// TryLock tries to lock rw for writing and reports whether it succeeded.
+//
+// Note that while correct uses of TryLock do exist, they are rare,
+// and use of TryLock is often a sign of a deeper problem
+// in a particular use of mutexes.
+func (rw *RWMutex) TryLock() bool {
+	if race.Enabled {
+		_ = rw.w.state
+		race.Disable()
+	}
+	if !rw.w.TryLock() {
+		if race.Enabled {
+			race.Enable()
+		}
+		return false
+	}
+	if !atomic.CompareAndSwapInt32(&rw.readerCount, 0, -rwmutexMaxReaders) {
+		rw.w.Unlock()
+		if race.Enabled {
+			race.Enable()
+		}
+		return false
+	}
+	if race.Enabled {
+		race.Enable()
+		race.Acquire(unsafe.Pointer(&rw.readerSem))
+		race.Acquire(unsafe.Pointer(&rw.writerSem))
+	}
+	return true
+}
+
 // Unlock unlocks rw for writing. It is a run-time error if rw is
 // not locked for writing on entry to Unlock.
 //
@@ -126,7 +206,7 @@ func (rw *RWMutex) Unlock() {
 	r := atomic.AddInt32(&rw.readerCount, rwmutexMaxReaders)
 	if r >= rwmutexMaxReaders {
 		race.Enable()
-		throw("sync: Unlock of unlocked RWMutex")
+		fatal("sync: Unlock of unlocked RWMutex")
 	}
 	// Unblock blocked readers, if any.
 	for i := 0; i < int(r); i++ {

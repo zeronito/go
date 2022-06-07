@@ -152,7 +152,7 @@ func (d *Data) LineReader(cu *Entry) (*LineReader, error) {
 		// cu has no line table.
 		return nil, nil
 	}
-	if off > int64(len(d.line)) {
+	if off < 0 || off > int64(len(d.line)) {
 		return nil, errors.New("AttrStmtList value out of range")
 	}
 	// AttrCompDir is optional if all file names are absolute. Use
@@ -814,7 +814,11 @@ func pathJoin(dirname, filename string) string {
 		// Drives are the same. Ignore drive on filename.
 	}
 	if !(strings.HasSuffix(dirname, "/") || strings.HasSuffix(dirname, `\`)) && dirname != "" {
-		dirname += `\`
+		sep := `\`
+		if strings.HasPrefix(dirname, "/") {
+			sep = `/`
+		}
+		dirname += sep
 	}
 	return drive + dirname + filename
 }

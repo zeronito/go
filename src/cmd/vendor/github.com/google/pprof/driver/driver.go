@@ -137,12 +137,14 @@ type MappingSources map[string][]struct {
 type ObjTool interface {
 	// Open opens the named object file. If the object is a shared
 	// library, start/limit/offset are the addresses where it is mapped
-	// into memory in the address space being inspected.
-	Open(file string, start, limit, offset uint64) (ObjFile, error)
+	// into memory in the address space being inspected. If the object
+	// is a linux kernel, relocationSymbol is the name of the symbol
+	// corresponding to the start address.
+	Open(file string, start, limit, offset uint64, relocationSymbol string) (ObjFile, error)
 
 	// Disasm disassembles the named object file, starting at
 	// the start address and stopping at (before) the end address.
-	Disasm(file string, start, end uint64) ([]Inst, error)
+	Disasm(file string, start, end uint64, intelSyntax bool) ([]Inst, error)
 }
 
 // An Inst is a single instruction in an assembly listing.
@@ -159,8 +161,8 @@ type ObjFile interface {
 	// Name returns the underlying file name, if available.
 	Name() string
 
-	// Base returns the base address to use when looking up symbols in the file.
-	Base() uint64
+	// ObjAddr returns the objdump address corresponding to a runtime address.
+	ObjAddr(addr uint64) (uint64, error)
 
 	// BuildID returns the GNU build ID of the file, or an empty string.
 	BuildID() string
@@ -232,8 +234,8 @@ type internalObjTool struct {
 	ObjTool
 }
 
-func (o *internalObjTool) Open(file string, start, limit, offset uint64) (plugin.ObjFile, error) {
-	f, err := o.ObjTool.Open(file, start, limit, offset)
+func (o *internalObjTool) Open(file string, start, limit, offset uint64, relocationSymbol string) (plugin.ObjFile, error) {
+	f, err := o.ObjTool.Open(file, start, limit, offset, relocationSymbol)
 	if err != nil {
 		return nil, err
 	}
@@ -269,8 +271,8 @@ func (f *internalObjFile) Symbols(r *regexp.Regexp, addr uint64) ([]*plugin.Sym,
 	return pluginSyms, nil
 }
 
-func (o *internalObjTool) Disasm(file string, start, end uint64) ([]plugin.Inst, error) {
-	insts, err := o.ObjTool.Disasm(file, start, end)
+func (o *internalObjTool) Disasm(file string, start, end uint64, intelSyntax bool) ([]plugin.Inst, error) {
+	insts, err := o.ObjTool.Disasm(file, start, end, intelSyntax)
 	if err != nil {
 		return nil, err
 	}

@@ -5,68 +5,14 @@
 package runtime
 
 import (
+	"internal/abi"
 	"runtime/internal/atomic"
-	"runtime/internal/sys"
 	"unsafe"
 )
 
 type mOS struct {
 	waitsemacount uint32
 }
-
-//go:noescape
-func setitimer(mode int32, new, old *itimerval)
-
-//go:noescape
-func sigaction(sig uint32, new, old *sigactiont)
-
-//go:noescape
-func sigaltstack(new, old *stackt)
-
-//go:noescape
-func obsdsigprocmask(how int32, new sigset) sigset
-
-//go:nosplit
-//go:nowritebarrierrec
-func sigprocmask(how int32, new, old *sigset) {
-	n := sigset(0)
-	if new != nil {
-		n = *new
-	}
-	r := obsdsigprocmask(how, n)
-	if old != nil {
-		*old = r
-	}
-}
-
-//go:noescape
-func sysctl(mib *uint32, miblen uint32, out *byte, size *uintptr, dst *byte, ndst uintptr) int32
-
-func raiseproc(sig uint32)
-
-func getthrid() int32
-func thrkill(tid int32, sig int)
-
-//go:noescape
-func tfork(param *tforkt, psize uintptr, mm *m, gg *g, fn uintptr) int32
-
-//go:noescape
-func thrsleep(ident uintptr, clock_id int32, tsp *timespec, lock uintptr, abort *uint32) int32
-
-//go:noescape
-func thrwakeup(ident uintptr, n int32) int32
-
-func osyield()
-
-func kqueue() int32
-
-//go:noescape
-func kevent(kq int32, ch *keventt, nch int32, ev *keventt, nev int32, ts *timespec) int32
-
-func pipe() (r, w int32, errno int32)
-func pipe2(flags int32) (r, w int32, errno int32)
-func closeonexec(fd int32)
-func setNonblock(fd int32)
 
 const (
 	_ESRCH       = 3
@@ -183,36 +129,6 @@ func semawakeup(mp *m) {
 	}
 }
 
-// May run with m.p==nil, so write barriers are not allowed.
-//go:nowritebarrier
-func newosproc(mp *m) {
-	stk := unsafe.Pointer(mp.g0.stack.hi)
-	if false {
-		print("newosproc stk=", stk, " m=", mp, " g=", mp.g0, " id=", mp.id, " ostk=", &mp, "\n")
-	}
-
-	// Stack pointer must point inside stack area (as marked with MAP_STACK),
-	// rather than at the top of it.
-	param := tforkt{
-		tf_tcb:   unsafe.Pointer(&mp.tls[0]),
-		tf_tid:   nil, // minit will record tid
-		tf_stack: uintptr(stk) - sys.PtrSize,
-	}
-
-	var oset sigset
-	sigprocmask(_SIG_SETMASK, &sigset_all, &oset)
-	ret := tfork(&param, unsafe.Sizeof(param), mp, mp.g0, funcPC(mstart))
-	sigprocmask(_SIG_SETMASK, &oset, nil)
-
-	if ret < 0 {
-		print("runtime: failed to create new OS thread (have ", mcount()-1, " already; errno=", -ret, ")\n")
-		if ret == -_EAGAIN {
-			println("runtime: may need to increase max user processes (ulimit -p)")
-		}
-		throw("runtime.newosproc")
-	}
-}
-
 func osinit() {
 	ncpu = getncpu()
 	physPageSize = getPageSize()
@@ -236,7 +152,11 @@ func goenvs() {
 // Called to initialize a new m (including the bootstrap m).
 // Called on the parent thread (main thread in case of bootstrap), can allocate memory.
 func mpreinit(mp *m) {
-	mp.gsignal = malg(32 * 1024)
+	gsignalSize := int32(32 * 1024)
+	if GOARCH == "mips64" {
+		gsignalSize = int32(64 * 1024)
+	}
+	mp.gsignal = malg(gsignalSize)
 	mp.gsignal.m = mp
 }
 
@@ -248,9 +168,15 @@ func minit() {
 }
 
 // Called from dropm to undo the effect of an minit.
+//
 //go:nosplit
 func unminit() {
 	unminitSignals()
+}
+
+// Called from exitm, but not from drop, to undo the effect of thread-owned
+// resources in minit, semacreate, or elsewhere. Do not take locks after calling this.
+func mdestroy(mp *m) {
 }
 
 func sigtramp()
@@ -267,8 +193,8 @@ func setsig(i uint32, fn uintptr) {
 	var sa sigactiont
 	sa.sa_flags = _SA_SIGINFO | _SA_ONSTACK | _SA_RESTART
 	sa.sa_mask = uint32(sigset_all)
-	if fn == funcPC(sighandler) {
-		fn = funcPC(sigtramp)
+	if fn == abi.FuncPCABIInternal(sighandler) { // abi.FuncPCABIInternal(sighandler) matches the callers in signal_unix.go
+		fn = abi.FuncPCABI0(sigtramp)
 	}
 	sa.sa_sigaction = fn
 	sigaction(i, &sa, nil)
@@ -289,6 +215,7 @@ func getsig(i uint32) uintptr {
 }
 
 // setSignaltstackSP sets the ss_sp field of a stackt.
+//
 //go:nosplit
 func setSignalstackSP(s *stackt, sp uintptr) {
 	s.ss_sp = sp
@@ -306,6 +233,19 @@ func sigdelset(mask *sigset, i int) {
 
 //go:nosplit
 func (c *sigctxt) fixsigcode(sig uint32) {
+}
+
+func setProcessCPUProfiler(hz int32) {
+	setProcessCPUProfilerTimer(hz)
+}
+
+func setThreadCPUProfiler(hz int32) {
+	setThreadCPUProfilerHz(hz)
+}
+
+//go:nosplit
+func validSIGPROF(mp *m, c *sigctxt) bool {
+	return true
 }
 
 var haveMapStack = false
@@ -340,10 +280,20 @@ func osStackRemap(s *mspan, flags int32) {
 	}
 }
 
+//go:nosplit
 func raise(sig uint32) {
 	thrkill(getthrid(), int(sig))
 }
 
 func signalM(mp *m, sig int) {
 	thrkill(int32(mp.procid), sig)
+}
+
+// sigPerThreadSyscall is only used on linux, so we assign a bogus signal
+// number.
+const sigPerThreadSyscall = 1 << 31
+
+//go:nosplit
+func runPerThreadSyscall() {
+	throw("runPerThreadSyscall only valid on linux")
 }

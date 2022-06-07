@@ -44,23 +44,23 @@ var x [256]byte
 // Check that large disjoint copies are replaced with moves.
 
 func moveDisjointStack32() {
-        var s [32]byte
-        // ppc64:-".*memmove"
-        // ppc64le:-".*memmove"
-        // ppc64le/power8:"LXVD2X",-"ADD",-"BC"
-        // ppc64le/power9:"LXV",-"LXVD2X",-"ADD",-"BC"
-        copy(s[:], x[:32])
-        runtime.KeepAlive(&s)
+	var s [32]byte
+	// ppc64:-".*memmove"
+	// ppc64le:-".*memmove"
+	// ppc64le/power8:"LXVD2X",-"ADD",-"BC"
+	// ppc64le/power9:"LXV",-"LXVD2X",-"ADD",-"BC"
+	copy(s[:], x[:32])
+	runtime.KeepAlive(&s)
 }
 
 func moveDisjointStack64() {
-        var s [96]byte
-        // ppc64:-".*memmove"
-        // ppc64le:-".*memmove"
-        // ppc64le/power8:"LXVD2X","ADD","BC"
-        // ppc64le/power9:"LXV",-"LXVD2X",-"ADD",-"BC"
-        copy(s[:], x[:96])
-        runtime.KeepAlive(&s)
+	var s [96]byte
+	// ppc64:-".*memmove"
+	// ppc64le:-".*memmove"
+	// ppc64le/power8:"LXVD2X","ADD","BC"
+	// ppc64le/power9:"LXV",-"LXVD2X",-"ADD",-"BC"
+	copy(s[:], x[:96])
+	runtime.KeepAlive(&s)
 }
 
 func moveDisjointStack() {
@@ -95,6 +95,50 @@ func moveDisjointNoOverlap(a *[256]byte) {
 	// ppc64le/power8:"LXVD2X"
 	// ppc64le/power9:"LXV",-"LXVD2X"
 	copy(a[:], a[128:])
+}
+
+// Check arch-specific memmove lowering. See issue 41662 fot details
+
+func moveArchLowering1(b []byte, x *[1]byte) {
+	_ = b[1]
+	// amd64:-".*memmove"
+	// arm64:-".*memmove"
+	// ppc64:-".*memmove"
+	// ppc64le:-".*memmove"
+	copy(b, x[:])
+}
+
+func moveArchLowering2(b []byte, x *[2]byte) {
+	_ = b[2]
+	// amd64:-".*memmove"
+	// arm64:-".*memmove"
+	// ppc64:-".*memmove"
+	// ppc64le:-".*memmove"
+	copy(b, x[:])
+}
+
+func moveArchLowering4(b []byte, x *[4]byte) {
+	_ = b[4]
+	// amd64:-".*memmove"
+	// arm64:-".*memmove"
+	// ppc64:-".*memmove"
+	// ppc64le:-".*memmove"
+	copy(b, x[:])
+}
+
+func moveArchLowering8(b []byte, x *[8]byte) {
+	_ = b[8]
+	// amd64:-".*memmove"
+	// arm64:-".*memmove"
+	// ppc64:-".*memmove"
+	// ppc64le:-".*memmove"
+	copy(b, x[:])
+}
+
+func moveArchLowering16(b []byte, x *[16]byte) {
+	_ = b[16]
+	// amd64:-".*memmove"
+	copy(b, x[:])
 }
 
 // Check that no branches are generated when the pointers are [not] equal.

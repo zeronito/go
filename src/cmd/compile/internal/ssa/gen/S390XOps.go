@@ -2,6 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+//go:build ignore
 // +build ignore
 
 package main
@@ -330,26 +331,27 @@ func init() {
 		{name: "LTDBR", argLength: 1, reg: fp1flags, asm: "LTDBR", typ: "Flags"}, // arg0 compare to 0, f64
 		{name: "LTEBR", argLength: 1, reg: fp1flags, asm: "LTEBR", typ: "Flags"}, // arg0 compare to 0, f32
 
-		{name: "SLD", argLength: 2, reg: sh21, asm: "SLD"},                   // arg0 << arg1, shift amount is mod 64
-		{name: "SLW", argLength: 2, reg: sh21, asm: "SLW"},                   // arg0 << arg1, shift amount is mod 32
-		{name: "SLDconst", argLength: 1, reg: gp11, asm: "SLD", aux: "Int8"}, // arg0 << auxint, shift amount 0-63
-		{name: "SLWconst", argLength: 1, reg: gp11, asm: "SLW", aux: "Int8"}, // arg0 << auxint, shift amount 0-31
+		{name: "SLD", argLength: 2, reg: sh21, asm: "SLD"},                    // arg0 << arg1, shift amount is mod 64
+		{name: "SLW", argLength: 2, reg: sh21, asm: "SLW"},                    // arg0 << arg1, shift amount is mod 64
+		{name: "SLDconst", argLength: 1, reg: gp11, asm: "SLD", aux: "UInt8"}, // arg0 << auxint, shift amount 0-63
+		{name: "SLWconst", argLength: 1, reg: gp11, asm: "SLW", aux: "UInt8"}, // arg0 << auxint, shift amount 0-31
 
-		{name: "SRD", argLength: 2, reg: sh21, asm: "SRD"},                   // unsigned arg0 >> arg1, shift amount is mod 64
-		{name: "SRW", argLength: 2, reg: sh21, asm: "SRW"},                   // unsigned uint32(arg0) >> arg1, shift amount is mod 32
-		{name: "SRDconst", argLength: 1, reg: gp11, asm: "SRD", aux: "Int8"}, // unsigned arg0 >> auxint, shift amount 0-63
-		{name: "SRWconst", argLength: 1, reg: gp11, asm: "SRW", aux: "Int8"}, // unsigned uint32(arg0) >> auxint, shift amount 0-31
+		{name: "SRD", argLength: 2, reg: sh21, asm: "SRD"},                    // unsigned arg0 >> arg1, shift amount is mod 64
+		{name: "SRW", argLength: 2, reg: sh21, asm: "SRW"},                    // unsigned uint32(arg0) >> arg1, shift amount is mod 64
+		{name: "SRDconst", argLength: 1, reg: gp11, asm: "SRD", aux: "UInt8"}, // unsigned arg0 >> auxint, shift amount 0-63
+		{name: "SRWconst", argLength: 1, reg: gp11, asm: "SRW", aux: "UInt8"}, // unsigned uint32(arg0) >> auxint, shift amount 0-31
 
 		// Arithmetic shifts clobber flags.
-		{name: "SRAD", argLength: 2, reg: sh21, asm: "SRAD", clobberFlags: true},                   // signed arg0 >> arg1, shift amount is mod 64
-		{name: "SRAW", argLength: 2, reg: sh21, asm: "SRAW", clobberFlags: true},                   // signed int32(arg0) >> arg1, shift amount is mod 32
-		{name: "SRADconst", argLength: 1, reg: gp11, asm: "SRAD", aux: "Int8", clobberFlags: true}, // signed arg0 >> auxint, shift amount 0-63
-		{name: "SRAWconst", argLength: 1, reg: gp11, asm: "SRAW", aux: "Int8", clobberFlags: true}, // signed int32(arg0) >> auxint, shift amount 0-31
+		{name: "SRAD", argLength: 2, reg: sh21, asm: "SRAD", clobberFlags: true},                    // signed arg0 >> arg1, shift amount is mod 64
+		{name: "SRAW", argLength: 2, reg: sh21, asm: "SRAW", clobberFlags: true},                    // signed int32(arg0) >> arg1, shift amount is mod 64
+		{name: "SRADconst", argLength: 1, reg: gp11, asm: "SRAD", aux: "UInt8", clobberFlags: true}, // signed arg0 >> auxint, shift amount 0-63
+		{name: "SRAWconst", argLength: 1, reg: gp11, asm: "SRAW", aux: "UInt8", clobberFlags: true}, // signed int32(arg0) >> auxint, shift amount 0-31
 
-		{name: "RLLG", argLength: 2, reg: sh21, asm: "RLLG"},                   // arg0 rotate left arg1, rotate amount 0-63
-		{name: "RLL", argLength: 2, reg: sh21, asm: "RLL"},                     // arg0 rotate left arg1, rotate amount 0-31
-		{name: "RLLGconst", argLength: 1, reg: gp11, asm: "RLLG", aux: "Int8"}, // arg0 rotate left auxint, rotate amount 0-63
-		{name: "RLLconst", argLength: 1, reg: gp11, asm: "RLL", aux: "Int8"},   // arg0 rotate left auxint, rotate amount 0-31
+		// Rotate instructions.
+		// Note: no RLLGconst - use RISBGZ instead.
+		{name: "RLLG", argLength: 2, reg: sh21, asm: "RLLG"},                  // arg0 rotate left arg1, rotate amount 0-63
+		{name: "RLL", argLength: 2, reg: sh21, asm: "RLL"},                    // arg0 rotate left arg1, rotate amount 0-31
+		{name: "RLLconst", argLength: 1, reg: gp11, asm: "RLL", aux: "UInt8"}, // arg0 rotate left auxint, rotate amount 0-31
 
 		// Rotate then (and|or|xor|insert) selected bits instructions.
 		//
@@ -370,7 +372,8 @@ func init() {
 		// | RXSBG (XOR) |     0 |  47 |     16 | 0xffff_ffff_ffff_ffff | 0x0000_0000_0000_ffff | 0xffff_ffff_0000_ffff |
 		// +-------------+-------+-----+--------+-----------------------+-----------------------+-----------------------+
 		//
-		{name: "RXSBG", argLength: 2, reg: gp21, asm: "RXSBG", resultInArg0: true, aux: "ArchSpecific", clobberFlags: true}, // rotate then xor selected bits
+		{name: "RXSBG", argLength: 2, reg: gp21, asm: "RXSBG", resultInArg0: true, aux: "S390XRotateParams", clobberFlags: true}, // rotate then xor selected bits
+		{name: "RISBGZ", argLength: 1, reg: gp11, asm: "RISBGZ", aux: "S390XRotateParams", clobberFlags: true},                   // rotate then insert selected bits [into zero]
 
 		// unary ops
 		{name: "NEG", argLength: 1, reg: gp11, asm: "NEG", clobberFlags: true},   // -arg0
@@ -379,11 +382,12 @@ func init() {
 		{name: "NOT", argLength: 1, reg: gp11, resultInArg0: true, clobberFlags: true},  // ^arg0
 		{name: "NOTW", argLength: 1, reg: gp11, resultInArg0: true, clobberFlags: true}, // ^arg0
 
-		{name: "FSQRT", argLength: 1, reg: fp11, asm: "FSQRT"}, // sqrt(arg0)
+		{name: "FSQRT", argLength: 1, reg: fp11, asm: "FSQRT"},   // sqrt(arg0)
+		{name: "FSQRTS", argLength: 1, reg: fp11, asm: "FSQRTS"}, // sqrt(arg0), float32
 
 		// Conditional register-register moves.
 		// The aux for these values is an s390x.CCMask value representing the condition code mask.
-		{name: "LOCGR", argLength: 3, reg: gp2flags1, resultInArg0: true, asm: "LOCGR", aux: "ArchSpecific"}, // load arg1 into arg0 if the condition code in arg2 matches a masked bit in aux.
+		{name: "LOCGR", argLength: 3, reg: gp2flags1, resultInArg0: true, asm: "LOCGR", aux: "S390XCCMask"}, // load arg1 into arg0 if the condition code in arg2 matches a masked bit in aux.
 
 		{name: "MOVBreg", argLength: 1, reg: gp11sp, asm: "MOVB", typ: "Int64"},    // sign extend arg0 from int8 to int64
 		{name: "MOVBZreg", argLength: 1, reg: gp11sp, asm: "MOVBZ", typ: "UInt64"}, // zero extend arg0 from int8 to int64
@@ -394,24 +398,25 @@ func init() {
 
 		{name: "MOVDconst", reg: gp01, asm: "MOVD", typ: "UInt64", aux: "Int64", rematerializeable: true}, // auxint
 
-		{name: "LDGR", argLength: 1, reg: gpfp, asm: "LDGR"},     // move int64 to float64 (no conversion)
-		{name: "LGDR", argLength: 1, reg: fpgp, asm: "LGDR"},     // move float64 to int64 (no conversion)
-		{name: "CFDBRA", argLength: 1, reg: fpgp, asm: "CFDBRA"}, // convert float64 to int32
-		{name: "CGDBRA", argLength: 1, reg: fpgp, asm: "CGDBRA"}, // convert float64 to int64
-		{name: "CFEBRA", argLength: 1, reg: fpgp, asm: "CFEBRA"}, // convert float32 to int32
-		{name: "CGEBRA", argLength: 1, reg: fpgp, asm: "CGEBRA"}, // convert float32 to int64
-		{name: "CEFBRA", argLength: 1, reg: gpfp, asm: "CEFBRA"}, // convert int32 to float32
-		{name: "CDFBRA", argLength: 1, reg: gpfp, asm: "CDFBRA"}, // convert int32 to float64
-		{name: "CEGBRA", argLength: 1, reg: gpfp, asm: "CEGBRA"}, // convert int64 to float32
-		{name: "CDGBRA", argLength: 1, reg: gpfp, asm: "CDGBRA"}, // convert int64 to float64
-		{name: "CLFEBR", argLength: 1, reg: fpgp, asm: "CLFEBR"}, // convert float32 to uint32
-		{name: "CLFDBR", argLength: 1, reg: fpgp, asm: "CLFDBR"}, // convert float64 to uint32
-		{name: "CLGEBR", argLength: 1, reg: fpgp, asm: "CLGEBR"}, // convert float32 to uint64
-		{name: "CLGDBR", argLength: 1, reg: fpgp, asm: "CLGDBR"}, // convert float64 to uint64
-		{name: "CELFBR", argLength: 1, reg: gpfp, asm: "CELFBR"}, // convert uint32 to float32
-		{name: "CDLFBR", argLength: 1, reg: gpfp, asm: "CDLFBR"}, // convert uint32 to float64
-		{name: "CELGBR", argLength: 1, reg: gpfp, asm: "CELGBR"}, // convert uint64 to float32
-		{name: "CDLGBR", argLength: 1, reg: gpfp, asm: "CDLGBR"}, // convert uint64 to float64
+		{name: "LDGR", argLength: 1, reg: gpfp, asm: "LDGR"}, // move int64 to float64 (no conversion)
+		{name: "LGDR", argLength: 1, reg: fpgp, asm: "LGDR"}, // move float64 to int64 (no conversion)
+
+		{name: "CFDBRA", argLength: 1, reg: fpgp, asm: "CFDBRA", clobberFlags: true}, // convert float64 to int32
+		{name: "CGDBRA", argLength: 1, reg: fpgp, asm: "CGDBRA", clobberFlags: true}, // convert float64 to int64
+		{name: "CFEBRA", argLength: 1, reg: fpgp, asm: "CFEBRA", clobberFlags: true}, // convert float32 to int32
+		{name: "CGEBRA", argLength: 1, reg: fpgp, asm: "CGEBRA", clobberFlags: true}, // convert float32 to int64
+		{name: "CEFBRA", argLength: 1, reg: gpfp, asm: "CEFBRA", clobberFlags: true}, // convert int32 to float32
+		{name: "CDFBRA", argLength: 1, reg: gpfp, asm: "CDFBRA", clobberFlags: true}, // convert int32 to float64
+		{name: "CEGBRA", argLength: 1, reg: gpfp, asm: "CEGBRA", clobberFlags: true}, // convert int64 to float32
+		{name: "CDGBRA", argLength: 1, reg: gpfp, asm: "CDGBRA", clobberFlags: true}, // convert int64 to float64
+		{name: "CLFEBR", argLength: 1, reg: fpgp, asm: "CLFEBR", clobberFlags: true}, // convert float32 to uint32
+		{name: "CLFDBR", argLength: 1, reg: fpgp, asm: "CLFDBR", clobberFlags: true}, // convert float64 to uint32
+		{name: "CLGEBR", argLength: 1, reg: fpgp, asm: "CLGEBR", clobberFlags: true}, // convert float32 to uint64
+		{name: "CLGDBR", argLength: 1, reg: fpgp, asm: "CLGDBR", clobberFlags: true}, // convert float64 to uint64
+		{name: "CELFBR", argLength: 1, reg: gpfp, asm: "CELFBR", clobberFlags: true}, // convert uint32 to float32
+		{name: "CDLFBR", argLength: 1, reg: gpfp, asm: "CDLFBR", clobberFlags: true}, // convert uint32 to float64
+		{name: "CELGBR", argLength: 1, reg: gpfp, asm: "CELGBR", clobberFlags: true}, // convert uint64 to float32
+		{name: "CDLGBR", argLength: 1, reg: gpfp, asm: "CDLGBR", clobberFlags: true}, // convert uint64 to float64
 
 		{name: "LEDBR", argLength: 1, reg: fp11, asm: "LEDBR"}, // convert float64 to float32
 		{name: "LDEBR", argLength: 1, reg: fp11, asm: "LDEBR"}, // convert float32 to float64
@@ -474,9 +479,10 @@ func init() {
 
 		{name: "CLEAR", argLength: 2, reg: regInfo{inputs: []regMask{ptr, 0}}, asm: "CLEAR", aux: "SymValAndOff", typ: "Mem", clobberFlags: true, faultOnNilArg0: true, symEffect: "Write"},
 
-		{name: "CALLstatic", argLength: 1, reg: regInfo{clobbers: callerSave}, aux: "SymOff", clobberFlags: true, call: true, symEffect: "None"},                            // call static function aux.(*obj.LSym).  arg0=mem, auxint=argsize, returns mem
-		{name: "CALLclosure", argLength: 3, reg: regInfo{inputs: []regMask{ptrsp, buildReg("R12"), 0}, clobbers: callerSave}, aux: "Int64", clobberFlags: true, call: true}, // call function via closure.  arg0=codeptr, arg1=closure, arg2=mem, auxint=argsize, returns mem
-		{name: "CALLinter", argLength: 2, reg: regInfo{inputs: []regMask{ptr}, clobbers: callerSave}, aux: "Int64", clobberFlags: true, call: true},                         // call fn by pointer.  arg0=codeptr, arg1=mem, auxint=argsize, returns mem
+		{name: "CALLstatic", argLength: 1, reg: regInfo{clobbers: callerSave}, aux: "CallOff", clobberFlags: true, call: true},                                                // call static function aux.(*obj.LSym).  arg0=mem, auxint=argsize, returns mem
+		{name: "CALLtail", argLength: 1, reg: regInfo{clobbers: callerSave}, aux: "CallOff", clobberFlags: true, call: true, tailCall: true},                                  // tail call static function aux.(*obj.LSym).  arg0=mem, auxint=argsize, returns mem
+		{name: "CALLclosure", argLength: 3, reg: regInfo{inputs: []regMask{ptrsp, buildReg("R12"), 0}, clobbers: callerSave}, aux: "CallOff", clobberFlags: true, call: true}, // call function via closure.  arg0=codeptr, arg1=closure, arg2=mem, auxint=argsize, returns mem
+		{name: "CALLinter", argLength: 2, reg: regInfo{inputs: []regMask{ptr}, clobbers: callerSave}, aux: "CallOff", clobberFlags: true, call: true},                         // call fn by pointer.  arg0=codeptr, arg1=mem, auxint=argsize, returns mem
 
 		// (InvertFlags (CMP a b)) == (CMP b a)
 		// InvertFlags is a pseudo-op which can't appear in assembly output.
@@ -503,15 +509,16 @@ func init() {
 
 		// LoweredWB invokes runtime.gcWriteBarrier. arg0=destptr, arg1=srcptr, arg2=mem, aux=runtime.gcWriteBarrier
 		// It saves all GP registers if necessary,
-		// but clobbers R14 (LR) because it's a call.
-		{name: "LoweredWB", argLength: 3, reg: regInfo{inputs: []regMask{buildReg("R2"), buildReg("R3")}, clobbers: (callerSave &^ gpg) | buildReg("R14")}, clobberFlags: true, aux: "Sym", symEffect: "None"},
+		// but clobbers R14 (LR) because it's a call,
+		// and also clobbers R1 as the PLT stub does.
+		{name: "LoweredWB", argLength: 3, reg: regInfo{inputs: []regMask{buildReg("R2"), buildReg("R3")}, clobbers: (callerSave &^ gpg) | buildReg("R14") | r1}, clobberFlags: true, aux: "Sym", symEffect: "None"},
 
 		// There are three of these functions so that they can have three different register inputs.
 		// When we check 0 <= c <= cap (A), then 0 <= b <= c (B), then 0 <= a <= b (C), we want the
 		// default registers to match so we don't need to copy registers around unnecessarily.
-		{name: "LoweredPanicBoundsA", argLength: 3, aux: "Int64", reg: regInfo{inputs: []regMask{r2, r3}}, typ: "Mem"}, // arg0=idx, arg1=len, arg2=mem, returns memory. AuxInt contains report code (see PanicBounds in generic.go).
-		{name: "LoweredPanicBoundsB", argLength: 3, aux: "Int64", reg: regInfo{inputs: []regMask{r1, r2}}, typ: "Mem"}, // arg0=idx, arg1=len, arg2=mem, returns memory. AuxInt contains report code (see PanicBounds in generic.go).
-		{name: "LoweredPanicBoundsC", argLength: 3, aux: "Int64", reg: regInfo{inputs: []regMask{r0, r1}}, typ: "Mem"}, // arg0=idx, arg1=len, arg2=mem, returns memory. AuxInt contains report code (see PanicBounds in generic.go).
+		{name: "LoweredPanicBoundsA", argLength: 3, aux: "Int64", reg: regInfo{inputs: []regMask{r2, r3}}, typ: "Mem", call: true}, // arg0=idx, arg1=len, arg2=mem, returns memory. AuxInt contains report code (see PanicBounds in generic.go).
+		{name: "LoweredPanicBoundsB", argLength: 3, aux: "Int64", reg: regInfo{inputs: []regMask{r1, r2}}, typ: "Mem", call: true}, // arg0=idx, arg1=len, arg2=mem, returns memory. AuxInt contains report code (see PanicBounds in generic.go).
+		{name: "LoweredPanicBoundsC", argLength: 3, aux: "Int64", reg: regInfo{inputs: []regMask{r0, r1}}, typ: "Mem", call: true}, // arg0=idx, arg1=len, arg2=mem, returns memory. AuxInt contains report code (see PanicBounds in generic.go).
 
 		// Constant condition code values. The condition code can be 0, 1, 2 or 3.
 		{name: "FlagEQ"}, // CC=0 (equal)
@@ -546,8 +553,10 @@ func init() {
 		// Atomic bitwise operations.
 		// Note: 'floor' operations round the pointer down to the nearest word boundary
 		// which reflects how they are used in the runtime.
-		{name: "LAOfloor", argLength: 3, reg: gpstorelab, asm: "LAO", typ: "Mem", clobberFlags: true, hasSideEffects: true}, // *(floor(arg0, 4)) |= arg1. arg2 = mem.
+		{name: "LAN", argLength: 3, reg: gpstore, asm: "LAN", typ: "Mem", clobberFlags: true, hasSideEffects: true},         // *arg0 &= arg1. arg2 = mem.
 		{name: "LANfloor", argLength: 3, reg: gpstorelab, asm: "LAN", typ: "Mem", clobberFlags: true, hasSideEffects: true}, // *(floor(arg0, 4)) &= arg1. arg2 = mem.
+		{name: "LAO", argLength: 3, reg: gpstore, asm: "LAO", typ: "Mem", clobberFlags: true, hasSideEffects: true},         // *arg0 |= arg1. arg2 = mem.
+		{name: "LAOfloor", argLength: 3, reg: gpstorelab, asm: "LAO", typ: "Mem", clobberFlags: true, hasSideEffects: true}, // *(floor(arg0, 4)) |= arg1. arg2 = mem.
 
 		// Compare and swap.
 		// arg0 = pointer, arg1 = old value, arg2 = new value, arg3 = memory.
@@ -772,25 +781,25 @@ func init() {
 	// Note: that compare-and-branch instructions must not have bit 3 (0b0001) set.
 	var S390Xblocks = []blockData{
 		// branch on condition
-		{name: "BRC", controls: 1}, // condition code value (flags) is Controls[0]
+		{name: "BRC", controls: 1, aux: "S390XCCMask"}, // condition code value (flags) is Controls[0]
 
 		// compare-and-branch (register-register)
 		//  - integrates comparison of Controls[0] with Controls[1]
 		//  - both control values must be in general purpose registers
-		{name: "CRJ", controls: 2},   // signed 32-bit integer comparison
-		{name: "CGRJ", controls: 2},  // signed 64-bit integer comparison
-		{name: "CLRJ", controls: 2},  // unsigned 32-bit integer comparison
-		{name: "CLGRJ", controls: 2}, // unsigned 64-bit integer comparison
+		{name: "CRJ", controls: 2, aux: "S390XCCMask"},   // signed 32-bit integer comparison
+		{name: "CGRJ", controls: 2, aux: "S390XCCMask"},  // signed 64-bit integer comparison
+		{name: "CLRJ", controls: 2, aux: "S390XCCMask"},  // unsigned 32-bit integer comparison
+		{name: "CLGRJ", controls: 2, aux: "S390XCCMask"}, // unsigned 64-bit integer comparison
 
 		// compare-and-branch (register-immediate)
 		//  - integrates comparison of Controls[0] with AuxInt
 		//  - control value must be in a general purpose register
 		//  - the AuxInt value is sign-extended for signed comparisons
 		//    and zero-extended for unsigned comparisons
-		{name: "CIJ", controls: 1, auxint: "Int8"},    // signed 32-bit integer comparison
-		{name: "CGIJ", controls: 1, auxint: "Int8"},   // signed 64-bit integer comparison
-		{name: "CLIJ", controls: 1, auxint: "UInt8"},  // unsigned 32-bit integer comparison
-		{name: "CLGIJ", controls: 1, auxint: "UInt8"}, // unsigned 64-bit integer comparison
+		{name: "CIJ", controls: 1, aux: "S390XCCMaskInt8"},    // signed 32-bit integer comparison
+		{name: "CGIJ", controls: 1, aux: "S390XCCMaskInt8"},   // signed 64-bit integer comparison
+		{name: "CLIJ", controls: 1, aux: "S390XCCMaskUint8"},  // unsigned 32-bit integer comparison
+		{name: "CLGIJ", controls: 1, aux: "S390XCCMaskUint8"}, // unsigned 64-bit integer comparison
 	}
 
 	archs = append(archs, arch{

@@ -2,11 +2,12 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// +build race
+//go:build race
 
 package runtime
 
 import (
+	"internal/abi"
 	"unsafe"
 )
 
@@ -232,6 +233,7 @@ func raceSymbolizeData(ctx *symbolizeDataContext) {
 }
 
 // Race runtime functions called via runtime·racecall.
+//
 //go:linkname __tsan_init __tsan_init
 var __tsan_init byte
 
@@ -268,6 +270,9 @@ var __tsan_acquire byte
 //go:linkname __tsan_release __tsan_release
 var __tsan_release byte
 
+//go:linkname __tsan_release_acquire __tsan_release_acquire
+var __tsan_release_acquire byte
+
 //go:linkname __tsan_release_merge __tsan_release_merge
 var __tsan_release_merge byte
 
@@ -281,6 +286,7 @@ var __tsan_go_ignore_sync_end byte
 var __tsan_report_count byte
 
 // Mimic what cmd/cgo would do.
+//
 //go:cgo_import_static __tsan_init
 //go:cgo_import_static __tsan_fini
 //go:cgo_import_static __tsan_proc_create
@@ -293,12 +299,14 @@ var __tsan_report_count byte
 //go:cgo_import_static __tsan_free
 //go:cgo_import_static __tsan_acquire
 //go:cgo_import_static __tsan_release
+//go:cgo_import_static __tsan_release_acquire
 //go:cgo_import_static __tsan_release_merge
 //go:cgo_import_static __tsan_go_ignore_sync_begin
 //go:cgo_import_static __tsan_go_ignore_sync_end
 //go:cgo_import_static __tsan_report_count
 
 // These are called from race_amd64.s.
+//
 //go:cgo_import_static __tsan_read
 //go:cgo_import_static __tsan_read_pc
 //go:cgo_import_static __tsan_read_range
@@ -338,11 +346,12 @@ func racereadrangepc1(addr, size, pc uintptr)
 func racewriterangepc1(addr, size, pc uintptr)
 func racecallbackthunk(uintptr)
 
-// racecall allows calling an arbitrary function f from C race runtime
+// racecall allows calling an arbitrary function fn from C race runtime
 // with up to 4 uintptr arguments.
 func racecall(fn *byte, arg0, arg1, arg2, arg3 uintptr)
 
 // checks if the address has shadow (i.e. heap or data/bss)
+//
 //go:nosplit
 func isvalidaddr(addr unsafe.Pointer) bool {
 	return racearenastart <= uintptr(addr) && uintptr(addr) < racearenaend ||
@@ -356,7 +365,7 @@ func raceinit() (gctx, pctx uintptr) {
 		throw("raceinit: race build must use cgo")
 	}
 
-	racecall(&__tsan_init, uintptr(unsafe.Pointer(&gctx)), uintptr(unsafe.Pointer(&pctx)), funcPC(racecallbackthunk), 0)
+	racecall(&__tsan_init, uintptr(unsafe.Pointer(&gctx)), uintptr(unsafe.Pointer(&pctx)), abi.FuncPCABI0(racecallbackthunk), 0)
 
 	// Round data segment to page boundaries, because it's used in mmap().
 	start := ^uintptr(0)
@@ -533,6 +542,19 @@ func racereleaseg(gp *g, addr unsafe.Pointer) {
 		return
 	}
 	racecall(&__tsan_release, gp.racectx, uintptr(addr), 0, 0)
+}
+
+//go:nosplit
+func racereleaseacquire(addr unsafe.Pointer) {
+	racereleaseacquireg(getg(), addr)
+}
+
+//go:nosplit
+func racereleaseacquireg(gp *g, addr unsafe.Pointer) {
+	if getg().raceignore != 0 || !isvalidaddr(addr) {
+		return
+	}
+	racecall(&__tsan_release_acquire, gp.racectx, uintptr(addr), 0, 0)
 }
 
 //go:nosplit
