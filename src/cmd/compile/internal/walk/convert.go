@@ -5,6 +5,7 @@
 package walk
 
 import (
+	"cmd/internal/obj"
 	"encoding/binary"
 	"go/constant"
 
@@ -46,6 +47,13 @@ func walkConvInterface(n *ir.ConvExpr, init *ir.Nodes) ir.Node {
 	if !fromType.IsInterface() && !ir.IsBlank(ir.CurFunc.Nname) {
 		// skip unnamed functions (func _())
 		reflectdata.MarkTypeUsedInInterface(fromType, ir.CurFunc.LSym)
+	}
+
+	if toType.IsEmptyInterface() {
+		fromTypeLsym := reflectdata.TypeLinksym(fromType)
+		if fromTypeLsym != nil {
+			fromTypeLsym.Set(obj.AttrUsedInEface, true)
+		}
 	}
 
 	if !fromType.IsInterface() {

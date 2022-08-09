@@ -65,6 +65,8 @@ type Link struct {
 
 	compressDWARF bool
 
+	efaceTypes bool
+
 	Libdir       []string
 	Library      []*sym.Library
 	LibraryByPkg map[string]*sym.Library
