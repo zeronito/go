@@ -103,8 +103,8 @@ func (v *bottomUpVisitor) visit(n *Func) uint32 {
 	if (min == id || min == id+1) && !n.IsHiddenClosure() {
 		// This node is the root of a strongly connected component.
 
-		// The original min passed to visitcodelist was v.nodeID[n]+1.
-		// If visitcodelist found its way back to v.nodeID[n], then this
+		// The original min captured by ir.Visit was v.nodeID[n]+1.
+		// If ir.Visit found its way back to v.nodeID[n], then this
 		// block is a set of mutually recursive functions.
 		// Otherwise it's just a lone function that does not recurse.
 		recursive := min == id
