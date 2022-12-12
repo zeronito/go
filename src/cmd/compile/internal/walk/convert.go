@@ -45,7 +45,14 @@ func walkConvInterface(n *ir.ConvExpr, init *ir.Nodes) ir.Node {
 	toType := n.Type()
 	if !fromType.IsInterface() && !ir.IsBlank(ir.CurFunc.Nname) {
 		// skip unnamed functions (func _())
-		reflectdata.MarkTypeUsedInInterface(fromType, ir.CurFunc.LSym)
+		if base.Debug.Unified != 0 && fromType.HasShape() {
+			// Unified IR uses OCONVIFACE for converting all derived types
+			// to interface type. Avoid assertion failure in
+			// MarkTypeUsedInInterface, because we've marked used types
+			// separately anyway.
+		} else {
+			reflectdata.MarkTypeUsedInInterface(fromType, ir.CurFunc.LSym)
+		}
 	}
 
 	if !fromType.IsInterface() {
@@ -73,13 +80,15 @@ func walkConvInterface(n *ir.ConvExpr, init *ir.Nodes) ir.Node {
 
 	var typeWord ir.Node
 	if toType.IsEmptyInterface() {
-		// Implement interface to empty interface conversion.
-		// res = itab
+		// Implement interface to empty interface conversion:
+		//
+		// var res *uint8
+		// res = (*uint8)(unsafe.Pointer(itab))
 		// if res != nil {
 		//    res = res.type
 		// }
 		typeWord = typecheck.Temp(types.NewPtr(types.Types[types.TUINT8]))
-		init.Append(ir.NewAssignStmt(base.Pos, typeWord, itab))
+		init.Append(ir.NewAssignStmt(base.Pos, typeWord, typecheck.Conv(typecheck.Conv(itab, types.Types[types.TUNSAFEPTR]), typeWord.Type())))
 		nif := ir.NewIfStmt(base.Pos, typecheck.Expr(ir.NewBinaryExpr(base.Pos, ir.ONE, typeWord, typecheck.NodNil())), nil, nil)
 		nif.Body = []ir.Node{ir.NewAssignStmt(base.Pos, typeWord, itabType(typeWord))}
 		init.Append(nif)
@@ -495,4 +504,22 @@ func walkCheckPtrArithmetic(n *ir.ConvExpr, init *ir.Nodes) ir.Node {
 	// the backing store for multiple calls to checkptrArithmetic.
 
 	return cheap
+}
+
+// walkSliceToArray walks an OSLICE2ARR expression.
+func walkSliceToArray(n *ir.ConvExpr, init *ir.Nodes) ir.Node {
+	// Replace T(x) with *(*T)(x).
+	conv := typecheck.Expr(ir.NewConvExpr(base.Pos, ir.OCONV, types.NewPtr(n.Type()), n.X)).(*ir.ConvExpr)
+	deref := typecheck.Expr(ir.NewStarExpr(base.Pos, conv)).(*ir.StarExpr)
+
+	// The OSLICE2ARRPTR conversion handles checking the slice length,
+	// so the dereference can't fail.
+	//
+	// However, this is more than just an optimization: if T is a
+	// zero-length array, then x (and thus (*T)(x)) can be nil, but T(x)
+	// should *not* panic. So suppressing the nil check here is
+	// necessary for correctness in that case.
+	deref.SetBounded(true)
+
+	return walkExpr(deref, init)
 }

@@ -9,6 +9,7 @@ import (
 
 	"cmd/compile/internal/base"
 	"cmd/compile/internal/ir"
+	"cmd/compile/internal/syntax"
 	"cmd/compile/internal/typecheck"
 	"cmd/compile/internal/types"
 	"cmd/compile/internal/types2"
@@ -222,7 +223,7 @@ func IncDec(pos src.XPos, op ir.Op, x ir.Node) *ir.AssignOpStmt {
 	return ir.NewAssignOpStmt(pos, op, x, bl)
 }
 
-func idealType(tv types2.TypeAndValue) types2.Type {
+func idealType(tv syntax.TypeAndValue) types2.Type {
 	// The gc backend expects all expressions to have a concrete type, and
 	// types2 mostly satisfies this expectation already. But there are a few
 	// cases where the Go spec doesn't require converting to concrete type,
@@ -250,4 +251,34 @@ func idealType(tv types2.TypeAndValue) types2.Type {
 		}
 	}
 	return typ
+}
+
+func isTypeParam(t types2.Type) bool {
+	_, ok := t.(*types2.TypeParam)
+	return ok
+}
+
+// isNotInHeap reports whether typ is or contains an element of type
+// runtime/internal/sys.NotInHeap.
+func isNotInHeap(typ types2.Type) bool {
+	if named, ok := typ.(*types2.Named); ok {
+		if obj := named.Obj(); obj.Name() == "nih" && obj.Pkg().Path() == "runtime/internal/sys" {
+			return true
+		}
+		typ = named.Underlying()
+	}
+
+	switch typ := typ.(type) {
+	case *types2.Array:
+		return isNotInHeap(typ.Elem())
+	case *types2.Struct:
+		for i := 0; i < typ.NumFields(); i++ {
+			if isNotInHeap(typ.Field(i).Type()) {
+				return true
+			}
+		}
+		return false
+	default:
+		return false
+	}
 }

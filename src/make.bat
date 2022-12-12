@@ -80,8 +80,10 @@ for /f "tokens=*" %%g in ('where go 2^>nul') do (
 		)
 	)
 )
-if "x%GOROOT_BOOTSTRAP%"=="x" if exist "%HOMEDRIVE%%HOMEPATH%\go1.17" set GOROOT_BOOTSTRAP=%HOMEDRIVE%%HOMEPATH%\go1.17
-if "x%GOROOT_BOOTSTRAP%"=="x" if exist "%HOMEDRIVE%%HOMEPATH%\sdk\go1.17" set GOROOT_BOOTSTRAP=%HOMEDRIVE%%HOMEPATH%\sdk\go1.17
+
+set bootgo=1.17.13
+if "x%GOROOT_BOOTSTRAP%"=="x" if exist "%HOMEDRIVE%%HOMEPATH%\go%bootgo%" set GOROOT_BOOTSTRAP=%HOMEDRIVE%%HOMEPATH%\go%bootgo%
+if "x%GOROOT_BOOTSTRAP%"=="x" if exist "%HOMEDRIVE%%HOMEPATH%\sdk\go%bootgo%" set GOROOT_BOOTSTRAP=%HOMEDRIVE%%HOMEPATH%\sdk\go%bootgo%
 if "x%GOROOT_BOOTSTRAP%"=="x" set GOROOT_BOOTSTRAP=%HOMEDRIVE%%HOMEPATH%\Go1.4
 
 :bootstrapset
@@ -93,7 +95,7 @@ setlocal
 set GOOS=
 set GOARCH=
 set GOEXPERIMENT=
-for /f "tokens=*" %%g IN ('%GOROOT_BOOTSTRAP%\bin\go version') do (set GOROOT_BOOTSTRAP_VERSION=%%g)
+for /f "tokens=*" %%g IN ('"%GOROOT_BOOTSTRAP%\bin\go" version') do (set GOROOT_BOOTSTRAP_VERSION=%%g)
 set GOROOT_BOOTSTRAP_VERSION=%GOROOT_BOOTSTRAP_VERSION:go version =%
 echo Building Go cmd/dist using %GOROOT_BOOTSTRAP%. (%GOROOT_BOOTSTRAP_VERSION%)
 if x%vflag==x-v echo cmd/dist
@@ -128,7 +130,7 @@ if x%4==x--no-banner set bootstrapflags=%bootstrapflags% --no-banner
 
 :: Run dist bootstrap to complete make.bash.
 :: Bootstrap installs a proper cmd/dist, built with the new toolchain.
-:: Throw ours, built with Go 1.4, away after bootstrap.
+:: Throw ours, built with the bootstrap toolchain, away after bootstrap.
 .\cmd\dist\dist.exe bootstrap -a %vflag% %bootstrapflags%
 if errorlevel 1 goto fail
 del .\cmd\dist\dist.exe
@@ -147,7 +149,7 @@ goto end
 
 :bootstrapfail
 echo ERROR: Cannot find %GOROOT_BOOTSTRAP%\bin\go.exe
-echo Set GOROOT_BOOTSTRAP to a working Go tree ^>= Go 1.4.
+echo Set GOROOT_BOOTSTRAP to a working Go tree ^>= Go %bootgo%.
 
 :fail
 set GOBUILDFAIL=1

@@ -187,7 +187,7 @@ func raceSymbolizeCode(ctx *symbolizeCodeContext) {
 							continue
 						}
 						ctx.pc = f.Entry() + uintptr(inltree[ix].parentPc) // "caller" pc
-						ctx.fn = cfuncnameFromNameoff(fi, inltree[ix].func_)
+						ctx.fn = cfuncnameFromNameOff(fi, inltree[ix].nameOff)
 						ctx.line = uintptr(line)
 						ctx.file = &bytes(file)[0] // assume NUL-terminated
 						ctx.off = pc - f.Entry()
@@ -350,7 +350,7 @@ func racecallbackthunk(uintptr)
 // with up to 4 uintptr arguments.
 func racecall(fn *byte, arg0, arg1, arg2, arg3 uintptr)
 
-// checks if the address has shadow (i.e. heap or data/bss)
+// checks if the address has shadow (i.e. heap or data/bss).
 //
 //go:nosplit
 func isvalidaddr(addr unsafe.Pointer) bool {
@@ -360,8 +360,8 @@ func isvalidaddr(addr unsafe.Pointer) bool {
 
 //go:nosplit
 func raceinit() (gctx, pctx uintptr) {
-	// cgo is required to initialize libc, which is used by race runtime
-	if !iscgo {
+	// On most machines, cgo is required to initialize libc, which is used by race runtime.
+	if !iscgo && GOOS != "darwin" {
 		throw("raceinit: race build must use cgo")
 	}
 

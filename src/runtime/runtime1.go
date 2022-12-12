@@ -56,7 +56,7 @@ var (
 	argv **byte
 )
 
-// nosplit for use in linux startup sysargs
+// nosplit for use in linux startup sysargs.
 //
 //go:nosplit
 func argv_index(argv **byte, i int32) *byte {
@@ -355,6 +355,8 @@ var dbgvars = []dbgVar{
 	{"adaptivestackstart", &debug.adaptivestackstart},
 }
 
+var globalGODEBUG string
+
 func parsedebugvars() {
 	// defaults
 	debug.cgocheck = 1
@@ -372,7 +374,9 @@ func parsedebugvars() {
 		debug.madvdontneed = 1
 	}
 
-	for p := gogetenv("GODEBUG"); p != ""; {
+	globalGODEBUG = gogetenv("GODEBUG")
+	godebugEnv.StoreNoWB(&globalGODEBUG)
+	for p := globalGODEBUG; p != ""; {
 		field := ""
 		i := bytealg.IndexByteString(p, ',')
 		if i < 0 {

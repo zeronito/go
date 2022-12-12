@@ -5,10 +5,11 @@
 package types2
 
 import (
-	"bytes"
 	"cmd/compile/internal/syntax"
 	"fmt"
+	. "internal/types/errors"
 	"sort"
+	"strings"
 )
 
 // ----------------------------------------------------------------------------
@@ -71,7 +72,7 @@ func (s *_TypeSet) String() string {
 	hasMethods := len(s.methods) > 0
 	hasTerms := s.hasTerms()
 
-	var buf bytes.Buffer
+	var buf strings.Builder
 	buf.WriteByte('{')
 	if s.comparable {
 		buf.WriteString("comparable")
@@ -226,6 +227,7 @@ func computeInterfaceTypeSet(check *Checker, pos syntax.Pos, ityp *Interface) *_
 			}
 			// check != nil
 			var err error_
+			err.code = DuplicateDecl
 			err.errorf(pos, "duplicate method %s", m.name)
 			err.errorf(mpos[other.(*Func)], "other declaration of %s", m.name)
 			check.report(&err)
@@ -244,6 +246,7 @@ func computeInterfaceTypeSet(check *Checker, pos syntax.Pos, ityp *Interface) *_
 			check.later(func() {
 				if !check.allowVersion(m.pkg, 1, 14) || !Identical(m.typ, other.Type()) {
 					var err error_
+					err.code = DuplicateDecl
 					err.errorf(pos, "duplicate method %s", m.name)
 					err.errorf(mpos[other.(*Func)], "other declaration of %s", m.name)
 					check.report(&err)
@@ -421,7 +424,7 @@ func computeUnionTypeSet(check *Checker, unionSets map[*Union]*_TypeSet, pos syn
 		allTerms = allTerms.union(terms)
 		if len(allTerms) > maxTermCount {
 			if check != nil {
-				check.errorf(pos, "cannot handle more than %d union terms (implementation limitation)", maxTermCount)
+				check.errorf(pos, InvalidUnion, "cannot handle more than %d union terms (implementation limitation)", maxTermCount)
 			}
 			unionSets[utyp] = &invalidTypeSet
 			return unionSets[utyp]

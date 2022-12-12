@@ -243,6 +243,8 @@ func fixedlit(ctxt initContext, kind initKind, n *ir.CompLitExpr, var_ ir.Node, 
 					// confuses about variables lifetime. So making sure those expressions
 					// are ordered correctly here. See issue #52673.
 					orderBlock(&sinit, map[string][]*ir.Name{})
+					typecheck.Stmts(sinit)
+					walkStmtList(sinit)
 				}
 				init.Append(sinit...)
 				continue
@@ -494,6 +496,7 @@ func maplit(n *ir.CompLitExpr, m ir.Node, init *ir.Nodes) {
 	// Build list of var[c] = expr.
 	// Use temporaries so that mapassign1 can have addressable key, elem.
 	// TODO(josharian): avoid map key temporaries for mapfast_* assignments with literal keys.
+	// TODO(khr): assign these temps in order phase so we can reuse them across multiple maplits?
 	tmpkey := typecheck.Temp(m.Type().Key())
 	tmpelem := typecheck.Temp(m.Type().Elem())
 
@@ -519,9 +522,6 @@ func maplit(n *ir.CompLitExpr, m ir.Node, init *ir.Nodes) {
 		a = orderStmtInPlace(a, map[string][]*ir.Name{})
 		appendWalkStmt(init, a)
 	}
-
-	appendWalkStmt(init, ir.NewUnaryExpr(base.Pos, ir.OVARKILL, tmpkey))
-	appendWalkStmt(init, ir.NewUnaryExpr(base.Pos, ir.OVARKILL, tmpelem))
 }
 
 func anylit(n ir.Node, var_ ir.Node, init *ir.Nodes) {

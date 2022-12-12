@@ -83,6 +83,9 @@ NONE
 < itab
 < reflectOffs;
 
+# User arena state
+NONE < userArenaState;
+
 # Tracing without a P uses a global trace buffer.
 scavenge
 # Above TRACEGLOBAL can emit a trace event without a P.
@@ -100,7 +103,8 @@ allg,
   notifyList,
   reflectOffs,
   timers,
-  traceStrings
+  traceStrings,
+  userArenaState
 # Above MALLOC are things that can allocate memory.
 < MALLOC
 # Below MALLOC is the malloc implementation.
@@ -115,18 +119,6 @@ allg,
 MPROF < profInsert, profBlock, profMemActive;
 profMemActive < profMemFuture;
 
-# Execution tracer events (with a P)
-hchan,
-  root,
-  sched,
-  traceStrings,
-  notifyList,
-  fin
-# Above TRACE is anything that can create a trace event
-< TRACE
-< trace
-< traceStackTab;
-
 # Stack allocation and copying
 gcBitsArenas,
   netpollInit,
@@ -134,7 +126,8 @@ gcBitsArenas,
   profInsert,
   profMemFuture,
   spanSetSpine,
-  traceStackTab
+  fin,
+  root
 # Anything that can grow the stack can acquire STACKGROW.
 # (Most higher layers imply STACKGROW, like MALLOC.)
 < STACKGROW
@@ -167,6 +160,19 @@ stackLarge,
 < mheap;
 # Below mheap is the span allocator implementation.
 mheap, mheapSpecial < globalAlloc;
+
+# Execution tracer events (with a P)
+hchan,
+  mheap,
+  root,
+  sched,
+  traceStrings,
+  notifyList,
+  fin
+# Above TRACE is anything that can create a trace event
+< TRACE
+< trace
+< traceStackTab;
 
 # panic is handled specially. It is implicitly below all other locks.
 NONE < panic;

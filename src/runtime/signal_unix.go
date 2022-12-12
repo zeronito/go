@@ -349,11 +349,11 @@ func doSigPreempt(gp *g, ctxt *sigctxt) {
 	}
 
 	// Acknowledge the preemption.
-	atomic.Xadd(&gp.m.preemptGen, 1)
-	atomic.Store(&gp.m.signalPending, 0)
+	gp.m.preemptGen.Add(1)
+	gp.m.signalPending.Store(0)
 
 	if GOOS == "darwin" || GOOS == "ios" {
-		atomic.Xadd(&pendingPreemptSignals, -1)
+		pendingPreemptSignals.Add(-1)
 	}
 }
 
@@ -372,9 +372,9 @@ func preemptM(mp *m) {
 		execLock.rlock()
 	}
 
-	if atomic.Cas(&mp.signalPending, 0, 1) {
+	if mp.signalPending.CompareAndSwap(0, 1) {
 		if GOOS == "darwin" || GOOS == "ios" {
-			atomic.Xadd(&pendingPreemptSignals, 1)
+			pendingPreemptSignals.Add(1)
 		}
 
 		// If multiple threads are preempting the same M, it may send many
@@ -453,7 +453,7 @@ func sigtrampgo(sig uint32, info *siginfo, ctx unsafe.Pointer) {
 			// The default behavior for sigPreempt is to ignore
 			// the signal, so badsignal will be a no-op anyway.
 			if GOOS == "darwin" || GOOS == "ios" {
-				atomic.Xadd(&pendingPreemptSignals, -1)
+				pendingPreemptSignals.Add(-1)
 			}
 			return
 		}
@@ -502,7 +502,7 @@ var sigprofCallersUse uint32
 //go:nosplit
 //go:nowritebarrierrec
 func sigprofNonGo(sig uint32, info *siginfo, ctx unsafe.Pointer) {
-	if prof.hz != 0 {
+	if prof.hz.Load() != 0 {
 		c := &sigctxt{info, ctx}
 		// Some platforms (Linux) have per-thread timers, which we use in
 		// combination with the process-wide timer. Avoid double-counting.
@@ -525,7 +525,7 @@ func sigprofNonGo(sig uint32, info *siginfo, ctx unsafe.Pointer) {
 //go:nosplit
 //go:nowritebarrierrec
 func sigprofNonGoPC(pc uintptr) {
-	if prof.hz != 0 {
+	if prof.hz.Load() != 0 {
 		stk := []uintptr{
 			pc,
 			abi.FuncPCABIInternal(_ExternalCode) + sys.PCQuantum,
@@ -662,7 +662,7 @@ func sighandler(sig uint32, info *siginfo, ctxt unsafe.Pointer, gp *g) {
 	if sig < uint32(len(sigtable)) {
 		flags = sigtable[sig].flags
 	}
-	if c.sigcode() != _SI_USER && flags&_SigPanic != 0 && gp.throwsplit {
+	if !c.sigFromUser() && flags&_SigPanic != 0 && gp.throwsplit {
 		// We can't safely sigpanic because it may grow the
 		// stack. Abort in the signal handler instead.
 		flags = _SigThrow
@@ -672,7 +672,7 @@ func sighandler(sig uint32, info *siginfo, ctxt unsafe.Pointer, gp *g) {
 		// causes a memory fault. Don't turn that into a panic.
 		flags = _SigThrow
 	}
-	if c.sigcode() != _SI_USER && flags&_SigPanic != 0 {
+	if !c.sigFromUser() && flags&_SigPanic != 0 {
 		// The signal is going to cause a panic.
 		// Arrange the stack so that it looks like the point
 		// where the signal occurred made a call to the
@@ -690,13 +690,13 @@ func sighandler(sig uint32, info *siginfo, ctxt unsafe.Pointer, gp *g) {
 		return
 	}
 
-	if c.sigcode() == _SI_USER || flags&_SigNotify != 0 {
+	if c.sigFromUser() || flags&_SigNotify != 0 {
 		if sigsend(sig) {
 			return
 		}
 	}
 
-	if c.sigcode() == _SI_USER && signal_ignored(sig) {
+	if c.sigFromUser() && signal_ignored(sig) {
 		return
 	}
 
@@ -706,7 +706,7 @@ func sighandler(sig uint32, info *siginfo, ctxt unsafe.Pointer, gp *g) {
 
 	// _SigThrow means that we should exit now.
 	// If we get here with _SigPanic, it means that the signal
-	// was sent to us by a program (c.sigcode() == _SI_USER);
+	// was sent to us by a program (c.sigFromUser() is true);
 	// in that case, if we didn't handle it in sigsend, we exit now.
 	if flags&(_SigThrow|_SigPanic) == 0 {
 		return
@@ -840,7 +840,14 @@ func sigpanic() {
 		if gp.paniconfault {
 			panicmemAddr(gp.sigcode1)
 		}
-		print("unexpected fault address ", hex(gp.sigcode1), "\n")
+		if inUserArenaChunk(gp.sigcode1) {
+			// We could check that the arena chunk is explicitly set to fault,
+			// but the fact that we faulted on accessing it is enough to prove
+			// that it is.
+			print("accessed data from freed user arena ", hex(gp.sigcode1), "\n")
+		} else {
+			print("unexpected fault address ", hex(gp.sigcode1), "\n")
+		}
 		throw("fault")
 	case _SIGFPE:
 		switch gp.sigcode0 {
@@ -929,7 +936,7 @@ func raisebadsignal(sig uint32, c *sigctxt) {
 	//
 	// On FreeBSD, the libthr sigaction code prevents
 	// this from working so we fall through to raise.
-	if GOOS != "freebsd" && (isarchive || islibrary) && handler == _SIG_DFL && c.sigcode() != _SI_USER {
+	if GOOS != "freebsd" && (isarchive || islibrary) && handler == _SIG_DFL && !c.sigFromUser() {
 		return
 	}
 
@@ -1032,8 +1039,6 @@ func signalDuringFork(sig uint32) {
 	throw("signal received during fork")
 }
 
-var badginsignalMsg = "fatal: bad g in signal handler\n"
-
 // This runs on a foreign stack, without an m or a g. No stack split.
 //
 //go:nosplit
@@ -1044,8 +1049,7 @@ func badsignal(sig uintptr, c *sigctxt) {
 		// There is no extra M. needm will not be able to grab
 		// an M. Instead of hanging, just crash.
 		// Cannot call split-stack function as there is no G.
-		s := stringStructOf(&badginsignalMsg)
-		write(2, s.str, int32(s.len))
+		writeErrStr("fatal: bad g in signal handler\n")
 		exit(2)
 		*(*uintptr)(unsafe.Pointer(uintptr(123))) = 2
 	}
@@ -1110,7 +1114,7 @@ func sigfwdgo(sig uint32, info *siginfo, ctx unsafe.Pointer) bool {
 	// Unfortunately, user generated SIGPIPEs will also be forwarded, because si_code
 	// is set to _SI_USER even for a SIGPIPE raised from a write to a closed socket
 	// or pipe.
-	if (c.sigcode() == _SI_USER || flags&_SigPanic == 0) && sig != _SIGPIPE {
+	if (c.sigFromUser() || flags&_SigPanic == 0) && sig != _SIGPIPE {
 		return false
 	}
 	// Determine if the signal occurred inside Go code. We test that:

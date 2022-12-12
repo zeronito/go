@@ -200,14 +200,15 @@ func lastcontinuehandler(info *exceptionrecord, r *context, gp *g) int32 {
 }
 
 // Always called on g0. gp is the G where the exception occurred.
+//
 //go:nosplit
 func winthrow(info *exceptionrecord, r *context, gp *g) {
 	g0 := getg()
 
-	if panicking != 0 { // traceback already printed
+	if panicking.Load() != 0 { // traceback already printed
 		exit(2)
 	}
-	panicking = 1
+	panicking.Store(1)
 
 	// In case we're handling a g0 stack overflow, blow away the
 	// g0 stack bounds so we have room to print the traceback. If
@@ -258,7 +259,14 @@ func sigpanic() {
 		if gp.paniconfault {
 			panicmemAddr(gp.sigcode1)
 		}
-		print("unexpected fault address ", hex(gp.sigcode1), "\n")
+		if inUserArenaChunk(gp.sigcode1) {
+			// We could check that the arena chunk is explicitly set to fault,
+			// but the fact that we faulted on accessing it is enough to prove
+			// that it is.
+			print("accessed data from freed user arena ", hex(gp.sigcode1), "\n")
+		} else {
+			print("unexpected fault address ", hex(gp.sigcode1), "\n")
+		}
 		throw("fault")
 	case _EXCEPTION_INT_DIVIDE_BY_ZERO:
 		panicdivide()
