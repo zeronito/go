@@ -18,6 +18,7 @@ path to this file based on the path to the runtime package.
 from __future__ import print_function
 import re
 import sys
+import gdb
 
 print("Loading Go Runtime support.", file=sys.stderr)
 #http://python3porting.com/differences.html
@@ -98,11 +99,11 @@ class SliceValue:
 #  Pretty Printers
 #
 
-
+# The patterns for matching types are permissive because gdb 8.2 switched to matching on (we think) typedef names instead of C syntax names.
 class StringTypePrinter:
 	"Pretty print Go strings."
 
-	pattern = re.compile(r'^struct string( \*)?$')
+	pattern = re.compile(r'^(struct string( \*)?|string)$')
 
 	def __init__(self, val):
 		self.val = val
@@ -118,7 +119,7 @@ class StringTypePrinter:
 class SliceTypePrinter:
 	"Pretty print slices."
 
-	pattern = re.compile(r'^struct \[\]')
+	pattern = re.compile(r'^(struct \[\]|\[\])')
 
 	def __init__(self, val):
 		self.val = val
@@ -127,7 +128,10 @@ class SliceTypePrinter:
 		return 'array'
 
 	def to_string(self):
-		return str(self.val.type)[6:]  # skip 'struct '
+		t = str(self.val.type)
+		if (t.startswith("struct ")):
+			return t[len("struct "):]
+		return t
 
 	def children(self):
 		sval = SliceValue(self.val)
@@ -156,6 +160,7 @@ class MapTypePrinter:
 		return str(self.val.type)
 
 	def children(self):
+		MapBucketCount = 8 # see internal/abi.go:MapBucketCount
 		B = self.val['B']
 		buckets = self.val['buckets']
 		oldbuckets = self.val['oldbuckets']
@@ -174,7 +179,7 @@ class MapTypePrinter:
 					bp = oldbp
 			while bp:
 				b = bp.dereference()
-				for i in xrange(8):
+				for i in xrange(MapBucketCount):
 					if b['tophash'][i] != 0:
 						k = b['keys'][i]
 						v = b['values'][i]
@@ -195,7 +200,7 @@ class ChanTypePrinter:
 	to inspect their contents with this pretty printer.
 	"""
 
-	pattern = re.compile(r'^struct hchan<.*>$')
+	pattern = re.compile(r'^chan ')
 
 	def __init__(self, val):
 		self.val = val
@@ -209,11 +214,14 @@ class ChanTypePrinter:
 	def children(self):
 		# see chan.c chanbuf(). et is the type stolen from hchan<T>::recvq->first->elem
 		et = [x.type for x in self.val['recvq']['first'].type.target().fields() if x.name == 'elem'][0]
-		ptr = (self.val.address + 1).cast(et.pointer())
+		ptr = (self.val.address["buf"]).cast(et)
 		for i in range(self.val["qcount"]):
 			j = (self.val["recvx"] + i) % self.val["dataqsiz"]
 			yield ('[{0}]'.format(i), (ptr + j).dereference())
 
+
+def paramtypematch(t, pattern):
+	return t.code == gdb.TYPE_CODE_TYPEDEF and str(t).startswith(".param") and pattern.match(str(t.target()))
 
 #
 #  Register all the *Printer classes above.
@@ -224,13 +232,13 @@ def makematcher(klass):
 		try:
 			if klass.pattern.match(str(val.type)):
 				return klass(val)
+			elif paramtypematch(val.type, klass.pattern):
+				return klass(val.cast(val.type.target()))
 		except Exception:
 			pass
 	return matcher
 
 goobjfile.pretty_printers.extend([makematcher(var) for var in vars().values() if hasattr(var, 'pattern')])
-
-
 #
 #  Utilities
 #
@@ -385,7 +393,7 @@ class GoLenFunc(gdb.Function):
 	def invoke(self, obj):
 		typename = str(obj.type)
 		for klass, fld in self.how:
-			if klass.pattern.match(typename):
+			if klass.pattern.match(typename) or paramtypematch(obj.type, klass.pattern):
 				return obj[fld]
 
 
@@ -400,7 +408,7 @@ class GoCapFunc(gdb.Function):
 	def invoke(self, obj):
 		typename = str(obj.type)
 		for klass, fld in self.how:
-			if klass.pattern.match(typename):
+			if klass.pattern.match(typename) or paramtypematch(obj.type, klass.pattern):
 				return obj[fld]
 
 
@@ -440,7 +448,7 @@ class GoroutinesCmd(gdb.Command):
 		# args = gdb.string_to_argv(arg)
 		vp = gdb.lookup_type('void').pointer()
 		for ptr in SliceValue(gdb.parse_and_eval("'runtime.allgs'")):
-			if ptr['atomicstatus'] == G_DEAD:
+			if ptr['atomicstatus']['value'] == G_DEAD:
 				continue
 			s = ' '
 			if ptr['m']:
@@ -448,7 +456,7 @@ class GoroutinesCmd(gdb.Command):
 			pc = ptr['sched']['pc'].cast(vp)
 			pc = pc_to_int(pc)
 			blk = gdb.block_for_pc(pc)
-			status = int(ptr['atomicstatus'])
+			status = int(ptr['atomicstatus']['value'])
 			st = sts.get(status, "unknown(%d)" % status)
 			print(s, ptr['goid'], "{0:8s}".format(st), blk.function)
 
@@ -465,7 +473,7 @@ def find_goroutine(goid):
 	"""
 	vp = gdb.lookup_type('void').pointer()
 	for ptr in SliceValue(gdb.parse_and_eval("'runtime.allgs'")):
-		if ptr['atomicstatus'] == G_DEAD:
+		if ptr['atomicstatus']['value'] == G_DEAD:
 			continue
 		if ptr['goid'] == goid:
 			break
@@ -473,7 +481,7 @@ def find_goroutine(goid):
 		return None, None
 	# Get the goroutine's saved state.
 	pc, sp = ptr['sched']['pc'], ptr['sched']['sp']
-	status = ptr['atomicstatus']&~G_SCAN
+	status = ptr['atomicstatus']['value']&~G_SCAN
 	# Goroutine is not running nor in syscall, so use the info in goroutine
 	if status != G_RUNNING and status != G_SYSCALL:
 		return pc.cast(vp), sp.cast(vp)

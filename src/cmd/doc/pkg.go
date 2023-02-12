@@ -16,8 +16,8 @@ import (
 	"go/printer"
 	"go/token"
 	"io"
+	"io/fs"
 	"log"
-	"os"
 	"path/filepath"
 	"strings"
 	"unicode"
@@ -25,8 +25,7 @@ import (
 )
 
 const (
-	punchedCardWidth = 80 // These things just won't leave us alone.
-	indentedWidth    = punchedCardWidth - len(indent)
+	punchedCardWidth = 80
 	indent           = "    "
 )
 
@@ -42,6 +41,14 @@ type Package struct {
 	constructor map[*doc.Func]bool  // Constructors.
 	fs          *token.FileSet      // Needed for printing.
 	buf         pkgBuffer
+}
+
+func (p *Package) ToText(w io.Writer, text, prefix, codePrefix string) {
+	d := p.doc.Parser().Parse(text)
+	pr := p.doc.Printer()
+	pr.TextPrefix = prefix
+	pr.TextCodePrefix = codePrefix
+	w.Write(pr.Text(d))
 }
 
 // pkgBuffer is a wrapper for bytes.Buffer that prints a package clause the
@@ -89,9 +96,11 @@ func (pkg *Package) prettyPath() string {
 	// Also convert everything to slash-separated paths for uniform handling.
 	path = filepath.Clean(filepath.ToSlash(pkg.build.Dir))
 	// Can we find a decent prefix?
-	goroot := filepath.Join(buildCtx.GOROOT, "src")
-	if p, ok := trim(path, filepath.ToSlash(goroot)); ok {
-		return p
+	if buildCtx.GOROOT != "" {
+		goroot := filepath.Join(buildCtx.GOROOT, "src")
+		if p, ok := trim(path, filepath.ToSlash(goroot)); ok {
+			return p
+		}
 	}
 	for _, gopath := range splitGopath() {
 		if p, ok := trim(path, filepath.ToSlash(gopath)); ok {
@@ -122,18 +131,17 @@ func trim(path, prefix string) (string, bool) {
 // main do function, so it doesn't cause an exit. Allows testing to work
 // without running a subprocess. The log prefix will be added when
 // logged in main; it is not added here.
-func (pkg *Package) Fatalf(format string, args ...interface{}) {
+func (pkg *Package) Fatalf(format string, args ...any) {
 	panic(PackageError(fmt.Sprintf(format, args...)))
 }
 
 // parsePackage turns the build package we found into a parsed package
 // we can then use to generate documentation.
 func parsePackage(writer io.Writer, pkg *build.Package, userPath string) *Package {
-	fs := token.NewFileSet()
 	// include tells parser.ParseDir which files to include.
 	// That means the file must be in the build package's GoFiles or CgoFiles
 	// list only (no tag-ignored files, tests, swig or other non-Go files).
-	include := func(info os.FileInfo) bool {
+	include := func(info fs.FileInfo) bool {
 		for _, name := range pkg.GoFiles {
 			if name == info.Name() {
 				return true
@@ -146,7 +154,8 @@ func parsePackage(writer io.Writer, pkg *build.Package, userPath string) *Packag
 		}
 		return false
 	}
-	pkgs, err := parser.ParseDir(fs, pkg.Dir, include, parser.ParseComments)
+	fset := token.NewFileSet()
+	pkgs, err := parser.ParseDir(fset, pkg.Dir, include, parser.ParseComments)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -203,19 +212,17 @@ func parsePackage(writer io.Writer, pkg *build.Package, userPath string) *Packag
 		typedValue:  typedValue,
 		constructor: constructor,
 		build:       pkg,
-		fs:          fs,
+		fs:          fset,
 	}
 	p.buf.pkg = p
 	return p
 }
 
-func (pkg *Package) Printf(format string, args ...interface{}) {
+func (pkg *Package) Printf(format string, args ...any) {
 	fmt.Fprintf(&pkg.buf, format, args...)
 }
 
 func (pkg *Package) flush() {
-	// Print the package clause in case it wasn't written already.
-	pkg.buf.packageClause()
 	_, err := pkg.writer.Write(pkg.buf.Bytes())
 	if err != nil {
 		log.Fatal(err)
@@ -237,7 +244,7 @@ func (pkg *Package) newlines(n int) {
 // clears the stuff we don't want to print anyway. It's a bit of a magic trick.
 func (pkg *Package) emit(comment string, node ast.Node) {
 	if node != nil {
-		var arg interface{} = node
+		var arg any = node
 		if showSrc {
 			// Need an extra little dance to get internal comments to appear.
 			arg = &printer.CommentedNode{
@@ -251,7 +258,7 @@ func (pkg *Package) emit(comment string, node ast.Node) {
 		}
 		if comment != "" && !showSrc {
 			pkg.newlines(1)
-			doc.ToText(&pkg.buf, comment, indent, indent+indent, indentedWidth)
+			pkg.ToText(&pkg.buf, comment, indent, indent+indent)
 			pkg.newlines(2) // Blank line after comment to separate from next item.
 		} else {
 			pkg.newlines(1)
@@ -317,9 +324,7 @@ func (pkg *Package) oneLineNodeDepth(node ast.Node, depth int) string {
 			recv = "(" + recv + ") "
 		}
 		fnc := pkg.oneLineNodeDepth(n.Type, depth)
-		if strings.Index(fnc, "func") == 0 {
-			fnc = fnc[4:]
-		}
+		fnc = strings.TrimPrefix(fnc, "func")
 		return fmt.Sprintf("func %s%s%s", recv, name, fnc)
 
 	case *ast.TypeSpec:
@@ -327,7 +332,8 @@ func (pkg *Package) oneLineNodeDepth(node ast.Node, depth int) string {
 		if n.Assign.IsValid() {
 			sep = " = "
 		}
-		return fmt.Sprintf("type %s%s%s", n.Name.Name, sep, pkg.oneLineNodeDepth(n.Type, depth))
+		tparams := pkg.formatTypeParams(n.TypeParams, depth)
+		return fmt.Sprintf("type %s%s%s%s", n.Name.Name, tparams, sep, pkg.oneLineNodeDepth(n.Type, depth))
 
 	case *ast.FuncType:
 		var params []string
@@ -346,15 +352,16 @@ func (pkg *Package) oneLineNodeDepth(node ast.Node, depth int) string {
 			}
 		}
 
+		tparam := pkg.formatTypeParams(n.TypeParams, depth)
 		param := joinStrings(params)
 		if len(results) == 0 {
-			return fmt.Sprintf("func(%s)", param)
+			return fmt.Sprintf("func%s(%s)", tparam, param)
 		}
 		result := joinStrings(results)
 		if !needParens {
-			return fmt.Sprintf("func(%s) %s", param, result)
+			return fmt.Sprintf("func%s(%s) %s", tparam, param, result)
 		}
-		return fmt.Sprintf("func(%s) (%s)", param, result)
+		return fmt.Sprintf("func%s(%s) (%s)", tparam, param, result)
 
 	case *ast.StructType:
 		if n.Fields == nil || len(n.Fields.List) == 0 {
@@ -413,7 +420,7 @@ func (pkg *Package) oneLineNodeDepth(node ast.Node, depth int) string {
 
 	default:
 		// As a fallback, use default formatter for all unknown node types.
-		buf := new(bytes.Buffer)
+		buf := new(strings.Builder)
 		format.Node(buf, pkg.fs, node)
 		s := buf.String()
 		if strings.Contains(s, "\n") {
@@ -421,6 +428,17 @@ func (pkg *Package) oneLineNodeDepth(node ast.Node, depth int) string {
 		}
 		return s
 	}
+}
+
+func (pkg *Package) formatTypeParams(list *ast.FieldList, depth int) string {
+	if list.NumFields() == 0 {
+		return ""
+	}
+	var tparams []string
+	for _, field := range list.List {
+		tparams = append(tparams, pkg.oneLineField(field, depth))
+	}
+	return "[" + joinStrings(tparams) + "]"
 }
 
 // oneLineField returns a one-line summary of the field.
@@ -451,9 +469,8 @@ func joinStrings(ss []string) string {
 
 // allDoc prints all the docs for the package.
 func (pkg *Package) allDoc() {
-	defer pkg.flush()
-
-	doc.ToText(&pkg.buf, pkg.doc.Doc, "", indent, indentedWidth)
+	pkg.Printf("") // Trigger the package clause; we know the package exists.
+	pkg.ToText(&pkg.buf, pkg.doc.Doc, "", indent)
 	pkg.newlines(1)
 
 	printed := make(map[*ast.GenDecl]bool)
@@ -511,10 +528,9 @@ func (pkg *Package) allDoc() {
 
 // packageDoc prints the docs for the package (package doc plus one-liners of the rest).
 func (pkg *Package) packageDoc() {
-	defer pkg.flush()
-
+	pkg.Printf("") // Trigger the package clause; we know the package exists.
 	if !short {
-		doc.ToText(&pkg.buf, pkg.doc.Doc, "", indent, indentedWidth)
+		pkg.ToText(&pkg.buf, pkg.doc.Doc, "", indent)
 		pkg.newlines(1)
 	}
 
@@ -705,7 +721,6 @@ func (pkg *Package) findTypeSpec(decl *ast.GenDecl, symbol string) *ast.TypeSpec
 // If symbol matches a type, output includes its methods factories and associated constants.
 // If there is no top-level symbol, symbolDoc looks for methods that match.
 func (pkg *Package) symbolDoc(symbol string) bool {
-	defer pkg.flush()
 	found := false
 	// Functions.
 	for _, fun := range pkg.findFuncs(symbol) {
@@ -859,6 +874,7 @@ func trimUnexportedFields(fields *ast.FieldList, isInterface bool) *ast.FieldLis
 		if len(names) == 0 {
 			// Embedded type. Use the name of the type. It must be of the form ident or
 			// pkg.ident (for structs and interfaces), or *ident or *pkg.ident (structs only).
+			// Or a type embedded in a constraint.
 			// Nothing else is allowed.
 			ty := field.Type
 			if se, ok := field.Type.(*ast.StarExpr); !isInterface && ok {
@@ -866,6 +882,7 @@ func trimUnexportedFields(fields *ast.FieldList, isInterface bool) *ast.FieldLis
 				// embedded types in structs.
 				ty = se.X
 			}
+			constraint := false
 			switch ident := ty.(type) {
 			case *ast.Ident:
 				if isInterface && ident.Name == "error" && ident.Obj == nil {
@@ -879,8 +896,12 @@ func trimUnexportedFields(fields *ast.FieldList, isInterface bool) *ast.FieldLis
 			case *ast.SelectorExpr:
 				// An embedded type may refer to a type in another package.
 				names = []*ast.Ident{ident.Sel}
+			default:
+				// An approximation or union or type
+				// literal in an interface.
+				constraint = true
 			}
-			if names == nil {
+			if names == nil && !constraint {
 				// Can only happen if AST is incorrect. Safe to continue with a nil list.
 				log.Print("invalid program: unexpected type for embedded field")
 			}
@@ -925,7 +946,6 @@ func trimUnexportedFields(fields *ast.FieldList, isInterface bool) *ast.FieldLis
 // If symbol is empty, it prints all methods for any concrete type
 // that match the name. It reports whether it found any methods.
 func (pkg *Package) printMethodDoc(symbol, method string) bool {
-	defer pkg.flush()
 	types := pkg.findTypes(symbol)
 	if types == nil {
 		if symbol == "" {
@@ -956,6 +976,9 @@ func (pkg *Package) printMethodDoc(symbol, method string) bool {
 			// Not an interface type.
 			continue
 		}
+
+		// Collect and print only the methods that match.
+		var methods []*ast.Field
 		for _, iMethod := range inter.Methods.List {
 			// This is an interface, so there can be only one name.
 			// TODO: Anonymous methods (embedding)
@@ -964,21 +987,20 @@ func (pkg *Package) printMethodDoc(symbol, method string) bool {
 			}
 			name := iMethod.Names[0].Name
 			if match(method, name) {
-				if iMethod.Doc != nil {
-					for _, comment := range iMethod.Doc.List {
-						doc.ToText(&pkg.buf, comment.Text, "", indent, indentedWidth)
-					}
-				}
-				s := pkg.oneLineNode(iMethod.Type)
-				// Hack: s starts "func" but there is no name present.
-				// We could instead build a FuncDecl but it's not worthwhile.
-				lineComment := ""
-				if iMethod.Comment != nil {
-					lineComment = fmt.Sprintf("  %s", iMethod.Comment.List[0].Text)
-				}
-				pkg.Printf("func %s%s%s\n", name, s[4:], lineComment)
+				methods = append(methods, iMethod)
 				found = true
 			}
+		}
+		if found {
+			pkg.Printf("type %s ", spec.Name)
+			inter.Methods.List, methods = methods, inter.Methods.List
+			err := format.Node(&pkg.buf, pkg.fs, inter)
+			if err != nil {
+				log.Fatal(err)
+			}
+			pkg.newlines(1)
+			// Restore the original methods.
+			inter.Methods.List = methods
 		}
 	}
 	return found
@@ -991,7 +1013,6 @@ func (pkg *Package) printFieldDoc(symbol, fieldName string) bool {
 	if symbol == "" || fieldName == "" {
 		return false
 	}
-	defer pkg.flush()
 	types := pkg.findTypes(symbol)
 	if types == nil {
 		pkg.Fatalf("symbol %s is not a type in package %s installed in %q", symbol, pkg.name, pkg.build.ImportPath)
@@ -1019,9 +1040,9 @@ func (pkg *Package) printFieldDoc(symbol, fieldName string) bool {
 				if field.Doc != nil {
 					// To present indented blocks in comments correctly, process the comment as
 					// a unit before adding the leading // to each line.
-					docBuf := bytes.Buffer{}
-					doc.ToText(&docBuf, field.Doc.Text(), "", indent, indentedWidth)
-					scanner := bufio.NewScanner(&docBuf)
+					docBuf := new(bytes.Buffer)
+					pkg.ToText(docBuf, field.Doc.Text(), "", indent)
+					scanner := bufio.NewScanner(docBuf)
 					for scanner.Scan() {
 						fmt.Fprintf(&pkg.buf, "%s// %s\n", indent, scanner.Bytes())
 					}
@@ -1047,13 +1068,11 @@ func (pkg *Package) printFieldDoc(symbol, fieldName string) bool {
 
 // methodDoc prints the docs for matches of symbol.method.
 func (pkg *Package) methodDoc(symbol, method string) bool {
-	defer pkg.flush()
 	return pkg.printMethodDoc(symbol, method)
 }
 
 // fieldDoc prints the docs for matches of symbol.field.
 func (pkg *Package) fieldDoc(symbol, field string) bool {
-	defer pkg.flush()
 	return pkg.printFieldDoc(symbol, field)
 }
 

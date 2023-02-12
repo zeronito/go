@@ -2,26 +2,13 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+//go:build !math_big_pure_go && riscv64
 // +build !math_big_pure_go,riscv64
 
 #include "textflag.h"
 
 // This file provides fast assembly versions for the elementary
 // arithmetic operations on vectors implemented in arith.go.
-
-// func mulWW(x, y Word) (z1, z0 Word)
-TEXT ·mulWW(SB),NOSPLIT,$0
-	MOV	x+0(FP), X5
-	MOV	y+8(FP), X6
-	MULHU	X5, X6, X7
-	MUL	X5, X6, X8
-	MOV	X7, z1+16(FP)
-	MOV	X8, z0+24(FP)
-	RET
-
-// func divWW(x1, x0, y Word) (q, r Word)
-TEXT ·divWW(SB),NOSPLIT,$0
-	JMP ·divWW_g(SB)		// riscv64 has no multiword division
 
 TEXT ·addVV(SB),NOSPLIT,$0
 	JMP ·addVV_g(SB)
@@ -47,5 +34,3 @@ TEXT ·mulAddVWW(SB),NOSPLIT,$0
 TEXT ·addMulVVW(SB),NOSPLIT,$0
 	JMP ·addMulVVW_g(SB)
 
-TEXT ·divWVW(SB),NOSPLIT,$0
-	JMP ·divWVW_g(SB)

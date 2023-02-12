@@ -6,6 +6,7 @@ package filepath
 
 import (
 	"errors"
+	"io/fs"
 	"os"
 	"runtime"
 	"syscall"
@@ -85,7 +86,7 @@ func walkSymlinks(path string) (string, error) {
 			return "", err
 		}
 
-		if fi.Mode()&os.ModeSymlink == 0 {
+		if fi.Mode()&fs.ModeSymlink == 0 {
 			if !fi.Mode().IsDir() && end < len(path) {
 				return "", syscall.ENOTDIR
 			}
@@ -125,6 +126,8 @@ func walkSymlinks(path string) (string, error) {
 			// Symlink to absolute path.
 			dest = link[:1]
 			end = 1
+			vol = link[:1]
+			volLen = 1
 		} else {
 			// Symlink to relative path; replace last
 			// path component in dest.

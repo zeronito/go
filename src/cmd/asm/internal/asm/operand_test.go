@@ -5,21 +5,21 @@
 package asm
 
 import (
+	"internal/buildcfg"
 	"strings"
 	"testing"
 
 	"cmd/asm/internal/arch"
 	"cmd/asm/internal/lex"
 	"cmd/internal/obj"
-	"cmd/internal/objabi"
 )
 
 // A simple in-out test: Do we print what we parse?
 
 func setArch(goarch string) (*arch.Arch, *obj.Link) {
-	objabi.GOOS = "linux" // obj can handle this OS for all architectures.
-	objabi.GOARCH = goarch
-	architecture := arch.Set(goarch)
+	buildcfg.GOOS = "linux" // obj can handle this OS for all architectures.
+	buildcfg.GOARCH = goarch
+	architecture := arch.Set(goarch, false)
 	if architecture == nil {
 		panic("asm: unrecognized architecture " + goarch)
 	}
@@ -28,7 +28,7 @@ func setArch(goarch string) (*arch.Arch, *obj.Link) {
 
 func newParser(goarch string) *Parser {
 	architecture, ctxt := setArch(goarch)
-	return NewParser(ctxt, architecture, nil)
+	return NewParser(ctxt, architecture, nil, false)
 }
 
 // tryParse executes parse func in panicOnError=true context.
@@ -75,7 +75,12 @@ func testOperandParser(t *testing.T, parser *Parser, tests []operandTest) {
 		parser.start(lex.Tokenize(test.input))
 		addr := obj.Addr{}
 		parser.operand(&addr)
-		result := obj.Dconv(&emptyProg, &addr)
+		var result string
+		if parser.compilingRuntime {
+			result = obj.DconvWithABIDetail(&emptyProg, &addr)
+		} else {
+			result = obj.Dconv(&emptyProg, &addr)
+		}
 		if result != test.output {
 			t.Errorf("fail at %s: got %s; expected %s\n", test.input, result, test.output)
 		}
@@ -86,6 +91,9 @@ func TestAMD64OperandParser(t *testing.T) {
 	parser := newParser("amd64")
 	testOperandParser(t, parser, amd64OperandTests)
 	testBadOperandParser(t, parser, amd64BadOperandTests)
+	parser.compilingRuntime = true
+	testOperandParser(t, parser, amd64RuntimeOperandTests)
+	testBadOperandParser(t, parser, amd64BadOperandRuntimeTests)
 }
 
 func Test386OperandParser(t *testing.T) {
@@ -117,6 +125,11 @@ func TestMIPS64OperandParser(t *testing.T) {
 	testOperandParser(t, parser, mips64OperandTests)
 }
 
+func TestLOONG64OperandParser(t *testing.T) {
+	parser := newParser("loong64")
+	testOperandParser(t, parser, loong64OperandTests)
+}
+
 func TestS390XOperandParser(t *testing.T) {
 	parser := newParser("s390x")
 	testOperandParser(t, parser, s390xOperandTests)
@@ -135,13 +148,14 @@ func TestFuncAddress(t *testing.T) {
 		{"ppc64", ppc64OperandTests},
 		{"mips", mipsOperandTests},
 		{"mips64", mips64OperandTests},
+		{"loong64", loong64OperandTests},
 		{"s390x", s390xOperandTests},
 	} {
 		t.Run(sub.arch, func(t *testing.T) {
 			parser := newParser(sub.arch)
 			for _, test := range sub.tests {
 				parser.start(lex.Tokenize(test.input))
-				name, ok := parser.funcAddress()
+				name, _, ok := parser.funcAddress()
 
 				isFuncSym := strings.HasSuffix(test.input, "(SB)") &&
 					// Ignore static symbols.
@@ -251,6 +265,7 @@ var amd64OperandTests = []operandTest{
 	{"R15", "R15"},
 	{"R8", "R8"},
 	{"R9", "R9"},
+	{"g", "R14"},
 	{"SI", "SI"},
 	{"SP", "SP"},
 	{"X0", "X0"},
@@ -298,6 +313,11 @@ var amd64OperandTests = []operandTest{
 	{"[):[o-FP", ""}, // Issue 12469 - asm hung parsing the o-FP range on non ARM platforms.
 }
 
+var amd64RuntimeOperandTests = []operandTest{
+	{"$bar<ABI0>(SB)", "$bar<ABI0>(SB)"},
+	{"$foo<ABIInternal>(SB)", "$foo<ABIInternal>(SB)"},
+}
+
 var amd64BadOperandTests = []badOperandTest{
 	{"[", "register list: expected ']', found EOF"},
 	{"[4", "register list: bad low register in `[4`"},
@@ -311,6 +331,11 @@ var amd64BadOperandTests = []badOperandTest{
 	{"[X0-X1-X2]", "register list: expected ']' after `[X0-X1`, found '-'"},
 	{"[X0,X3]", "register list: expected '-' after `[X0`, found ','"},
 	{"[X0,X1,X2,X3]", "register list: expected '-' after `[X0`, found ','"},
+	{"$foo<ABI0>", "ABI selector only permitted when compiling runtime, reference was to \"foo\""},
+}
+
+var amd64BadOperandRuntimeTests = []badOperandTest{
+	{"$foo<bletch>", "malformed ABI selector \"bletch\" in reference to \"foo\""},
 }
 
 var x86OperandTests = []operandTest{
@@ -448,7 +473,7 @@ var ppc64OperandTests = []operandTest{
 	{"(R4)", "(R4)"},
 	{"(R5)", "(R5)"},
 	{"(R5)(R6*1)", "(R5)(R6*1)"},
-	{"(R5+R6)", "(R5)(R6*1)"}, // Old syntax.
+	{"(R5+R6)", "(R5)(R6)"},
 	{"-1(R4)", "-1(R4)"},
 	{"-1(R5)", "-1(R5)"},
 	{"6(PC)", "6(PC)"},
@@ -819,6 +844,88 @@ var mipsOperandTests = []operandTest{
 	{"LO", "LO"},
 	{"a(FP)", "a(FP)"},
 	{"g", "g"},
+	{"ret+8(FP)", "ret+8(FP)"},
+	{"runtime·abort(SB)", "runtime.abort(SB)"},
+	{"·AddUint32(SB)", "\"\".AddUint32(SB)"},
+	{"·trunc(SB)", "\"\".trunc(SB)"},
+	{"[):[o-FP", ""}, // Issue 12469 - asm hung parsing the o-FP range on non ARM platforms.
+}
+
+var loong64OperandTests = []operandTest{
+	{"$((1<<63)-1)", "$9223372036854775807"},
+	{"$(-64*1024)", "$-65536"},
+	{"$(1024 * 8)", "$8192"},
+	{"$-1", "$-1"},
+	{"$-24(R4)", "$-24(R4)"},
+	{"$0", "$0"},
+	{"$0(R1)", "$(R1)"},
+	{"$0.5", "$(0.5)"},
+	{"$0x7000", "$28672"},
+	{"$0x88888eef", "$2290650863"},
+	{"$1", "$1"},
+	{"$_main<>(SB)", "$_main<>(SB)"},
+	{"$argframe(FP)", "$argframe(FP)"},
+	{"$~3", "$-4"},
+	{"(-288-3*8)(R1)", "-312(R1)"},
+	{"(16)(R7)", "16(R7)"},
+	{"(8)(g)", "8(g)"},
+	{"(R0)", "(R0)"},
+	{"(R3)", "(R3)"},
+	{"(R4)", "(R4)"},
+	{"(R5)", "(R5)"},
+	{"-1(R4)", "-1(R4)"},
+	{"-1(R5)", "-1(R5)"},
+	{"6(PC)", "6(PC)"},
+	{"F14", "F14"},
+	{"F15", "F15"},
+	{"F16", "F16"},
+	{"F17", "F17"},
+	{"F18", "F18"},
+	{"F19", "F19"},
+	{"F20", "F20"},
+	{"F21", "F21"},
+	{"F22", "F22"},
+	{"F23", "F23"},
+	{"F24", "F24"},
+	{"F25", "F25"},
+	{"F26", "F26"},
+	{"F27", "F27"},
+	{"F28", "F28"},
+	{"F29", "F29"},
+	{"F30", "F30"},
+	{"F31", "F31"},
+	{"R0", "R0"},
+	{"R1", "R1"},
+	{"R11", "R11"},
+	{"R12", "R12"},
+	{"R13", "R13"},
+	{"R14", "R14"},
+	{"R15", "R15"},
+	{"R16", "R16"},
+	{"R17", "R17"},
+	{"R18", "R18"},
+	{"R19", "R19"},
+	{"R2", "R2"},
+	{"R20", "R20"},
+	{"R21", "R21"},
+	{"R23", "R23"},
+	{"R24", "R24"},
+	{"R25", "R25"},
+	{"R26", "R26"},
+	{"R27", "R27"},
+	{"R28", "R28"},
+	{"R29", "R29"},
+	{"R30", "R30"},
+	{"R3", "R3"},
+	{"R4", "R4"},
+	{"R5", "R5"},
+	{"R6", "R6"},
+	{"R7", "R7"},
+	{"R8", "R8"},
+	{"R9", "R9"},
+	{"a(FP)", "a(FP)"},
+	{"g", "g"},
+	{"RSB", "R31"},
 	{"ret+8(FP)", "ret+8(FP)"},
 	{"runtime·abort(SB)", "runtime.abort(SB)"},
 	{"·AddUint32(SB)", "\"\".AddUint32(SB)"},

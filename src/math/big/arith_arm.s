@@ -2,6 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+//go:build !math_big_pure_go
 // +build !math_big_pure_go
 
 #include "textflag.h"
@@ -269,26 +270,4 @@ E9:
 	BNE	L9
 
 	MOVW	R4, c+28(FP)
-	RET
-
-
-// func divWVW(z* Word, xn Word, x []Word, y Word) (r Word)
-TEXT ·divWVW(SB),NOSPLIT,$0
-	// ARM has no multiword division, so use portable code.
-	B ·divWVW_g(SB)
-
-
-// func divWW(x1, x0, y Word) (q, r Word)
-TEXT ·divWW(SB),NOSPLIT,$0
-	// ARM has no multiword division, so use portable code.
-	B ·divWW_g(SB)
-
-
-// func mulWW(x, y Word) (z1, z0 Word)
-TEXT ·mulWW(SB),NOSPLIT,$0
-	MOVW	x+0(FP), R1
-	MOVW	y+4(FP), R2
-	MULLU	R1, R2, (R4, R3)
-	MOVW	R4, z1+8(FP)
-	MOVW	R3, z0+12(FP)
 	RET

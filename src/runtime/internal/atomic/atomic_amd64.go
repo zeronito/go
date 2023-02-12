@@ -7,6 +7,7 @@ package atomic
 import "unsafe"
 
 // Export some functions via linkname to assembly in sync/atomic.
+//
 //go:linkname Load
 //go:linkname Loadp
 //go:linkname Load64
@@ -32,6 +33,18 @@ func Load64(ptr *uint64) uint64 {
 //go:nosplit
 //go:noinline
 func LoadAcq(ptr *uint32) uint32 {
+	return *ptr
+}
+
+//go:nosplit
+//go:noinline
+func LoadAcq64(ptr *uint64) uint64 {
+	return *ptr
+}
+
+//go:nosplit
+//go:noinline
+func LoadAcquintptr(ptr *uintptr) uintptr {
 	return *ptr
 }
 
@@ -65,6 +78,12 @@ func And8(ptr *uint8, val uint8)
 //go:noescape
 func Or8(ptr *uint8, val uint8)
 
+//go:noescape
+func And(ptr *uint32, val uint32)
+
+//go:noescape
+func Or(ptr *uint32, val uint32)
+
 // NOTE: Do not add atomicxor8 (XOR is not idempotent).
 
 //go:noescape
@@ -84,6 +103,12 @@ func Store64(ptr *uint64, val uint64)
 
 //go:noescape
 func StoreRel(ptr *uint32, val uint32)
+
+//go:noescape
+func StoreRel64(ptr *uint64, val uint64)
+
+//go:noescape
+func StoreReluintptr(ptr *uintptr, val uintptr)
 
 // StorepNoWB performs *ptr = val atomically and without a write
 // barrier.

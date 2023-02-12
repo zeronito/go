@@ -7,6 +7,7 @@
 package runtime
 
 import (
+	"internal/abi"
 	"runtime/internal/atomic"
 	"runtime/internal/sys"
 	"unsafe"
@@ -23,17 +24,19 @@ type timer struct {
 	// Timer wakes up at when, and then at when+period, ... (period > 0 only)
 	// each time calling f(arg, now) in the timer goroutine, so f must be
 	// a well-behaved function and not block.
+	//
+	// when must be positive on an active timer.
 	when   int64
 	period int64
-	f      func(interface{}, uintptr)
-	arg    interface{}
+	f      func(any, uintptr)
+	arg    any
 	seq    uintptr
 
 	// What to set the when field to in timerModifiedXX status.
 	nextwhen int64
 
 	// The status field holds one of the values below.
-	status uint32
+	status atomic.Uint32
 }
 
 // Code outside this file has to be careful in using a timer value.
@@ -170,6 +173,7 @@ const verifyTimers = false
 // time.now is implemented in assembly.
 
 // timeSleep puts the current goroutine to sleep for at least ns nanoseconds.
+//
 //go:linkname timeSleep time.Sleep
 func timeSleep(ns int64) {
 	if ns <= 0 {
@@ -185,6 +189,9 @@ func timeSleep(ns int64) {
 	t.f = goroutineReady
 	t.arg = gp
 	t.nextwhen = nanotime() + ns
+	if t.nextwhen < 0 { // check for overflow.
+		t.nextwhen = maxWhen
+	}
 	gopark(resetForSleep, unsafe.Pointer(t), waitReasonSleep, traceEvGoSleep, 1)
 }
 
@@ -199,6 +206,7 @@ func resetForSleep(gp *g, ut unsafe.Pointer) bool {
 }
 
 // startTimer adds t to the timer heap.
+//
 //go:linkname startTimer time.startTimer
 func startTimer(t *timer) {
 	if raceenabled {
@@ -209,14 +217,17 @@ func startTimer(t *timer) {
 
 // stopTimer stops a timer.
 // It reports whether t was stopped before being run.
+//
 //go:linkname stopTimer time.stopTimer
 func stopTimer(t *timer) bool {
 	return deltimer(t)
 }
 
 // resetTimer resets an inactive timer, adding it to the heap.
-//go:linkname resetTimer time.resetTimer
+//
 // Reports whether the timer was modified before it was run.
+//
+//go:linkname resetTimer time.resetTimer
 func resetTimer(t *timer, when int64) bool {
 	if raceenabled {
 		racerelease(unsafe.Pointer(t))
@@ -225,34 +236,43 @@ func resetTimer(t *timer, when int64) bool {
 }
 
 // modTimer modifies an existing timer.
+//
 //go:linkname modTimer time.modTimer
-func modTimer(t *timer, when, period int64, f func(interface{}, uintptr), arg interface{}, seq uintptr) {
+func modTimer(t *timer, when, period int64, f func(any, uintptr), arg any, seq uintptr) {
 	modtimer(t, when, period, f, arg, seq)
 }
 
 // Go runtime.
 
 // Ready the goroutine arg.
-func goroutineReady(arg interface{}, seq uintptr) {
+func goroutineReady(arg any, seq uintptr) {
 	goready(arg.(*g), 0)
 }
 
+// Note: this changes some unsynchronized operations to synchronized operations
 // addtimer adds a timer to the current P.
 // This should only be called with a newly created timer.
 // That avoids the risk of changing the when field of a timer in some P's heap,
 // which could cause the heap to become unsorted.
 func addtimer(t *timer) {
-	// when must never be negative; otherwise runtimer will overflow
-	// during its delta calculation and never expire other runtime timers.
-	if t.when < 0 {
-		t.when = maxWhen
+	// when must be positive. A negative value will cause runtimer to
+	// overflow during its delta calculation and never expire other runtime
+	// timers. Zero will cause checkTimers to fail to notice the timer.
+	if t.when <= 0 {
+		throw("timer when must be positive")
 	}
-	if t.status != timerNoStatus {
+	if t.period < 0 {
+		throw("timer period must be non-negative")
+	}
+	if t.status.Load() != timerNoStatus {
 		throw("addtimer called with initialized timer")
 	}
-	t.status = timerWaiting
+	t.status.Store(timerWaiting)
 
 	when := t.when
+
+	// Disable preemption while using pp to avoid changing another P's heap.
+	mp := acquirem()
 
 	pp := getg().m.p.ptr()
 	lock(&pp.timersLock)
@@ -261,6 +281,8 @@ func addtimer(t *timer) {
 	unlock(&pp.timersLock)
 
 	wakeNetPoller(when)
+
+	releasem(mp)
 }
 
 // doaddtimer adds t to the current P's heap.
@@ -268,7 +290,7 @@ func addtimer(t *timer) {
 func doaddtimer(pp *p, t *timer) {
 	// Timers rely on the network poller, so make sure the poller
 	// has started.
-	if netpollInited == 0 {
+	if netpollInited.Load() == 0 {
 		netpollGenericInit()
 	}
 
@@ -280,9 +302,9 @@ func doaddtimer(pp *p, t *timer) {
 	pp.timers = append(pp.timers, t)
 	siftupTimer(pp.timers, i)
 	if t == pp.timers[0] {
-		atomic.Store64(&pp.timer0When, uint64(t.when))
+		pp.timer0When.Store(t.when)
 	}
-	atomic.Xadd(&pp.numTimers, 1)
+	pp.numTimers.Add(1)
 }
 
 // deltimer deletes the timer t. It may be on some other P, so we can't
@@ -291,21 +313,21 @@ func doaddtimer(pp *p, t *timer) {
 // Reports whether the timer was removed before it was run.
 func deltimer(t *timer) bool {
 	for {
-		switch s := atomic.Load(&t.status); s {
+		switch s := t.status.Load(); s {
 		case timerWaiting, timerModifiedLater:
 			// Prevent preemption while the timer is in timerModifying.
 			// This could lead to a self-deadlock. See #38070.
 			mp := acquirem()
-			if atomic.Cas(&t.status, s, timerModifying) {
+			if t.status.CompareAndSwap(s, timerModifying) {
 				// Must fetch t.pp before changing status,
 				// as cleantimers in another goroutine
 				// can clear t.pp of a timerDeleted timer.
 				tpp := t.pp.ptr()
-				if !atomic.Cas(&t.status, timerModifying, timerDeleted) {
+				if !t.status.CompareAndSwap(timerModifying, timerDeleted) {
 					badTimer()
 				}
 				releasem(mp)
-				atomic.Xadd(&tpp.deletedTimers, 1)
+				tpp.deletedTimers.Add(1)
 				// Timer was not yet run.
 				return true
 			} else {
@@ -315,16 +337,15 @@ func deltimer(t *timer) bool {
 			// Prevent preemption while the timer is in timerModifying.
 			// This could lead to a self-deadlock. See #38070.
 			mp := acquirem()
-			if atomic.Cas(&t.status, s, timerModifying) {
+			if t.status.CompareAndSwap(s, timerModifying) {
 				// Must fetch t.pp before setting status
 				// to timerDeleted.
 				tpp := t.pp.ptr()
-				atomic.Xadd(&tpp.adjustTimers, -1)
-				if !atomic.Cas(&t.status, timerModifying, timerDeleted) {
+				if !t.status.CompareAndSwap(timerModifying, timerDeleted) {
 					badTimer()
 				}
 				releasem(mp)
-				atomic.Xadd(&tpp.deletedTimers, 1)
+				tpp.deletedTimers.Add(1)
 				// Timer was not yet run.
 				return true
 			} else {
@@ -353,9 +374,9 @@ func deltimer(t *timer) bool {
 
 // dodeltimer removes timer i from the current P's heap.
 // We are locked on the P when this is called.
-// It reports whether it saw no problems due to races.
+// It returns the smallest changed index in pp.timers.
 // The caller must have locked the timers for pp.
-func dodeltimer(pp *p, i int) {
+func dodeltimer(pp *p, i int) int {
 	if t := pp.timers[i]; t.pp.ptr() != pp {
 		throw("dodeltimer: wrong P")
 	} else {
@@ -367,16 +388,22 @@ func dodeltimer(pp *p, i int) {
 	}
 	pp.timers[last] = nil
 	pp.timers = pp.timers[:last]
+	smallestChanged := i
 	if i != last {
 		// Moving to i may have moved the last timer to a new parent,
 		// so sift up to preserve the heap guarantee.
-		siftupTimer(pp.timers, i)
+		smallestChanged = siftupTimer(pp.timers, i)
 		siftdownTimer(pp.timers, i)
 	}
 	if i == 0 {
 		updateTimer0When(pp)
 	}
-	atomic.Xadd(&pp.numTimers, -1)
+	n := pp.numTimers.Add(-1)
+	if n == 0 {
+		// If there are no timers, then clearly none are modified.
+		pp.timerModifiedEarliest.Store(0)
+	}
+	return smallestChanged
 }
 
 // dodeltimer0 removes timer 0 from the current P's heap.
@@ -399,15 +426,22 @@ func dodeltimer0(pp *p) {
 		siftdownTimer(pp.timers, 0)
 	}
 	updateTimer0When(pp)
-	atomic.Xadd(&pp.numTimers, -1)
+	n := pp.numTimers.Add(-1)
+	if n == 0 {
+		// If there are no timers, then clearly none are modified.
+		pp.timerModifiedEarliest.Store(0)
+	}
 }
 
 // modtimer modifies an existing timer.
-// This is called by the netpoll code or time.Ticker.Reset.
+// This is called by the netpoll code or time.Ticker.Reset or time.Timer.Reset.
 // Reports whether the timer was modified before it was run.
-func modtimer(t *timer, when, period int64, f func(interface{}, uintptr), arg interface{}, seq uintptr) bool {
-	if when < 0 {
-		when = maxWhen
+func modtimer(t *timer, when, period int64, f func(any, uintptr), arg any, seq uintptr) bool {
+	if when <= 0 {
+		throw("timer when must be positive")
+	}
+	if period < 0 {
+		throw("timer period must be non-negative")
 	}
 
 	status := uint32(timerNoStatus)
@@ -416,12 +450,12 @@ func modtimer(t *timer, when, period int64, f func(interface{}, uintptr), arg in
 	var mp *m
 loop:
 	for {
-		switch status = atomic.Load(&t.status); status {
+		switch status = t.status.Load(); status {
 		case timerWaiting, timerModifiedEarlier, timerModifiedLater:
 			// Prevent preemption while the timer is in timerModifying.
 			// This could lead to a self-deadlock. See #38070.
 			mp = acquirem()
-			if atomic.Cas(&t.status, status, timerModifying) {
+			if t.status.CompareAndSwap(status, timerModifying) {
 				pending = true // timer not yet run
 				break loop
 			}
@@ -433,7 +467,7 @@ loop:
 
 			// Timer was already run and t is no longer in a heap.
 			// Act like addtimer.
-			if atomic.Cas(&t.status, status, timerModifying) {
+			if t.status.CompareAndSwap(status, timerModifying) {
 				wasRemoved = true
 				pending = false // timer already run or stopped
 				break loop
@@ -443,8 +477,8 @@ loop:
 			// Prevent preemption while the timer is in timerModifying.
 			// This could lead to a self-deadlock. See #38070.
 			mp = acquirem()
-			if atomic.Cas(&t.status, status, timerModifying) {
-				atomic.Xadd(&t.pp.ptr().deletedTimers, -1)
+			if t.status.CompareAndSwap(status, timerModifying) {
+				t.pp.ptr().deletedTimers.Add(-1)
 				pending = false // timer already stopped
 				break loop
 			}
@@ -473,7 +507,7 @@ loop:
 		lock(&pp.timersLock)
 		doaddtimer(pp, t)
 		unlock(&pp.timersLock)
-		if !atomic.Cas(&t.status, timerModifying, timerWaiting) {
+		if !t.status.CompareAndSwap(timerModifying, timerWaiting) {
 			badTimer()
 		}
 		releasem(mp)
@@ -491,22 +525,14 @@ loop:
 			newStatus = timerModifiedEarlier
 		}
 
-		// Update the adjustTimers field.  Subtract one if we
-		// are removing a timerModifiedEarlier, add one if we
-		// are adding a timerModifiedEarlier.
-		adjust := int32(0)
-		if status == timerModifiedEarlier {
-			adjust--
-		}
+		tpp := t.pp.ptr()
+
 		if newStatus == timerModifiedEarlier {
-			adjust++
-		}
-		if adjust != 0 {
-			atomic.Xadd(&t.pp.ptr().adjustTimers, adjust)
+			updateTimerModifiedEarliest(tpp, when)
 		}
 
 		// Set the new status of the timer.
-		if !atomic.Cas(&t.status, timerModifying, newStatus) {
+		if !t.status.CompareAndSwap(timerModifying, newStatus) {
 			badTimer()
 		}
 		releasem(mp)
@@ -552,18 +578,18 @@ func cleantimers(pp *p) {
 		if t.pp.ptr() != pp {
 			throw("cleantimers: bad p")
 		}
-		switch s := atomic.Load(&t.status); s {
+		switch s := t.status.Load(); s {
 		case timerDeleted:
-			if !atomic.Cas(&t.status, s, timerRemoving) {
+			if !t.status.CompareAndSwap(s, timerRemoving) {
 				continue
 			}
 			dodeltimer0(pp)
-			if !atomic.Cas(&t.status, timerRemoving, timerRemoved) {
+			if !t.status.CompareAndSwap(timerRemoving, timerRemoved) {
 				badTimer()
 			}
-			atomic.Xadd(&pp.deletedTimers, -1)
+			pp.deletedTimers.Add(-1)
 		case timerModifiedEarlier, timerModifiedLater:
-			if !atomic.Cas(&t.status, s, timerMoving) {
+			if !t.status.CompareAndSwap(s, timerMoving) {
 				continue
 			}
 			// Now we can change the when field.
@@ -571,10 +597,7 @@ func cleantimers(pp *p) {
 			// Move t to the right position.
 			dodeltimer0(pp)
 			doaddtimer(pp, t)
-			if s == timerModifiedEarlier {
-				atomic.Xadd(&pp.adjustTimers, -1)
-			}
-			if !atomic.Cas(&t.status, timerMoving, timerWaiting) {
+			if !t.status.CompareAndSwap(timerMoving, timerWaiting) {
 				badTimer()
 			}
 		default:
@@ -592,24 +615,30 @@ func moveTimers(pp *p, timers []*timer) {
 	for _, t := range timers {
 	loop:
 		for {
-			switch s := atomic.Load(&t.status); s {
+			switch s := t.status.Load(); s {
 			case timerWaiting:
+				if !t.status.CompareAndSwap(s, timerMoving) {
+					continue
+				}
 				t.pp = 0
 				doaddtimer(pp, t)
+				if !t.status.CompareAndSwap(timerMoving, timerWaiting) {
+					badTimer()
+				}
 				break loop
 			case timerModifiedEarlier, timerModifiedLater:
-				if !atomic.Cas(&t.status, s, timerMoving) {
+				if !t.status.CompareAndSwap(s, timerMoving) {
 					continue
 				}
 				t.when = t.nextwhen
 				t.pp = 0
 				doaddtimer(pp, t)
-				if !atomic.Cas(&t.status, timerMoving, timerWaiting) {
+				if !t.status.CompareAndSwap(timerMoving, timerWaiting) {
 					badTimer()
 				}
 				break loop
 			case timerDeleted:
-				if !atomic.Cas(&t.status, s, timerRemoved) {
+				if !t.status.CompareAndSwap(s, timerRemoved) {
 					continue
 				}
 				t.pp = 0
@@ -637,51 +666,54 @@ func moveTimers(pp *p, timers []*timer) {
 // the correct place in the heap. While looking for those timers,
 // it also moves timers that have been modified to run later,
 // and removes deleted timers. The caller must have locked the timers for pp.
-func adjusttimers(pp *p) {
-	if len(pp.timers) == 0 {
-		return
-	}
-	if atomic.Load(&pp.adjustTimers) == 0 {
+func adjusttimers(pp *p, now int64) {
+	// If we haven't yet reached the time of the first timerModifiedEarlier
+	// timer, don't do anything. This speeds up programs that adjust
+	// a lot of timers back and forth if the timers rarely expire.
+	// We'll postpone looking through all the adjusted timers until
+	// one would actually expire.
+	first := pp.timerModifiedEarliest.Load()
+	if first == 0 || first > now {
 		if verifyTimers {
 			verifyTimerHeap(pp)
 		}
 		return
 	}
+
+	// We are going to clear all timerModifiedEarlier timers.
+	pp.timerModifiedEarliest.Store(0)
+
 	var moved []*timer
-loop:
 	for i := 0; i < len(pp.timers); i++ {
 		t := pp.timers[i]
 		if t.pp.ptr() != pp {
 			throw("adjusttimers: bad p")
 		}
-		switch s := atomic.Load(&t.status); s {
+		switch s := t.status.Load(); s {
 		case timerDeleted:
-			if atomic.Cas(&t.status, s, timerRemoving) {
-				dodeltimer(pp, i)
-				if !atomic.Cas(&t.status, timerRemoving, timerRemoved) {
+			if t.status.CompareAndSwap(s, timerRemoving) {
+				changed := dodeltimer(pp, i)
+				if !t.status.CompareAndSwap(timerRemoving, timerRemoved) {
 					badTimer()
 				}
-				atomic.Xadd(&pp.deletedTimers, -1)
-				// Look at this heap position again.
-				i--
+				pp.deletedTimers.Add(-1)
+				// Go back to the earliest changed heap entry.
+				// "- 1" because the loop will add 1.
+				i = changed - 1
 			}
 		case timerModifiedEarlier, timerModifiedLater:
-			if atomic.Cas(&t.status, s, timerMoving) {
+			if t.status.CompareAndSwap(s, timerMoving) {
 				// Now we can change the when field.
 				t.when = t.nextwhen
 				// Take t off the heap, and hold onto it.
 				// We don't add it back yet because the
 				// heap manipulation could cause our
 				// loop to skip some other timer.
-				dodeltimer(pp, i)
+				changed := dodeltimer(pp, i)
 				moved = append(moved, t)
-				if s == timerModifiedEarlier {
-					if n := atomic.Xadd(&pp.adjustTimers, -1); int32(n) <= 0 {
-						break loop
-					}
-				}
-				// Look at this heap position again.
-				i--
+				// Go back to the earliest changed heap entry.
+				// "- 1" because the loop will add 1.
+				i = changed - 1
 			}
 		case timerNoStatus, timerRunning, timerRemoving, timerRemoved, timerMoving:
 			badTimer()
@@ -710,7 +742,7 @@ loop:
 func addAdjustedTimers(pp *p, moved []*timer) {
 	for _, t := range moved {
 		doaddtimer(pp, t)
-		if !atomic.Cas(&t.status, timerMoving, timerWaiting) {
+		if !t.status.CompareAndSwap(timerMoving, timerWaiting) {
 			badTimer()
 		}
 	}
@@ -719,16 +751,16 @@ func addAdjustedTimers(pp *p, moved []*timer) {
 // nobarrierWakeTime looks at P's timers and returns the time when we
 // should wake up the netpoller. It returns 0 if there are no timers.
 // This function is invoked when dropping a P, and must run without
-// any write barriers. Therefore, if there are any timers that needs
-// to be moved earlier, it conservatively returns the current time.
-// The netpoller M will wake up and adjust timers before sleeping again.
+// any write barriers.
+//
 //go:nowritebarrierrec
 func nobarrierWakeTime(pp *p) int64 {
-	if atomic.Load(&pp.adjustTimers) > 0 {
-		return nanotime()
-	} else {
-		return int64(atomic.Load64(&pp.timer0When))
+	next := pp.timer0When.Load()
+	nextAdj := pp.timerModifiedEarliest.Load()
+	if next == 0 || (nextAdj != 0 && nextAdj < next) {
+		next = nextAdj
 	}
+	return next
 }
 
 // runtimer examines the first timer in timers. If it is ready based on now,
@@ -737,6 +769,7 @@ func nobarrierWakeTime(pp *p) int64 {
 // when the first timer should run.
 // The caller must have locked the timers for pp.
 // If a timer is run, this will temporarily unlock the timers.
+//
 //go:systemstack
 func runtimer(pp *p, now int64) int64 {
 	for {
@@ -744,14 +777,14 @@ func runtimer(pp *p, now int64) int64 {
 		if t.pp.ptr() != pp {
 			throw("runtimer: bad p")
 		}
-		switch s := atomic.Load(&t.status); s {
+		switch s := t.status.Load(); s {
 		case timerWaiting:
 			if t.when > now {
 				// Not ready to run.
 				return t.when
 			}
 
-			if !atomic.Cas(&t.status, s, timerRunning) {
+			if !t.status.CompareAndSwap(s, timerRunning) {
 				continue
 			}
 			// Note that runOneTimer may temporarily unlock
@@ -760,29 +793,26 @@ func runtimer(pp *p, now int64) int64 {
 			return 0
 
 		case timerDeleted:
-			if !atomic.Cas(&t.status, s, timerRemoving) {
+			if !t.status.CompareAndSwap(s, timerRemoving) {
 				continue
 			}
 			dodeltimer0(pp)
-			if !atomic.Cas(&t.status, timerRemoving, timerRemoved) {
+			if !t.status.CompareAndSwap(timerRemoving, timerRemoved) {
 				badTimer()
 			}
-			atomic.Xadd(&pp.deletedTimers, -1)
+			pp.deletedTimers.Add(-1)
 			if len(pp.timers) == 0 {
 				return -1
 			}
 
 		case timerModifiedEarlier, timerModifiedLater:
-			if !atomic.Cas(&t.status, s, timerMoving) {
+			if !t.status.CompareAndSwap(s, timerMoving) {
 				continue
 			}
 			t.when = t.nextwhen
 			dodeltimer0(pp)
 			doaddtimer(pp, t)
-			if s == timerModifiedEarlier {
-				atomic.Xadd(&pp.adjustTimers, -1)
-			}
-			if !atomic.Cas(&t.status, timerMoving, timerWaiting) {
+			if !t.status.CompareAndSwap(timerMoving, timerWaiting) {
 				badTimer()
 			}
 
@@ -806,12 +836,13 @@ func runtimer(pp *p, now int64) int64 {
 // runOneTimer runs a single timer.
 // The caller must have locked the timers for pp.
 // This will temporarily unlock the timers while running the timer function.
+//
 //go:systemstack
 func runOneTimer(pp *p, t *timer, now int64) {
 	if raceenabled {
 		ppcur := getg().m.p.ptr()
 		if ppcur.timerRaceCtx == 0 {
-			ppcur.timerRaceCtx = racegostart(funcPC(runtimer) + sys.PCQuantum)
+			ppcur.timerRaceCtx = racegostart(abi.FuncPCABIInternal(runtimer) + sys.PCQuantum)
 		}
 		raceacquirectx(ppcur.timerRaceCtx, unsafe.Pointer(t))
 	}
@@ -824,15 +855,18 @@ func runOneTimer(pp *p, t *timer, now int64) {
 		// Leave in heap but adjust next time to fire.
 		delta := t.when - now
 		t.when += t.period * (1 + -delta/t.period)
+		if t.when < 0 { // check for overflow.
+			t.when = maxWhen
+		}
 		siftdownTimer(pp.timers, 0)
-		if !atomic.Cas(&t.status, timerRunning, timerWaiting) {
+		if !t.status.CompareAndSwap(timerRunning, timerWaiting) {
 			badTimer()
 		}
 		updateTimer0When(pp)
 	} else {
 		// Remove from heap.
 		dodeltimer0(pp)
-		if !atomic.Cas(&t.status, timerRunning, timerNoStatus) {
+		if !t.status.CompareAndSwap(timerRunning, timerNoStatus) {
 			badTimer()
 		}
 	}
@@ -868,15 +902,18 @@ func runOneTimer(pp *p, t *timer, now int64) {
 //
 // The caller must have locked the timers for pp.
 func clearDeletedTimers(pp *p) {
+	// We are going to clear all timerModifiedEarlier timers.
+	// Do this now in case new ones show up while we are looping.
+	pp.timerModifiedEarliest.Store(0)
+
 	cdel := int32(0)
-	cearlier := int32(0)
 	to := 0
 	changedHeap := false
 	timers := pp.timers
 nextTimer:
 	for _, t := range timers {
 		for {
-			switch s := atomic.Load(&t.status); s {
+			switch s := t.status.Load(); s {
 			case timerWaiting:
 				if changedHeap {
 					timers[to] = t
@@ -885,25 +922,22 @@ nextTimer:
 				to++
 				continue nextTimer
 			case timerModifiedEarlier, timerModifiedLater:
-				if atomic.Cas(&t.status, s, timerMoving) {
+				if t.status.CompareAndSwap(s, timerMoving) {
 					t.when = t.nextwhen
 					timers[to] = t
 					siftupTimer(timers, to)
 					to++
 					changedHeap = true
-					if !atomic.Cas(&t.status, timerMoving, timerWaiting) {
+					if !t.status.CompareAndSwap(timerMoving, timerWaiting) {
 						badTimer()
-					}
-					if s == timerModifiedEarlier {
-						cearlier++
 					}
 					continue nextTimer
 				}
 			case timerDeleted:
-				if atomic.Cas(&t.status, s, timerRemoving) {
+				if t.status.CompareAndSwap(s, timerRemoving) {
 					t.pp = 0
 					cdel++
-					if !atomic.Cas(&t.status, timerRemoving, timerRemoved) {
+					if !t.status.CompareAndSwap(timerRemoving, timerRemoved) {
 						badTimer()
 					}
 					changedHeap = true
@@ -931,9 +965,8 @@ nextTimer:
 		timers[i] = nil
 	}
 
-	atomic.Xadd(&pp.deletedTimers, -cdel)
-	atomic.Xadd(&pp.numTimers, -cdel)
-	atomic.Xadd(&pp.adjustTimers, -cearlier)
+	pp.deletedTimers.Add(-cdel)
+	pp.numTimers.Add(-cdel)
 
 	timers = timers[:to]
 	pp.timers = timers
@@ -961,7 +994,7 @@ func verifyTimerHeap(pp *p) {
 			throw("bad timer heap")
 		}
 	}
-	if numTimers := int(atomic.Load(&pp.numTimers)); len(pp.timers) != numTimers {
+	if numTimers := int(pp.numTimers.Load()); len(pp.timers) != numTimers {
 		println("timer heap len", len(pp.timers), "!= numTimers", numTimers)
 		throw("bad timer heap len")
 	}
@@ -971,18 +1004,33 @@ func verifyTimerHeap(pp *p) {
 // The caller must have locked the timers for pp.
 func updateTimer0When(pp *p) {
 	if len(pp.timers) == 0 {
-		atomic.Store64(&pp.timer0When, 0)
+		pp.timer0When.Store(0)
 	} else {
-		atomic.Store64(&pp.timer0When, uint64(pp.timers[0].when))
+		pp.timer0When.Store(pp.timers[0].when)
 	}
 }
 
-// timeSleepUntil returns the time when the next timer should fire,
-// and the P that holds the timer heap that that timer is on.
+// updateTimerModifiedEarliest updates the recorded nextwhen field of the
+// earlier timerModifiedEarier value.
+// The timers for pp will not be locked.
+func updateTimerModifiedEarliest(pp *p, nextwhen int64) {
+	for {
+		old := pp.timerModifiedEarliest.Load()
+		if old != 0 && int64(old) < nextwhen {
+			return
+		}
+
+		if pp.timerModifiedEarliest.CompareAndSwap(old, nextwhen) {
+			return
+		}
+	}
+}
+
+// timeSleepUntil returns the time when the next timer should fire. Returns
+// maxWhen if there are no timers.
 // This is only called by sysmon and checkdead.
-func timeSleepUntil() (int64, *p) {
+func timeSleepUntil() int64 {
 	next := int64(maxWhen)
-	var pret *p
 
 	// Prevent allp slice changes. This is like retake.
 	lock(&allpLock)
@@ -993,52 +1041,19 @@ func timeSleepUntil() (int64, *p) {
 			continue
 		}
 
-		c := atomic.Load(&pp.adjustTimers)
-		if c == 0 {
-			w := int64(atomic.Load64(&pp.timer0When))
-			if w != 0 && w < next {
-				next = w
-				pret = pp
-			}
-			continue
+		w := pp.timer0When.Load()
+		if w != 0 && w < next {
+			next = w
 		}
 
-		lock(&pp.timersLock)
-		for _, t := range pp.timers {
-			switch s := atomic.Load(&t.status); s {
-			case timerWaiting:
-				if t.when < next {
-					next = t.when
-				}
-			case timerModifiedEarlier, timerModifiedLater:
-				if t.nextwhen < next {
-					next = t.nextwhen
-				}
-				if s == timerModifiedEarlier {
-					c--
-				}
-			}
-			// The timers are sorted, so we only have to check
-			// the first timer for each P, unless there are
-			// some timerModifiedEarlier timers. The number
-			// of timerModifiedEarlier timers is in the adjustTimers
-			// field, used to initialize c, above.
-			//
-			// We don't worry about cases like timerModifying.
-			// New timers can show up at any time,
-			// so this function is necessarily imprecise.
-			// Do a signed check here since we aren't
-			// synchronizing the read of pp.adjustTimers
-			// with the check of a timer status.
-			if int32(c) <= 0 {
-				break
-			}
+		w = pp.timerModifiedEarliest.Load()
+		if w != 0 && w < next {
+			next = w
 		}
-		unlock(&pp.timersLock)
 	}
 	unlock(&allpLock)
 
-	return next, pret
+	return next
 }
 
 // Heap maintenance algorithms.
@@ -1049,11 +1064,17 @@ func timeSleepUntil() (int64, *p) {
 // "panic holding locks" message. Instead, we panic while not
 // holding a lock.
 
-func siftupTimer(t []*timer, i int) {
+// siftupTimer puts the timer at position i in the right place
+// in the heap by moving it up toward the top of the heap.
+// It returns the smallest changed index.
+func siftupTimer(t []*timer, i int) int {
 	if i >= len(t) {
 		badTimer()
 	}
 	when := t[i].when
+	if when <= 0 {
+		badTimer()
+	}
 	tmp := t[i]
 	for i > 0 {
 		p := (i - 1) / 4 // parent
@@ -1066,14 +1087,20 @@ func siftupTimer(t []*timer, i int) {
 	if tmp != t[i] {
 		t[i] = tmp
 	}
+	return i
 }
 
+// siftdownTimer puts the timer at position i in the right place
+// in the heap by moving it down toward the bottom of the heap.
 func siftdownTimer(t []*timer, i int) {
 	n := len(t)
 	if i >= n {
 		badTimer()
 	}
 	when := t[i].when
+	if when <= 0 {
+		badTimer()
+	}
 	tmp := t[i]
 	for {
 		c := i*4 + 1 // left child

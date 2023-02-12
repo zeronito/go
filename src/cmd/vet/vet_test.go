@@ -2,14 +2,13 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-package main_test
+package main
 
 import (
 	"bytes"
 	"errors"
 	"fmt"
 	"internal/testenv"
-	"io/ioutil"
 	"log"
 	"os"
 	"os/exec"
@@ -22,62 +21,46 @@ import (
 	"testing"
 )
 
-const dataDir = "testdata"
-
-var binary string
-
-// We implement TestMain so remove the test binary when all is done.
+// TestMain executes the test binary as the vet command if
+// GO_VETTEST_IS_VET is set, and runs the tests otherwise.
 func TestMain(m *testing.M) {
-	os.Exit(testMain(m))
+	if os.Getenv("GO_VETTEST_IS_VET") != "" {
+		main()
+		os.Exit(0)
+	}
+
+	os.Setenv("GO_VETTEST_IS_VET", "1") // Set for subprocesses to inherit.
+	os.Exit(m.Run())
 }
 
-func testMain(m *testing.M) int {
-	dir, err := ioutil.TempDir("", "vet_test")
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 1
-	}
-	defer os.RemoveAll(dir)
-	binary = filepath.Join(dir, "testvet.exe")
+// vetPath returns the path to the "vet" binary to run.
+func vetPath(t testing.TB) string {
+	t.Helper()
+	testenv.MustHaveExec(t)
 
-	return m.Run()
+	vetPathOnce.Do(func() {
+		vetExePath, vetPathErr = os.Executable()
+	})
+	if vetPathErr != nil {
+		t.Fatal(vetPathErr)
+	}
+	return vetExePath
 }
 
 var (
-	buildMu sync.Mutex // guards following
-	built   = false    // We have built the binary.
-	failed  = false    // We have failed to build the binary, don't try again.
+	vetPathOnce sync.Once
+	vetExePath  string
+	vetPathErr  error
 )
 
-func Build(t *testing.T) {
-	buildMu.Lock()
-	defer buildMu.Unlock()
-	if built {
-		return
-	}
-	if failed {
-		t.Skip("cannot run on this environment")
-	}
-	testenv.MustHaveGoBuild(t)
-	cmd := exec.Command(testenv.GoToolPath(t), "build", "-o", binary)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		failed = true
-		fmt.Fprintf(os.Stderr, "%s\n", output)
-		t.Fatal(err)
-	}
-	built = true
-}
-
 func vetCmd(t *testing.T, arg, pkg string) *exec.Cmd {
-	cmd := exec.Command(testenv.GoToolPath(t), "vet", "-vettool="+binary, arg, path.Join("cmd/vet/testdata", pkg))
+	cmd := testenv.Command(t, testenv.GoToolPath(t), "vet", "-vettool="+vetPath(t), arg, path.Join("cmd/vet/testdata", pkg))
 	cmd.Env = os.Environ()
 	return cmd
 }
 
 func TestVet(t *testing.T) {
 	t.Parallel()
-	Build(t)
 	for _, pkg := range []string{
 		"asm",
 		"assign",
@@ -88,6 +71,7 @@ func TestVet(t *testing.T) {
 		"composite",
 		"copylock",
 		"deadcode",
+		"directive",
 		"httpresponse",
 		"lostcancel",
 		"method",
@@ -142,7 +126,7 @@ func cgoEnabled(t *testing.T) bool {
 	// That's fine for the builders, but causes commands like
 	// 'GOARCH=386 go test .' to fail.
 	// Instead, we ask the go command.
-	cmd := exec.Command(testenv.GoToolPath(t), "list", "-f", "{{context.CgoEnabled}}")
+	cmd := testenv.Command(t, testenv.GoToolPath(t), "list", "-f", "{{context.CgoEnabled}}")
 	out, _ := cmd.CombinedOutput()
 	return string(out) == "true\n"
 }
@@ -166,7 +150,6 @@ func errchk(c *exec.Cmd, files []string, t *testing.T) {
 // TestTags verifies that the -tags argument controls which files to check.
 func TestTags(t *testing.T) {
 	t.Parallel()
-	Build(t)
 	for tag, wantFile := range map[string]int{
 		"testtag":     1, // file1
 		"x testtag y": 1,
@@ -242,8 +225,8 @@ func errorCheck(outStr string, wantAuto bool, fullshort ...string) (err error) {
 			// Assume errmsg says "file:line: foo".
 			// Cut leading "file:line: " to avoid accidental matching of file name instead of message.
 			text := errmsg
-			if i := strings.Index(text, " "); i >= 0 {
-				text = text[i+1:]
+			if _, suffix, ok := strings.Cut(text, " "); ok {
+				text = suffix
 			}
 			if we.re.MatchString(text) {
 				matched = true
@@ -270,7 +253,7 @@ func errorCheck(outStr string, wantAuto bool, fullshort ...string) (err error) {
 	if len(errs) == 1 {
 		return errs[0]
 	}
-	var buf bytes.Buffer
+	var buf strings.Builder
 	fmt.Fprintf(&buf, "\n")
 	for _, err := range errs {
 		fmt.Fprintf(&buf, "%s\n", err.Error())
@@ -335,17 +318,17 @@ type wantedError struct {
 }
 
 var (
-	errRx       = regexp.MustCompile(`// (?:GC_)?ERROR (.*)`)
-	errAutoRx   = regexp.MustCompile(`// (?:GC_)?ERRORAUTO (.*)`)
+	errRx       = regexp.MustCompile(`// (?:GC_)?ERROR(NEXT)? (.*)`)
+	errAutoRx   = regexp.MustCompile(`// (?:GC_)?ERRORAUTO(NEXT)? (.*)`)
 	errQuotesRx = regexp.MustCompile(`"([^"]*)"`)
-	lineRx      = regexp.MustCompile(`LINE(([+-])([0-9]+))?`)
+	lineRx      = regexp.MustCompile(`LINE(([+-])(\d+))?`)
 )
 
 // wantedErrors parses expected errors from comments in a file.
 func wantedErrors(file, short string) (errs []wantedError) {
 	cache := make(map[string]*regexp.Regexp)
 
-	src, err := ioutil.ReadFile(file)
+	src, err := os.ReadFile(file)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -365,7 +348,10 @@ func wantedErrors(file, short string) (errs []wantedError) {
 		if m == nil {
 			continue
 		}
-		all := m[1]
+		if m[1] == "NEXT" {
+			lineNum++
+		}
+		all := m[2]
 		mm := errQuotesRx.FindAllStringSubmatch(all, -1)
 		if mm == nil {
 			log.Fatalf("%s:%d: invalid errchk line: %s", file, lineNum, line)

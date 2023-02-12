@@ -12,6 +12,7 @@ import (
 	"runtime"
 	"runtime/debug"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -20,6 +21,7 @@ import (
 )
 
 func TestGcSys(t *testing.T) {
+	t.Skip("skipping known-flaky test; golang.org/issue/37331")
 	if os.Getenv("GOGC") == "off" {
 		t.Skip("skipping test; GOGC=off in environment")
 	}
@@ -134,7 +136,7 @@ func TestGcLastTime(t *testing.T) {
 	}
 }
 
-var hugeSink interface{}
+var hugeSink any
 
 func TestHugeGCInfo(t *testing.T) {
 	// The test ensures that compiler can chew these huge types even on weakest machines.
@@ -190,6 +192,119 @@ func TestPeriodicGC(t *testing.T) {
 	if numGCs < want {
 		t.Fatalf("no periodic GC: got %v GCs, want >= 2", numGCs)
 	}
+}
+
+func TestGcZombieReporting(t *testing.T) {
+	// This test is somewhat sensitive to how the allocator works.
+	// Pointers in zombies slice may cross-span, thus we
+	// add invalidptr=0 for avoiding the badPointer check.
+	// See issue https://golang.org/issues/49613/
+	got := runTestProg(t, "testprog", "GCZombie", "GODEBUG=invalidptr=0")
+	want := "found pointer to free object"
+	if !strings.Contains(got, want) {
+		t.Fatalf("expected %q in output, but got %q", want, got)
+	}
+}
+
+func TestGCTestMoveStackOnNextCall(t *testing.T) {
+	t.Parallel()
+	var onStack int
+	// GCTestMoveStackOnNextCall can fail in rare cases if there's
+	// a preemption. This won't happen many times in quick
+	// succession, so just retry a few times.
+	for retry := 0; retry < 5; retry++ {
+		runtime.GCTestMoveStackOnNextCall()
+		if moveStackCheck(t, &onStack, uintptr(unsafe.Pointer(&onStack))) {
+			// Passed.
+			return
+		}
+	}
+	t.Fatal("stack did not move")
+}
+
+// This must not be inlined because the point is to force a stack
+// growth check and move the stack.
+//
+//go:noinline
+func moveStackCheck(t *testing.T, new *int, old uintptr) bool {
+	// new should have been updated by the stack move;
+	// old should not have.
+
+	// Capture new's value before doing anything that could
+	// further move the stack.
+	new2 := uintptr(unsafe.Pointer(new))
+
+	t.Logf("old stack pointer %x, new stack pointer %x", old, new2)
+	if new2 == old {
+		// Check that we didn't screw up the test's escape analysis.
+		if cls := runtime.GCTestPointerClass(unsafe.Pointer(new)); cls != "stack" {
+			t.Fatalf("test bug: new (%#x) should be a stack pointer, not %s", new2, cls)
+		}
+		// This was a real failure.
+		return false
+	}
+	return true
+}
+
+func TestGCTestMoveStackRepeatedly(t *testing.T) {
+	// Move the stack repeatedly to make sure we're not doubling
+	// it each time.
+	for i := 0; i < 100; i++ {
+		runtime.GCTestMoveStackOnNextCall()
+		moveStack1(false)
+	}
+}
+
+//go:noinline
+func moveStack1(x bool) {
+	// Make sure this function doesn't get auto-nosplit.
+	if x {
+		println("x")
+	}
+}
+
+func TestGCTestIsReachable(t *testing.T) {
+	var all, half []unsafe.Pointer
+	var want uint64
+	for i := 0; i < 16; i++ {
+		// The tiny allocator muddies things, so we use a
+		// scannable type.
+		p := unsafe.Pointer(new(*int))
+		all = append(all, p)
+		if i%2 == 0 {
+			half = append(half, p)
+			want |= 1 << i
+		}
+	}
+
+	got := runtime.GCTestIsReachable(all...)
+	if want != got {
+		t.Fatalf("did not get expected reachable set; want %b, got %b", want, got)
+	}
+	runtime.KeepAlive(half)
+}
+
+var pointerClassBSS *int
+var pointerClassData = 42
+
+func TestGCTestPointerClass(t *testing.T) {
+	t.Parallel()
+	check := func(p unsafe.Pointer, want string) {
+		t.Helper()
+		got := runtime.GCTestPointerClass(p)
+		if got != want {
+			// Convert the pointer to a uintptr to avoid
+			// escaping it.
+			t.Errorf("for %#x, want class %s, got %s", uintptr(p), want, got)
+		}
+	}
+	var onStack int
+	var notOnStack int
+	check(unsafe.Pointer(&onStack), "stack")
+	check(unsafe.Pointer(runtime.Escape(&notOnStack)), "heap")
+	check(unsafe.Pointer(&pointerClassBSS), "bss")
+	check(unsafe.Pointer(&pointerClassData), "data")
+	check(nil, "other")
 }
 
 func BenchmarkSetTypePtr(b *testing.B) {
@@ -341,11 +456,11 @@ func BenchmarkSetTypeNode1024Slice(b *testing.B) {
 	benchSetType(b, make([]Node1024, 32))
 }
 
-func benchSetType(b *testing.B, x interface{}) {
+func benchSetType(b *testing.B, x any) {
 	v := reflect.ValueOf(x)
 	t := v.Type()
 	switch t.Kind() {
-	case reflect.Ptr:
+	case reflect.Pointer:
 		b.SetBytes(int64(t.Elem().Size()))
 	case reflect.Slice:
 		b.SetBytes(int64(t.Elem().Size()) * int64(v.Len()))
@@ -407,7 +522,7 @@ func TestPrintGC(t *testing.T) {
 	close(done)
 }
 
-func testTypeSwitch(x interface{}) error {
+func testTypeSwitch(x any) error {
 	switch y := x.(type) {
 	case nil:
 		// ok
@@ -417,14 +532,14 @@ func testTypeSwitch(x interface{}) error {
 	return nil
 }
 
-func testAssert(x interface{}) error {
+func testAssert(x any) error {
 	if y, ok := x.(error); ok {
 		return y
 	}
 	return nil
 }
 
-func testAssertVar(x interface{}) error {
+func testAssertVar(x any) error {
 	var y, ok = x.(error)
 	if ok {
 		return y
@@ -435,7 +550,7 @@ func testAssertVar(x interface{}) error {
 var a bool
 
 //go:noinline
-func testIfaceEqual(x interface{}) {
+func testIfaceEqual(x any) {
 	if x == "abc" {
 		a = true
 	}
@@ -498,17 +613,16 @@ func BenchmarkReadMemStats(b *testing.B) {
 	for i := range x {
 		x[i] = new([1024]byte)
 	}
-	hugeSink = x
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		runtime.ReadMemStats(&ms)
 	}
 
-	hugeSink = nil
+	runtime.KeepAlive(x)
 }
 
-func BenchmarkReadMemStatsLatency(b *testing.B) {
+func applyGCLoad(b *testing.B) func() {
 	// We’ll apply load to the runtime with maxProcs-1 goroutines
 	// and use one more to actually benchmark. It doesn't make sense
 	// to try to run this test with only 1 P (that's what
@@ -553,6 +667,14 @@ func BenchmarkReadMemStatsLatency(b *testing.B) {
 			runtime.KeepAlive(hold)
 		}()
 	}
+	return func() {
+		close(done)
+		wg.Wait()
+	}
+}
+
+func BenchmarkReadMemStatsLatency(b *testing.B) {
+	stop := applyGCLoad(b)
 
 	// Spend this much time measuring latencies.
 	latencies := make([]time.Duration, 0, 1024)
@@ -567,14 +689,13 @@ func BenchmarkReadMemStatsLatency(b *testing.B) {
 		time.Sleep(100 * time.Millisecond)
 		start := time.Now()
 		runtime.ReadMemStats(&ms)
-		latencies = append(latencies, time.Now().Sub(start))
+		latencies = append(latencies, time.Since(start))
 	}
-	close(done)
-	// Make sure to stop the timer before we wait! The goroutines above
-	// are very heavy-weight and not easy to stop, so we could end up
+	// Make sure to stop the timer before we wait! The load created above
+	// is very heavy-weight and not easy to stop, so we could end up
 	// confusing the benchmarking framework for small b.N.
 	b.StopTimer()
-	wg.Wait()
+	stop()
 
 	// Disable the default */op metrics.
 	// ns/op doesn't mean anything because it's an average, but we
@@ -753,6 +874,10 @@ func BenchmarkScanStackNoLocals(b *testing.B) {
 }
 
 func BenchmarkMSpanCountAlloc(b *testing.B) {
+	// Allocate one dummy mspan for the whole benchmark.
+	s := runtime.AllocMSpan()
+	defer runtime.FreeMSpan(s)
+
 	// n is the number of bytes to benchmark against.
 	// n must always be a multiple of 8, since gcBits is
 	// always rounded up 8 bytes.
@@ -764,7 +889,7 @@ func BenchmarkMSpanCountAlloc(b *testing.B) {
 
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				runtime.MSpanCountAlloc(bits)
+				runtime.MSpanCountAlloc(s, bits)
 			}
 		})
 	}
@@ -778,4 +903,32 @@ func countpwg(n *int, ready *sync.WaitGroup, teardown chan bool) {
 	}
 	*n--
 	countpwg(n, ready, teardown)
+}
+
+func TestMemoryLimit(t *testing.T) {
+	if testing.Short() {
+		t.Skip("stress test that takes time to run")
+	}
+	if runtime.NumCPU() < 4 {
+		t.Skip("want at least 4 CPUs for this test")
+	}
+	got := runTestProg(t, "testprog", "GCMemoryLimit")
+	want := "OK\n"
+	if got != want {
+		t.Fatalf("expected %q, but got %q", want, got)
+	}
+}
+
+func TestMemoryLimitNoGCPercent(t *testing.T) {
+	if testing.Short() {
+		t.Skip("stress test that takes time to run")
+	}
+	if runtime.NumCPU() < 4 {
+		t.Skip("want at least 4 CPUs for this test")
+	}
+	got := runTestProg(t, "testprog", "GCMemoryLimitNoGCPercent")
+	want := "OK\n"
+	if got != want {
+		t.Fatalf("expected %q, but got %q", want, got)
+	}
 }

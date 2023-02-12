@@ -9,7 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"reflect"
 	"runtime/debug"
 	"strings"
@@ -99,7 +98,7 @@ var bigtest = testpair{
 	"VHdhcyBicmlsbGlnLCBhbmQgdGhlIHNsaXRoeSB0b3Zlcw==",
 }
 
-func testEqual(t *testing.T, msg string, args ...interface{}) bool {
+func testEqual(t *testing.T, msg string, args ...any) bool {
 	t.Helper()
 	if args[len(args)-2] != args[len(args)-1] {
 		t.Errorf(msg, args...)
@@ -120,7 +119,7 @@ func TestEncode(t *testing.T) {
 
 func TestEncoder(t *testing.T) {
 	for _, p := range pairs {
-		bb := &bytes.Buffer{}
+		bb := &strings.Builder{}
 		encoder := NewEncoder(StdEncoding, bb)
 		encoder.Write([]byte(p.decoded))
 		encoder.Close()
@@ -131,7 +130,7 @@ func TestEncoder(t *testing.T) {
 func TestEncoderBuffering(t *testing.T) {
 	input := []byte(bigtest.decoded)
 	for bs := 1; bs <= 12; bs++ {
-		bb := &bytes.Buffer{}
+		bb := &strings.Builder{}
 		encoder := NewEncoder(StdEncoding, bb)
 		for pos := 0; pos < len(input); pos += bs {
 			end := pos + bs
@@ -324,9 +323,9 @@ func TestBig(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Encoder.Close() = %v want nil", err)
 	}
-	decoded, err := ioutil.ReadAll(NewDecoder(StdEncoding, encoded))
+	decoded, err := io.ReadAll(NewDecoder(StdEncoding, encoded))
 	if err != nil {
-		t.Fatalf("ioutil.ReadAll(NewDecoder(...)): %v", err)
+		t.Fatalf("io.ReadAll(NewDecoder(...)): %v", err)
 	}
 
 	if !bytes.Equal(raw, decoded) {
@@ -403,7 +402,7 @@ func TestDecoderIssue3577(t *testing.T) {
 	})
 	errc := make(chan error, 1)
 	go func() {
-		_, err := ioutil.ReadAll(d)
+		_, err := io.ReadAll(d)
 		errc <- err
 	}()
 	select {
@@ -436,14 +435,14 @@ bqbPb06551Y4
 	encodedShort := strings.ReplaceAll(encoded, "\n", "")
 
 	dec := NewDecoder(StdEncoding, strings.NewReader(encoded))
-	res1, err := ioutil.ReadAll(dec)
+	res1, err := io.ReadAll(dec)
 	if err != nil {
 		t.Errorf("ReadAll failed: %v", err)
 	}
 
 	dec = NewDecoder(StdEncoding, strings.NewReader(encodedShort))
 	var res2 []byte
-	res2, err = ioutil.ReadAll(dec)
+	res2, err = io.ReadAll(dec)
 	if err != nil {
 		t.Errorf("ReadAll failed: %v", err)
 	}
@@ -505,6 +504,16 @@ func BenchmarkDecodeString(b *testing.B) {
 	}
 }
 
+func BenchmarkNewEncoding(b *testing.B) {
+	b.SetBytes(int64(len(Encoding{}.decodeMap)))
+	for i := 0; i < b.N; i++ {
+		e := NewEncoding(encodeStd)
+		for _, v := range e.decodeMap {
+			_ = v
+		}
+	}
+}
+
 func TestDecoderRaw(t *testing.T) {
 	source := "AAAAAA"
 	want := []byte{0, 0, 0, 0}
@@ -517,14 +526,14 @@ func TestDecoderRaw(t *testing.T) {
 
 	// Through reader. Used to fail.
 	r := NewDecoder(RawURLEncoding, bytes.NewReader([]byte(source)))
-	dec2, err := ioutil.ReadAll(io.LimitReader(r, 100))
+	dec2, err := io.ReadAll(io.LimitReader(r, 100))
 	if err != nil || !bytes.Equal(dec2, want) {
 		t.Errorf("reading NewDecoder(RawURLEncoding, %q) = %x, %v, want %x, nil", source, dec2, err, want)
 	}
 
 	// Should work with padding.
 	r = NewDecoder(URLEncoding, bytes.NewReader([]byte(source+"==")))
-	dec3, err := ioutil.ReadAll(r)
+	dec3, err := io.ReadAll(r)
 	if err != nil || !bytes.Equal(dec3, want) {
 		t.Errorf("reading NewDecoder(URLEncoding, %q) = %x, %v, want %x, nil", source+"==", dec3, err, want)
 	}

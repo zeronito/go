@@ -16,6 +16,7 @@ import (
 	"errors"
 	"hash"
 	"sync"
+	"sync/atomic"
 )
 
 // The size of a CRC-32 checksum in bytes.
@@ -75,15 +76,14 @@ type Table [256]uint32
 // using this polynomial.
 var castagnoliTable *Table
 var castagnoliTable8 *slicing8Table
-var castagnoliArchImpl bool
 var updateCastagnoli func(crc uint32, p []byte) uint32
 var castagnoliOnce sync.Once
+var haveCastagnoli atomic.Bool
 
 func castagnoliInit() {
 	castagnoliTable = simpleMakeTable(Castagnoli)
-	castagnoliArchImpl = archAvailableCastagnoli()
 
-	if castagnoliArchImpl {
+	if archAvailableCastagnoli() {
 		archInitCastagnoli()
 		updateCastagnoli = archUpdateCastagnoli
 	} else {
@@ -93,6 +93,8 @@ func castagnoliInit() {
 			return slicingUpdate(crc, castagnoliTable8, p)
 		}
 	}
+
+	haveCastagnoli.Store(true)
 }
 
 // IEEETable is the table for the IEEE polynomial.
@@ -100,14 +102,11 @@ var IEEETable = simpleMakeTable(IEEE)
 
 // ieeeTable8 is the slicing8Table for IEEE
 var ieeeTable8 *slicing8Table
-var ieeeArchImpl bool
 var updateIEEE func(crc uint32, p []byte) uint32
 var ieeeOnce sync.Once
 
 func ieeeInit() {
-	ieeeArchImpl = archAvailableIEEE()
-
-	if ieeeArchImpl {
+	if archAvailableIEEE() {
 		archInitIEEE()
 		updateIEEE = archUpdateIEEE
 	} else {
@@ -129,8 +128,9 @@ func MakeTable(poly uint32) *Table {
 	case Castagnoli:
 		castagnoliOnce.Do(castagnoliInit)
 		return castagnoliTable
+	default:
+		return simpleMakeTable(poly)
 	}
-	return simpleMakeTable(poly)
 }
 
 // digest represents the partial evaluation of a checksum.
@@ -206,32 +206,31 @@ func readUint32(b []byte) uint32 {
 	return uint32(b[3]) | uint32(b[2])<<8 | uint32(b[1])<<16 | uint32(b[0])<<24
 }
 
-// Update returns the result of adding the bytes in p to the crc.
-func Update(crc uint32, tab *Table, p []byte) uint32 {
-	switch tab {
-	case castagnoliTable:
+func update(crc uint32, tab *Table, p []byte, checkInitIEEE bool) uint32 {
+	switch {
+	case haveCastagnoli.Load() && tab == castagnoliTable:
 		return updateCastagnoli(crc, p)
-	case IEEETable:
-		// Unfortunately, because IEEETable is exported, IEEE may be used without a
-		// call to MakeTable. We have to make sure it gets initialized in that case.
-		ieeeOnce.Do(ieeeInit)
+	case tab == IEEETable:
+		if checkInitIEEE {
+			ieeeOnce.Do(ieeeInit)
+		}
 		return updateIEEE(crc, p)
 	default:
 		return simpleUpdate(crc, tab, p)
 	}
 }
 
+// Update returns the result of adding the bytes in p to the crc.
+func Update(crc uint32, tab *Table, p []byte) uint32 {
+	// Unfortunately, because IEEETable is exported, IEEE may be used without a
+	// call to MakeTable. We have to make sure it gets initialized in that case.
+	return update(crc, tab, p, true)
+}
+
 func (d *digest) Write(p []byte) (n int, err error) {
-	switch d.tab {
-	case castagnoliTable:
-		d.crc = updateCastagnoli(d.crc, p)
-	case IEEETable:
-		// We only create digest objects through New() which takes care of
-		// initialization in this case.
-		d.crc = updateIEEE(d.crc, p)
-	default:
-		d.crc = simpleUpdate(d.crc, d.tab, p)
-	}
+	// We only create digest objects through New() which takes care of
+	// initialization in this case.
+	d.crc = update(d.crc, d.tab, p, false)
 	return len(p), nil
 }
 

@@ -11,12 +11,13 @@ import (
 
 // Offsets into internal/cpu records for use in assembly.
 const (
-	offsetX86HasSSE2   = unsafe.Offsetof(cpu.X86.HasSSE2)
 	offsetX86HasSSE42  = unsafe.Offsetof(cpu.X86.HasSSE42)
 	offsetX86HasAVX2   = unsafe.Offsetof(cpu.X86.HasAVX2)
 	offsetX86HasPOPCNT = unsafe.Offsetof(cpu.X86.HasPOPCNT)
 
 	offsetS390xHasVX = unsafe.Offsetof(cpu.S390X.HasVX)
+
+	offsetPPC64HasPOWER9 = unsafe.Offsetof(cpu.PPC64.IsPOWER9)
 )
 
 // MaxLen is the maximum length of the string to be searched for (argument b) in Index.
@@ -99,7 +100,7 @@ func HashStrRev(sep string) (uint32, uint32) {
 }
 
 // IndexRabinKarpBytes uses the Rabin-Karp search algorithm to return the index of the
-// first occurence of substr in s, or -1 if not present.
+// first occurrence of substr in s, or -1 if not present.
 func IndexRabinKarpBytes(s, sep []byte) int {
 	// Rabin-Karp search
 	hashsep, pow := HashStrBytes(sep)
@@ -124,7 +125,7 @@ func IndexRabinKarpBytes(s, sep []byte) int {
 }
 
 // IndexRabinKarp uses the Rabin-Karp search algorithm to return the index of the
-// first occurence of substr in s, or -1 if not present.
+// first occurrence of substr in s, or -1 if not present.
 func IndexRabinKarp(s, substr string) int {
 	// Rabin-Karp search
 	hashss, pow := HashStr(substr)

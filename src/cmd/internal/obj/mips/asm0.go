@@ -391,6 +391,9 @@ var optab = []Optab{
 	{obj.APCDATA, C_LCON, C_NONE, C_LCON, 0, 0, 0, 0, 0},
 	{obj.AFUNCDATA, C_SCON, C_NONE, C_ADDR, 0, 0, 0, 0, 0},
 	{obj.ANOP, C_NONE, C_NONE, C_NONE, 0, 0, 0, 0, 0},
+	{obj.ANOP, C_LCON, C_NONE, C_NONE, 0, 0, 0, 0, 0}, // nop variants, see #40689
+	{obj.ANOP, C_REG, C_NONE, C_NONE, 0, 0, 0, 0, 0},
+	{obj.ANOP, C_FREG, C_NONE, C_NONE, 0, 0, 0, 0, 0},
 	{obj.ADUFFZERO, C_NONE, C_NONE, C_LBRA, 11, 4, 0, 0, 0}, // same as AJMP
 	{obj.ADUFFCOPY, C_NONE, C_NONE, C_LBRA, 11, 4, 0, 0, 0}, // same as AJMP
 
@@ -407,12 +410,12 @@ func span0(ctxt *obj.Link, cursym *obj.LSym, newprog obj.ProgAlloc) {
 		ctxt.Retpoline = false // don't keep printing
 	}
 
-	p := cursym.Func.Text
+	p := cursym.Func().Text
 	if p == nil || p.Link == nil { // handle external functions and ELF section symbols
 		return
 	}
 
-	c := ctxt0{ctxt: ctxt, newprog: newprog, cursym: cursym, autosize: int32(p.To.Offset + ctxt.FixedFrameSize())}
+	c := ctxt0{ctxt: ctxt, newprog: newprog, cursym: cursym, autosize: int32(p.To.Offset + ctxt.Arch.FixedFrameSize)}
 
 	if oprange[AOR&obj.AMask] == nil {
 		c.ctxt.Diag("mips ops not initialized, call mips.buildop first")
@@ -452,13 +455,13 @@ func span0(ctxt *obj.Link, cursym *obj.LSym, newprog obj.ProgAlloc) {
 	for bflag != 0 {
 		bflag = 0
 		pc = 0
-		for p = c.cursym.Func.Text.Link; p != nil; p = p.Link {
+		for p = c.cursym.Func().Text.Link; p != nil; p = p.Link {
 			p.Pc = pc
 			o = c.oplook(p)
 
 			// very large conditional branches
-			if o.type_ == 6 && p.Pcond != nil {
-				otxt = p.Pcond.Pc - pc
+			if o.type_ == 6 && p.To.Target() != nil {
+				otxt = p.To.Target().Pc - pc
 				if otxt < -(1<<17)+10 || otxt >= (1<<17)-10 {
 					q = c.newprog()
 					q.Link = p.Link
@@ -466,15 +469,15 @@ func span0(ctxt *obj.Link, cursym *obj.LSym, newprog obj.ProgAlloc) {
 					q.As = AJMP
 					q.Pos = p.Pos
 					q.To.Type = obj.TYPE_BRANCH
-					q.Pcond = p.Pcond
-					p.Pcond = q
+					q.To.SetTarget(p.To.Target())
+					p.To.SetTarget(q)
 					q = c.newprog()
 					q.Link = p.Link
 					p.Link = q
 					q.As = AJMP
 					q.Pos = p.Pos
 					q.To.Type = obj.TYPE_BRANCH
-					q.Pcond = q.Link.Link
+					q.To.SetTarget(q.Link.Link)
 
 					c.addnop(p.Link)
 					c.addnop(p)
@@ -509,7 +512,7 @@ func span0(ctxt *obj.Link, cursym *obj.LSym, newprog obj.ProgAlloc) {
 	bp := c.cursym.P
 	var i int32
 	var out [4]uint32
-	for p := c.cursym.Func.Text.Link; p != nil; p = p.Link {
+	for p := c.cursym.Func().Text.Link; p != nil; p = p.Link {
 		c.pc = p.Pc
 		o = c.oplook(p)
 		if int(o.size) > 4*len(out) {
@@ -526,16 +529,29 @@ func span0(ctxt *obj.Link, cursym *obj.LSym, newprog obj.ProgAlloc) {
 	// We use REGTMP as a scratch register during call injection,
 	// so instruction sequences that use REGTMP are unsafe to
 	// preempt asynchronously.
-	obj.MarkUnsafePoints(c.ctxt, c.cursym.Func.Text, c.newprog, c.isUnsafePoint)
+	obj.MarkUnsafePoints(c.ctxt, c.cursym.Func().Text, c.newprog, c.isUnsafePoint, c.isRestartable)
 }
 
-// Return whether p is an unsafe point.
+// isUnsafePoint returns whether p is an unsafe point.
 func (c *ctxt0) isUnsafePoint(p *obj.Prog) bool {
-	if p.From.Reg == REGTMP || p.To.Reg == REGTMP || p.Reg == REGTMP {
-		return true
+	// If p explicitly uses REGTMP, it's unsafe to preempt, because the
+	// preemption sequence clobbers REGTMP.
+	return p.From.Reg == REGTMP || p.To.Reg == REGTMP || p.Reg == REGTMP
+}
+
+// isRestartable returns whether p is a multi-instruction sequence that,
+// if preempted, can be restarted.
+func (c *ctxt0) isRestartable(p *obj.Prog) bool {
+	if c.isUnsafePoint(p) {
+		return false
 	}
-	// Most of the multi-instruction sequence uses REGTMP, except
-	// ones marked safe.
+	// If p is a multi-instruction sequence with uses REGTMP inserted by
+	// the assembler in order to materialize a large constant/offset, we
+	// can restart p (at the start of the instruction sequence), recompute
+	// the content of REGTMP, upon async preemption. Currently, all cases
+	// of assembler-inserted REGTMP fall into this category.
+	// If p doesn't use REGTMP, it can be simply preempted, so we don't
+	// mark it.
 	o := c.oplook(p)
 	return o.size > 4 && o.flag&NOTUSETMP == 0
 }
@@ -611,7 +627,7 @@ func (c *ctxt0) aclass(a *obj.Addr) int {
 				// a.Offset is still relative to pseudo-FP.
 				a.Reg = obj.REG_NONE
 			}
-			c.instoffset = int64(c.autosize) + a.Offset + c.ctxt.FixedFrameSize()
+			c.instoffset = int64(c.autosize) + a.Offset + c.ctxt.Arch.FixedFrameSize
 			if c.instoffset >= -BIG && c.instoffset < BIG {
 				return C_SAUTO
 			}
@@ -679,7 +695,7 @@ func (c *ctxt0) aclass(a *obj.Addr) int {
 				// a.Offset is still relative to pseudo-FP.
 				a.Reg = obj.REG_NONE
 			}
-			c.instoffset = int64(c.autosize) + a.Offset + c.ctxt.FixedFrameSize()
+			c.instoffset = int64(c.autosize) + a.Offset + c.ctxt.Arch.FixedFrameSize
 			if c.instoffset >= -BIG && c.instoffset < BIG {
 				return C_SACON
 			}
@@ -1006,10 +1022,12 @@ func buildop(ctxt *obj.Link) {
 		case ASLL:
 			opset(ASRL, r0)
 			opset(ASRA, r0)
+			opset(AROTR, r0)
 
 		case ASLLV:
 			opset(ASRAV, r0)
 			opset(ASRLV, r0)
+			opset(AROTRV, r0)
 
 		case ASUB:
 			opset(ASUBU, r0)
@@ -1214,10 +1232,10 @@ func (c *ctxt0) asmout(p *obj.Prog, o *Optab, out []uint32) {
 
 	case 6: /* beq r1,[r2],sbra */
 		v := int32(0)
-		if p.Pcond == nil {
+		if p.To.Target() == nil {
 			v = int32(-4) >> 2
 		} else {
-			v = int32(p.Pcond.Pc-p.Pc-4) >> 2
+			v = int32(p.To.Target().Pc-p.Pc-4) >> 2
 		}
 		if (v<<16)>>16 != v {
 			c.ctxt.Diag("short branch too far\n%v", p)
@@ -1269,25 +1287,25 @@ func (c *ctxt0) asmout(p *obj.Prog, o *Optab, out []uint32) {
 		if c.aclass(&p.To) == C_SBRA && p.To.Sym == nil && p.As == AJMP {
 			// use PC-relative branch for short branches
 			// BEQ	R0, R0, sbra
-			if p.Pcond == nil {
+			if p.To.Target() == nil {
 				v = int32(-4) >> 2
 			} else {
-				v = int32(p.Pcond.Pc-p.Pc-4) >> 2
+				v = int32(p.To.Target().Pc-p.Pc-4) >> 2
 			}
 			if (v<<16)>>16 == v {
 				o1 = OP_IRR(c.opirr(ABEQ), uint32(v), uint32(REGZERO), uint32(REGZERO))
 				break
 			}
 		}
-		if p.Pcond == nil {
+		if p.To.Target() == nil {
 			v = int32(p.Pc) >> 2
 		} else {
-			v = int32(p.Pcond.Pc) >> 2
+			v = int32(p.To.Target().Pc) >> 2
 		}
 		o1 = OP_JMP(c.opirr(p.As), uint32(v))
 		if p.To.Sym == nil {
-			p.To.Sym = c.cursym.Func.Text.From.Sym
-			p.To.Offset = p.Pcond.Pc
+			p.To.Sym = c.cursym.Func().Text.From.Sym
+			p.To.Offset = p.To.Target().Pc
 		}
 		rel := obj.Addrel(c.cursym)
 		rel.Off = int32(c.pc)
@@ -1716,12 +1734,16 @@ func (c *ctxt0) oprrr(a obj.As) uint32 {
 		return OP(0, 6)
 	case ASRA:
 		return OP(0, 7)
+	case AROTR:
+		return OP(8, 6)
 	case ASLLV:
 		return OP(2, 4)
 	case ASRLV:
 		return OP(2, 6)
 	case ASRAV:
 		return OP(2, 7)
+	case AROTRV:
+		return OP(10, 6)
 	case AADDV:
 		return OP(5, 4)
 	case AADDVU:
@@ -1900,6 +1922,8 @@ func (c *ctxt0) opirr(a obj.As) uint32 {
 		return OP(0, 2)
 	case ASRA:
 		return OP(0, 3)
+	case AROTR:
+		return OP(0, 2) | 1<<21
 	case AADDV:
 		return SP(3, 0)
 	case AADDVU:
@@ -2012,12 +2036,16 @@ func (c *ctxt0) opirr(a obj.As) uint32 {
 		return OP(7, 2)
 	case ASRAV:
 		return OP(7, 3)
+	case AROTRV:
+		return OP(7, 2) | 1<<21
 	case -ASLLV:
 		return OP(7, 4)
 	case -ASRLV:
 		return OP(7, 6)
 	case -ASRAV:
 		return OP(7, 7)
+	case -AROTRV:
+		return OP(7, 6) | 1<<21
 
 	case ATEQ:
 		return OP(6, 4)
@@ -2045,7 +2073,8 @@ func vshift(a obj.As) bool {
 	switch a {
 	case ASLLV,
 		ASRLV,
-		ASRAV:
+		ASRAV,
+		AROTRV:
 		return true
 	}
 	return false

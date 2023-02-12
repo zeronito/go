@@ -2,30 +2,13 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+//go:build !math_big_pure_go
 // +build !math_big_pure_go
 
 #include "textflag.h"
 
 // This file provides fast assembly versions for the elementary
 // arithmetic operations on vectors implemented in arith.go.
-
-// func mulWW(x, y Word) (z1, z0 Word)
-TEXT ·mulWW(SB),NOSPLIT,$0
-	MOVQ x+0(FP), AX
-	MULQ y+8(FP)
-	MOVQ DX, z1+16(FP)
-	MOVQ AX, z0+24(FP)
-	RET
-
-
-// func divWW(x1, x0, y Word) (q, r Word)
-TEXT ·divWW(SB),NOSPLIT,$0
-	MOVQ x1+0(FP), DX
-	MOVQ x0+8(FP), AX
-	DIVQ y+16(FP)
-	MOVQ AX, q+24(FP)
-	MOVQ DX, r+32(FP)
-	RET
 
 // The carry bit is saved with SBBQ Rx, Rx: if the carry was set, Rx is -1, otherwise it is 0.
 // It is restored with ADDQ Rx, Rx: if Rx was -1 the carry is set, otherwise it is cleared.
@@ -386,7 +369,7 @@ E5:	CMPQ BX, R11		// i < n
 
 // func addMulVVW(z, x []Word, y Word) (c Word)
 TEXT ·addMulVVW(SB),NOSPLIT,$0
-	CMPB    ·support_adx(SB), $1
+	CMPB ·support_adx(SB), $1
 	JEQ adx
 	MOVQ z+0(FP), R10
 	MOVQ x+24(FP), R8
@@ -531,21 +514,3 @@ adx_short:
 
 
 
-// func divWVW(z []Word, xn Word, x []Word, y Word) (r Word)
-TEXT ·divWVW(SB),NOSPLIT,$0
-	MOVQ z+0(FP), R10
-	MOVQ xn+24(FP), DX	// r = xn
-	MOVQ x+32(FP), R8
-	MOVQ y+56(FP), R9
-	MOVQ z_len+8(FP), BX	// i = z
-	JMP E7
-
-L7:	MOVQ (R8)(BX*8), AX
-	DIVQ R9
-	MOVQ AX, (R10)(BX*8)
-
-E7:	SUBQ $1, BX		// i--
-	JGE L7			// i >= 0
-
-	MOVQ DX, r+64(FP)
-	RET

@@ -2,13 +2,12 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// +build ignore
+//go:build ignore
 
 /*
 Input to cgo.
 
 GOARCH=amd64 go tool cgo -cdefs defs_darwin.go >defs_darwin_amd64.h
-GOARCH=386 go tool cgo -cdefs defs_darwin.go >defs_darwin_386.h
 */
 
 package runtime
@@ -121,7 +120,10 @@ const (
 	F_SETFL    = C.F_SETFL
 	FD_CLOEXEC = C.FD_CLOEXEC
 
+	O_WRONLY   = C.O_WRONLY
 	O_NONBLOCK = C.O_NONBLOCK
+	O_CREAT    = C.O_CREAT
+	O_TRUNC    = C.O_TRUNC
 )
 
 type StackT C.struct_sigaltstack

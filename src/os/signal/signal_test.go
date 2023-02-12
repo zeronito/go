@@ -2,20 +2,22 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// +build aix darwin dragonfly freebsd linux netbsd openbsd solaris
+//go:build unix
 
 package signal
 
 import (
 	"bytes"
+	"context"
 	"flag"
 	"fmt"
 	"internal/testenv"
-	"io/ioutil"
 	"os"
 	"os/exec"
 	"runtime"
+	"runtime/trace"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"testing"
@@ -25,16 +27,54 @@ import (
 // settleTime is an upper bound on how long we expect signals to take to be
 // delivered. Lower values make the test faster, but also flakier — especially
 // on heavily loaded systems.
-const settleTime = 100 * time.Millisecond
+//
+// The current value is set based on flakes observed in the Go builders.
+var settleTime = 100 * time.Millisecond
+
+// fatalWaitingTime is an absurdly long time to wait for signals to be
+// delivered but, using it, we (hopefully) eliminate test flakes on the
+// build servers. See #46736 for discussion.
+var fatalWaitingTime = 30 * time.Second
+
+func init() {
+	if testenv.Builder() == "solaris-amd64-oraclerel" {
+		// The solaris-amd64-oraclerel builder has been observed to time out in
+		// TestNohup even with a 250ms settle time.
+		//
+		// Use a much longer settle time on that builder to try to suss out whether
+		// the test is flaky due to builder slowness (which may mean we need a
+		// longer GO_TEST_TIMEOUT_SCALE) or due to a dropped signal (which may
+		// instead need a test-skip and upstream bug filed against the Solaris
+		// kernel).
+		//
+		// See https://golang.org/issue/33174.
+		settleTime = 5 * time.Second
+	} else if runtime.GOOS == "linux" && strings.HasPrefix(runtime.GOARCH, "ppc64") {
+		// Older linux kernels seem to have some hiccups delivering the signal
+		// in a timely manner on ppc64 and ppc64le. When running on a
+		// ppc64le/ubuntu 16.04/linux 4.4 host the time can vary quite
+		// substantially even on a idle system. 5 seconds is twice any value
+		// observed when running 10000 tests on such a system.
+		settleTime = 5 * time.Second
+	} else if s := os.Getenv("GO_TEST_TIMEOUT_SCALE"); s != "" {
+		if scale, err := strconv.Atoi(s); err == nil {
+			settleTime *= time.Duration(scale)
+		}
+	}
+}
 
 func waitSig(t *testing.T, c <-chan os.Signal, sig os.Signal) {
+	t.Helper()
 	waitSig1(t, c, sig, false)
 }
 func waitSigAll(t *testing.T, c <-chan os.Signal, sig os.Signal) {
+	t.Helper()
 	waitSig1(t, c, sig, true)
 }
 
 func waitSig1(t *testing.T, c <-chan os.Signal, sig os.Signal, all bool) {
+	t.Helper()
+
 	// Sleep multiple times to give the kernel more tries to
 	// deliver the signal.
 	start := time.Now()
@@ -45,7 +85,7 @@ func waitSig1(t *testing.T, c <-chan os.Signal, sig os.Signal, all bool) {
 	// General user code should filter out all unexpected signals instead of just
 	// SIGURG, but since os/signal is tightly coupled to the runtime it seems
 	// appropriate to be stricter here.
-	for time.Since(start) < settleTime {
+	for time.Since(start) < fatalWaitingTime {
 		select {
 		case s := <-c:
 			if s == sig {
@@ -58,7 +98,7 @@ func waitSig1(t *testing.T, c <-chan os.Signal, sig os.Signal, all bool) {
 			timer.Reset(settleTime / 10)
 		}
 	}
-	t.Fatalf("timeout waiting for %v", sig)
+	t.Fatalf("timeout after %v waiting for %v", fatalWaitingTime, sig)
 }
 
 // quiesce waits until we can be reasonably confident that all pending signals
@@ -93,6 +133,9 @@ func TestSignal(t *testing.T) {
 	// Using 10 is arbitrary.
 	c1 := make(chan os.Signal, 10)
 	Notify(c1)
+	// Stop relaying the SIGURG signals. See #49724
+	Reset(syscall.SIGURG)
+	defer Stop(c1)
 
 	// Send this process a SIGWINCH
 	t.Logf("sigwinch...")
@@ -274,7 +317,7 @@ func TestDetectNohup(t *testing.T) {
 		os.Remove("nohup.out")
 		out, err := exec.Command("/usr/bin/nohup", os.Args[0], "-test.run=TestDetectNohup", "-check_sighup_ignored").CombinedOutput()
 
-		data, _ := ioutil.ReadFile("nohup.out")
+		data, _ := os.ReadFile("nohup.out")
 		os.Remove("nohup.out")
 		if err != nil {
 			t.Errorf("ran test with -check_sighup_ignored under nohup and it failed: expected success.\nError: %v\nOutput:\n%s%s", err, out, data)
@@ -643,5 +686,231 @@ func TestTime(t *testing.T) {
 	} // hammering on getting time
 
 	close(stop)
+	<-done
+}
+
+var (
+	checkNotifyContext = flag.Bool("check_notify_ctx", false, "if true, TestNotifyContext will fail if SIGINT is not received.")
+	ctxNotifyTimes     = flag.Int("ctx_notify_times", 1, "number of times a SIGINT signal should be received")
+)
+
+func TestNotifyContextNotifications(t *testing.T) {
+	if *checkNotifyContext {
+		ctx, _ := NotifyContext(context.Background(), syscall.SIGINT)
+		// We want to make sure not to be calling Stop() internally on NotifyContext() when processing a received signal.
+		// Being able to wait for a number of received system signals allows us to do so.
+		var wg sync.WaitGroup
+		n := *ctxNotifyTimes
+		wg.Add(n)
+		for i := 0; i < n; i++ {
+			go func() {
+				syscall.Kill(syscall.Getpid(), syscall.SIGINT)
+				wg.Done()
+			}()
+		}
+		wg.Wait()
+		<-ctx.Done()
+		fmt.Println("received SIGINT")
+		// Sleep to give time to simultaneous signals to reach the process.
+		// These signals must be ignored given stop() is not called on this code.
+		// We want to guarantee a SIGINT doesn't cause a premature termination of the program.
+		time.Sleep(settleTime)
+		return
+	}
+
+	t.Parallel()
+	testCases := []struct {
+		name string
+		n    int // number of times a SIGINT should be notified.
+	}{
+		{"once", 1},
+		{"multiple", 10},
+	}
+	for _, tc := range testCases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			var subTimeout time.Duration
+			if deadline, ok := t.Deadline(); ok {
+				timeout := time.Until(deadline)
+				if timeout < 2*settleTime {
+					t.Fatalf("starting test with less than %v remaining", 2*settleTime)
+				}
+				subTimeout = timeout - (timeout / 10) // Leave 10% headroom for cleaning up subprocess.
+			}
+
+			args := []string{
+				"-test.v",
+				"-test.run=TestNotifyContextNotifications$",
+				"-check_notify_ctx",
+				fmt.Sprintf("-ctx_notify_times=%d", tc.n),
+			}
+			if subTimeout != 0 {
+				args = append(args, fmt.Sprintf("-test.timeout=%v", subTimeout))
+			}
+			out, err := exec.Command(os.Args[0], args...).CombinedOutput()
+			if err != nil {
+				t.Errorf("ran test with -check_notify_ctx_notification and it failed with %v.\nOutput:\n%s", err, out)
+			}
+			if want := []byte("received SIGINT\n"); !bytes.Contains(out, want) {
+				t.Errorf("got %q, wanted %q", out, want)
+			}
+		})
+	}
+}
+
+func TestNotifyContextStop(t *testing.T) {
+	Ignore(syscall.SIGHUP)
+	if !Ignored(syscall.SIGHUP) {
+		t.Errorf("expected SIGHUP to be ignored when explicitly ignoring it.")
+	}
+
+	parent, cancelParent := context.WithCancel(context.Background())
+	defer cancelParent()
+	c, stop := NotifyContext(parent, syscall.SIGHUP)
+	defer stop()
+
+	// If we're being notified, then the signal should not be ignored.
+	if Ignored(syscall.SIGHUP) {
+		t.Errorf("expected SIGHUP to not be ignored.")
+	}
+
+	if want, got := "signal.NotifyContext(context.Background.WithCancel, [hangup])", fmt.Sprint(c); want != got {
+		t.Errorf("c.String() = %q, wanted %q", got, want)
+	}
+
+	stop()
+	select {
+	case <-c.Done():
+		if got := c.Err(); got != context.Canceled {
+			t.Errorf("c.Err() = %q, want %q", got, context.Canceled)
+		}
+	case <-time.After(time.Second):
+		t.Errorf("timed out waiting for context to be done after calling stop")
+	}
+}
+
+func TestNotifyContextCancelParent(t *testing.T) {
+	parent, cancelParent := context.WithCancel(context.Background())
+	defer cancelParent()
+	c, stop := NotifyContext(parent, syscall.SIGINT)
+	defer stop()
+
+	if want, got := "signal.NotifyContext(context.Background.WithCancel, [interrupt])", fmt.Sprint(c); want != got {
+		t.Errorf("c.String() = %q, want %q", got, want)
+	}
+
+	cancelParent()
+	select {
+	case <-c.Done():
+		if got := c.Err(); got != context.Canceled {
+			t.Errorf("c.Err() = %q, want %q", got, context.Canceled)
+		}
+	case <-time.After(time.Second):
+		t.Errorf("timed out waiting for parent context to be canceled")
+	}
+}
+
+func TestNotifyContextPrematureCancelParent(t *testing.T) {
+	parent, cancelParent := context.WithCancel(context.Background())
+	defer cancelParent()
+
+	cancelParent() // Prematurely cancel context before calling NotifyContext.
+	c, stop := NotifyContext(parent, syscall.SIGINT)
+	defer stop()
+
+	if want, got := "signal.NotifyContext(context.Background.WithCancel, [interrupt])", fmt.Sprint(c); want != got {
+		t.Errorf("c.String() = %q, want %q", got, want)
+	}
+
+	select {
+	case <-c.Done():
+		if got := c.Err(); got != context.Canceled {
+			t.Errorf("c.Err() = %q, want %q", got, context.Canceled)
+		}
+	case <-time.After(time.Second):
+		t.Errorf("timed out waiting for parent context to be canceled")
+	}
+}
+
+func TestNotifyContextSimultaneousStop(t *testing.T) {
+	c, stop := NotifyContext(context.Background(), syscall.SIGINT)
+	defer stop()
+
+	if want, got := "signal.NotifyContext(context.Background, [interrupt])", fmt.Sprint(c); want != got {
+		t.Errorf("c.String() = %q, want %q", got, want)
+	}
+
+	var wg sync.WaitGroup
+	n := 10
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		go func() {
+			stop()
+			wg.Done()
+		}()
+	}
+	wg.Wait()
+	select {
+	case <-c.Done():
+		if got := c.Err(); got != context.Canceled {
+			t.Errorf("c.Err() = %q, want %q", got, context.Canceled)
+		}
+	case <-time.After(time.Second):
+		t.Errorf("expected context to be canceled")
+	}
+}
+
+func TestNotifyContextStringer(t *testing.T) {
+	parent, cancelParent := context.WithCancel(context.Background())
+	defer cancelParent()
+	c, stop := NotifyContext(parent, syscall.SIGHUP, syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	want := `signal.NotifyContext(context.Background.WithCancel, [hangup interrupt terminated])`
+	if got := fmt.Sprint(c); got != want {
+		t.Errorf("c.String() = %q, want %q", got, want)
+	}
+}
+
+// #44193 test signal handling while stopping and starting the world.
+func TestSignalTrace(t *testing.T) {
+	done := make(chan struct{})
+	quit := make(chan struct{})
+	c := make(chan os.Signal, 1)
+	Notify(c, syscall.SIGHUP)
+
+	// Source and sink for signals busy loop unsynchronized with
+	// trace starts and stops. We are ultimately validating that
+	// signals and runtime.(stop|start)TheWorldGC are compatible.
+	go func() {
+		defer close(done)
+		defer Stop(c)
+		pid := syscall.Getpid()
+		for {
+			select {
+			case <-quit:
+				return
+			default:
+				syscall.Kill(pid, syscall.SIGHUP)
+			}
+			waitSig(t, c, syscall.SIGHUP)
+		}
+	}()
+
+	for i := 0; i < 100; i++ {
+		buf := new(bytes.Buffer)
+		if err := trace.Start(buf); err != nil {
+			t.Fatalf("[%d] failed to start tracing: %v", i, err)
+		}
+		time.After(1 * time.Microsecond)
+		trace.Stop()
+		size := buf.Len()
+		if size == 0 {
+			t.Fatalf("[%d] trace is empty", i)
+		}
+	}
+	close(quit)
 	<-done
 }

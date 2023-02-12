@@ -10,7 +10,8 @@ package ssa
 // A Value can be moved to any block that
 // dominates all blocks in which it is used.
 func tighten(f *Func) {
-	canMove := make([]bool, f.NumValues())
+	canMove := f.Cache.allocBoolSlice(f.NumValues())
+	defer f.Cache.freeBoolSlice(canMove)
 	for _, b := range f.Blocks {
 		for _, v := range b.Values {
 			if v.Op.isLoweredGetClosurePtr() {
@@ -18,10 +19,11 @@ func tighten(f *Func) {
 				continue
 			}
 			switch v.Op {
-			case OpPhi, OpArg, OpSelect0, OpSelect1:
+			case OpPhi, OpArg, OpArgIntReg, OpArgFloatReg, OpSelect0, OpSelect1, OpSelectN:
 				// Phis need to stay in their block.
 				// Arg must stay in the entry block.
 				// Tuple selectors must stay with the tuple generator.
+				// SelectN is typically, ultimately, a register.
 				continue
 			}
 			if v.MemoryArg() != nil {
@@ -51,7 +53,8 @@ func tighten(f *Func) {
 	lca := makeLCArange(f)
 
 	// For each moveable value, record the block that dominates all uses found so far.
-	target := make([]*Block, f.NumValues())
+	target := f.Cache.allocBlockSlice(f.NumValues())
+	defer f.Cache.freeBlockSlice(target)
 
 	// Grab loop information.
 	// We use this to make sure we don't tighten a value into a (deeper) loop.

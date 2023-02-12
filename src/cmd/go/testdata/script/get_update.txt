@@ -3,7 +3,8 @@
 # former dependencies, not current ones.
 
 [!net] skip
-[!exec:git] skip
+[!git] skip
+env GO111MODULE=off
 
 # Rewind
 go get github.com/rsc/go-get-issue-9224-cmd

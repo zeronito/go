@@ -54,28 +54,30 @@ package runtime
 // before the table grows. Typical tables will be somewhat less loaded.
 
 import (
+	"internal/abi"
+	"internal/goarch"
 	"runtime/internal/atomic"
 	"runtime/internal/math"
-	"runtime/internal/sys"
 	"unsafe"
 )
 
 const (
 	// Maximum number of key/elem pairs a bucket can hold.
-	bucketCntBits = 3
-	bucketCnt     = 1 << bucketCntBits
+	bucketCntBits = abi.MapBucketCountBits
+	bucketCnt     = abi.MapBucketCount
 
-	// Maximum average load of a bucket that triggers growth is 6.5.
+	// Maximum average load of a bucket that triggers growth is bucketCnt*13/16 (about 80% full)
+	// Because of minimum alignment rules, bucketCnt is known to be at least 8.
 	// Represent as loadFactorNum/loadFactorDen, to allow integer math.
-	loadFactorNum = 13
 	loadFactorDen = 2
+	loadFactorNum = (bucketCnt * 13 / 16) * loadFactorDen
 
 	// Maximum key or elem size to keep inline (instead of mallocing per element).
 	// Must fit in a uint8.
 	// Fast versions cannot handle big elems - the cutoff size for
 	// fast versions in cmd/compile/internal/gc/walk.go must be at most this elem.
-	maxKeySize  = 128
-	maxElemSize = 128
+	maxKeySize  = abi.MapMaxKeyBytes
+	maxElemSize = abi.MapMaxElemBytes
 
 	// data offset should be the size of the bmap struct, but needs to be
 	// aligned correctly. For amd64p32 this means 64-bit alignment
@@ -103,7 +105,7 @@ const (
 	sameSizeGrow = 8 // the current map growth is to a new map of the same size
 
 	// sentinel bucket ID for iterator checks
-	noCheck = 1<<(8*sys.PtrSize) - 1
+	noCheck = 1<<(8*goarch.PtrSize) - 1
 )
 
 // isEmpty reports whether the given tophash array entry represents an empty bucket entry.
@@ -113,7 +115,7 @@ func isEmpty(x uint8) bool {
 
 // A header for a Go map.
 type hmap struct {
-	// Note: the format of the hmap is also encoded in cmd/compile/internal/gc/reflect.go.
+	// Note: the format of the hmap is also encoded in cmd/compile/internal/reflectdata/reflect.go.
 	// Make sure this stays in sync with the compiler's definition.
 	count     int // # live cells == size of map.  Must be first (used by len() builtin)
 	flags     uint8
@@ -159,11 +161,11 @@ type bmap struct {
 }
 
 // A hash iteration structure.
-// If you modify hiter, also change cmd/compile/internal/gc/reflect.go to indicate
-// the layout of this structure.
+// If you modify hiter, also change cmd/compile/internal/reflectdata/reflect.go
+// and reflect/value.go to match the layout of this structure.
 type hiter struct {
-	key         unsafe.Pointer // Must be in first position.  Write nil to indicate iteration end (see cmd/internal/gc/range.go).
-	elem        unsafe.Pointer // Must be in second position (see cmd/internal/gc/range.go).
+	key         unsafe.Pointer // Must be in first position.  Write nil to indicate iteration end (see cmd/compile/internal/walk/range.go).
+	elem        unsafe.Pointer // Must be in second position (see cmd/compile/internal/walk/range.go).
 	t           *maptype
 	h           *hmap
 	buckets     unsafe.Pointer // bucket ptr at hash_iter initialization time
@@ -182,7 +184,7 @@ type hiter struct {
 // bucketShift returns 1<<b, optimized for code generation.
 func bucketShift(b uint8) uintptr {
 	// Masking the shift amount allows overflow checks to be elided.
-	return uintptr(1) << (b & (sys.PtrSize*8 - 1))
+	return uintptr(1) << (b & (goarch.PtrSize*8 - 1))
 }
 
 // bucketMask returns 1<<b - 1, optimized for code generation.
@@ -192,7 +194,7 @@ func bucketMask(b uint8) uintptr {
 
 // tophash calculates the tophash value for hash.
 func tophash(hash uintptr) uint8 {
-	top := uint8(hash >> (sys.PtrSize*8 - 8))
+	top := uint8(hash >> (goarch.PtrSize*8 - 8))
 	if top < minTopHash {
 		top += minTopHash
 	}
@@ -205,11 +207,11 @@ func evacuated(b *bmap) bool {
 }
 
 func (b *bmap) overflow(t *maptype) *bmap {
-	return *(**bmap)(add(unsafe.Pointer(b), uintptr(t.bucketsize)-sys.PtrSize))
+	return *(**bmap)(add(unsafe.Pointer(b), uintptr(t.bucketsize)-goarch.PtrSize))
 }
 
 func (b *bmap) setoverflow(t *maptype, ovf *bmap) {
-	*(**bmap)(add(unsafe.Pointer(b), uintptr(t.bucketsize)-sys.PtrSize)) = ovf
+	*(**bmap)(add(unsafe.Pointer(b), uintptr(t.bucketsize)-goarch.PtrSize)) = ovf
 }
 
 func (b *bmap) keys() unsafe.Pointer {
@@ -394,12 +396,15 @@ func makeBucketArray(t *maptype, b uint8, dirtyalloc unsafe.Pointer) (buckets un
 func mapaccess1(t *maptype, h *hmap, key unsafe.Pointer) unsafe.Pointer {
 	if raceenabled && h != nil {
 		callerpc := getcallerpc()
-		pc := funcPC(mapaccess1)
+		pc := abi.FuncPCABIInternal(mapaccess1)
 		racereadpc(unsafe.Pointer(h), callerpc, pc)
 		raceReadObjectPC(t.key, key, callerpc, pc)
 	}
 	if msanenabled && h != nil {
 		msanread(key, t.key.size)
+	}
+	if asanenabled && h != nil {
+		asanread(key, t.key.size)
 	}
 	if h == nil || h.count == 0 {
 		if t.hashMightPanic() {
@@ -408,7 +413,7 @@ func mapaccess1(t *maptype, h *hmap, key unsafe.Pointer) unsafe.Pointer {
 		return unsafe.Pointer(&zeroVal[0])
 	}
 	if h.flags&hashWriting != 0 {
-		throw("concurrent map read and map write")
+		fatal("concurrent map read and map write")
 	}
 	hash := t.hasher(key, uintptr(h.hash0))
 	m := bucketMask(h.B)
@@ -452,12 +457,15 @@ bucketloop:
 func mapaccess2(t *maptype, h *hmap, key unsafe.Pointer) (unsafe.Pointer, bool) {
 	if raceenabled && h != nil {
 		callerpc := getcallerpc()
-		pc := funcPC(mapaccess2)
+		pc := abi.FuncPCABIInternal(mapaccess2)
 		racereadpc(unsafe.Pointer(h), callerpc, pc)
 		raceReadObjectPC(t.key, key, callerpc, pc)
 	}
 	if msanenabled && h != nil {
 		msanread(key, t.key.size)
+	}
+	if asanenabled && h != nil {
+		asanread(key, t.key.size)
 	}
 	if h == nil || h.count == 0 {
 		if t.hashMightPanic() {
@@ -466,17 +474,17 @@ func mapaccess2(t *maptype, h *hmap, key unsafe.Pointer) (unsafe.Pointer, bool) 
 		return unsafe.Pointer(&zeroVal[0]), false
 	}
 	if h.flags&hashWriting != 0 {
-		throw("concurrent map read and map write")
+		fatal("concurrent map read and map write")
 	}
 	hash := t.hasher(key, uintptr(h.hash0))
 	m := bucketMask(h.B)
-	b := (*bmap)(unsafe.Pointer(uintptr(h.buckets) + (hash&m)*uintptr(t.bucketsize)))
+	b := (*bmap)(add(h.buckets, (hash&m)*uintptr(t.bucketsize)))
 	if c := h.oldbuckets; c != nil {
 		if !h.sameSizeGrow() {
 			// There used to be half as many buckets; mask down one more power of two.
 			m >>= 1
 		}
-		oldb := (*bmap)(unsafe.Pointer(uintptr(c) + (hash&m)*uintptr(t.bucketsize)))
+		oldb := (*bmap)(add(c, (hash&m)*uintptr(t.bucketsize)))
 		if !evacuated(oldb) {
 			b = oldb
 		}
@@ -507,20 +515,20 @@ bucketloop:
 	return unsafe.Pointer(&zeroVal[0]), false
 }
 
-// returns both key and elem. Used by map iterator
+// returns both key and elem. Used by map iterator.
 func mapaccessK(t *maptype, h *hmap, key unsafe.Pointer) (unsafe.Pointer, unsafe.Pointer) {
 	if h == nil || h.count == 0 {
 		return nil, nil
 	}
 	hash := t.hasher(key, uintptr(h.hash0))
 	m := bucketMask(h.B)
-	b := (*bmap)(unsafe.Pointer(uintptr(h.buckets) + (hash&m)*uintptr(t.bucketsize)))
+	b := (*bmap)(add(h.buckets, (hash&m)*uintptr(t.bucketsize)))
 	if c := h.oldbuckets; c != nil {
 		if !h.sameSizeGrow() {
 			// There used to be half as many buckets; mask down one more power of two.
 			m >>= 1
 		}
-		oldb := (*bmap)(unsafe.Pointer(uintptr(c) + (hash&m)*uintptr(t.bucketsize)))
+		oldb := (*bmap)(add(c, (hash&m)*uintptr(t.bucketsize)))
 		if !evacuated(oldb) {
 			b = oldb
 		}
@@ -574,15 +582,18 @@ func mapassign(t *maptype, h *hmap, key unsafe.Pointer) unsafe.Pointer {
 	}
 	if raceenabled {
 		callerpc := getcallerpc()
-		pc := funcPC(mapassign)
+		pc := abi.FuncPCABIInternal(mapassign)
 		racewritepc(unsafe.Pointer(h), callerpc, pc)
 		raceReadObjectPC(t.key, key, callerpc, pc)
 	}
 	if msanenabled {
 		msanread(key, t.key.size)
 	}
+	if asanenabled {
+		asanread(key, t.key.size)
+	}
 	if h.flags&hashWriting != 0 {
-		throw("concurrent map writes")
+		fatal("concurrent map writes")
 	}
 	hash := t.hasher(key, uintptr(h.hash0))
 
@@ -599,7 +610,7 @@ again:
 	if h.growing() {
 		growWork(t, h, bucket)
 	}
-	b := (*bmap)(unsafe.Pointer(uintptr(h.buckets) + bucket*uintptr(t.bucketsize)))
+	b := (*bmap)(add(h.buckets, bucket*uintptr(t.bucketsize)))
 	top := tophash(hash)
 
 	var inserti *uint8
@@ -650,7 +661,7 @@ bucketloop:
 	}
 
 	if inserti == nil {
-		// all current buckets are full, allocate a new one.
+		// The current bucket and all the overflow buckets connected to it are full, allocate a new one.
 		newb := h.newoverflow(t, b)
 		inserti = &newb.tophash[0]
 		insertk = add(unsafe.Pointer(newb), dataOffset)
@@ -673,7 +684,7 @@ bucketloop:
 
 done:
 	if h.flags&hashWriting == 0 {
-		throw("concurrent map writes")
+		fatal("concurrent map writes")
 	}
 	h.flags &^= hashWriting
 	if t.indirectelem() {
@@ -685,12 +696,15 @@ done:
 func mapdelete(t *maptype, h *hmap, key unsafe.Pointer) {
 	if raceenabled && h != nil {
 		callerpc := getcallerpc()
-		pc := funcPC(mapdelete)
+		pc := abi.FuncPCABIInternal(mapdelete)
 		racewritepc(unsafe.Pointer(h), callerpc, pc)
 		raceReadObjectPC(t.key, key, callerpc, pc)
 	}
 	if msanenabled && h != nil {
 		msanread(key, t.key.size)
+	}
+	if asanenabled && h != nil {
+		asanread(key, t.key.size)
 	}
 	if h == nil || h.count == 0 {
 		if t.hashMightPanic() {
@@ -699,7 +713,7 @@ func mapdelete(t *maptype, h *hmap, key unsafe.Pointer) {
 		return
 	}
 	if h.flags&hashWriting != 0 {
-		throw("concurrent map writes")
+		fatal("concurrent map writes")
 	}
 
 	hash := t.hasher(key, uintptr(h.hash0))
@@ -780,12 +794,17 @@ search:
 			}
 		notLast:
 			h.count--
+			// Reset the hash seed to make it more difficult for attackers to
+			// repeatedly trigger hash collisions. See issue 25237.
+			if h.count == 0 {
+				h.hash0 = fastrand()
+			}
 			break search
 		}
 	}
 
 	if h.flags&hashWriting == 0 {
-		throw("concurrent map writes")
+		fatal("concurrent map writes")
 	}
 	h.flags &^= hashWriting
 }
@@ -797,17 +816,17 @@ search:
 func mapiterinit(t *maptype, h *hmap, it *hiter) {
 	if raceenabled && h != nil {
 		callerpc := getcallerpc()
-		racereadpc(unsafe.Pointer(h), callerpc, funcPC(mapiterinit))
+		racereadpc(unsafe.Pointer(h), callerpc, abi.FuncPCABIInternal(mapiterinit))
 	}
 
+	it.t = t
 	if h == nil || h.count == 0 {
 		return
 	}
 
-	if unsafe.Sizeof(hiter{})/sys.PtrSize != 12 {
-		throw("hash_iter size incorrect") // see cmd/compile/internal/gc/reflect.go
+	if unsafe.Sizeof(hiter{})/goarch.PtrSize != 12 {
+		throw("hash_iter size incorrect") // see cmd/compile/internal/reflectdata/reflect.go
 	}
-	it.t = t
 	it.h = h
 
 	// grab snapshot of bucket state
@@ -824,9 +843,11 @@ func mapiterinit(t *maptype, h *hmap, it *hiter) {
 	}
 
 	// decide where to start
-	r := uintptr(fastrand())
+	var r uintptr
 	if h.B > 31-bucketCntBits {
-		r += uintptr(fastrand()) << 31
+		r = uintptr(fastrand64())
+	} else {
+		r = uintptr(fastrand())
 	}
 	it.startBucket = r & bucketMask(h.B)
 	it.offset = uint8(r >> h.B & (bucketCnt - 1))
@@ -847,10 +868,10 @@ func mapiternext(it *hiter) {
 	h := it.h
 	if raceenabled {
 		callerpc := getcallerpc()
-		racereadpc(unsafe.Pointer(h), callerpc, funcPC(mapiternext))
+		racereadpc(unsafe.Pointer(h), callerpc, abi.FuncPCABIInternal(mapiternext))
 	}
 	if h.flags&hashWriting != 0 {
-		throw("concurrent map iteration and map write")
+		fatal("concurrent map iteration and map write")
 	}
 	t := it.t
 	bucket := it.bucket
@@ -973,7 +994,7 @@ next:
 func mapclear(t *maptype, h *hmap) {
 	if raceenabled && h != nil {
 		callerpc := getcallerpc()
-		pc := funcPC(mapclear)
+		pc := abi.FuncPCABIInternal(mapclear)
 		racewritepc(unsafe.Pointer(h), callerpc, pc)
 	}
 
@@ -982,7 +1003,7 @@ func mapclear(t *maptype, h *hmap) {
 	}
 
 	if h.flags&hashWriting != 0 {
-		throw("concurrent map writes")
+		fatal("concurrent map writes")
 	}
 
 	h.flags ^= hashWriting
@@ -992,6 +1013,10 @@ func mapclear(t *maptype, h *hmap) {
 	h.nevacuate = 0
 	h.noverflow = 0
 	h.count = 0
+
+	// Reset the hash seed to make it more difficult for attackers to
+	// repeatedly trigger hash collisions. See issue 25237.
+	h.hash0 = fastrand()
 
 	// Keep the mapextra allocation but clear any extra information.
 	if h.extra != nil {
@@ -1009,7 +1034,7 @@ func mapclear(t *maptype, h *hmap) {
 	}
 
 	if h.flags&hashWriting == 0 {
-		throw("concurrent map writes")
+		fatal("concurrent map writes")
 	}
 	h.flags &^= hashWriting
 }
@@ -1271,11 +1296,11 @@ func reflect_makemap(t *maptype, cap int) *hmap {
 	if t.key.equal == nil {
 		throw("runtime.reflect_makemap: unsupported map key type")
 	}
-	if t.key.size > maxKeySize && (!t.indirectkey() || t.keysize != uint8(sys.PtrSize)) ||
+	if t.key.size > maxKeySize && (!t.indirectkey() || t.keysize != uint8(goarch.PtrSize)) ||
 		t.key.size <= maxKeySize && (t.indirectkey() || t.keysize != uint8(t.key.size)) {
 		throw("key size wrong")
 	}
-	if t.elem.size > maxElemSize && (!t.indirectelem() || t.elemsize != uint8(sys.PtrSize)) ||
+	if t.elem.size > maxElemSize && (!t.indirectelem() || t.elemsize != uint8(goarch.PtrSize)) ||
 		t.elem.size <= maxElemSize && (t.indirectelem() || t.elemsize != uint8(t.elem.size)) {
 		throw("elem size wrong")
 	}
@@ -1314,9 +1339,25 @@ func reflect_mapaccess(t *maptype, h *hmap, key unsafe.Pointer) unsafe.Pointer {
 	return elem
 }
 
+//go:linkname reflect_mapaccess_faststr reflect.mapaccess_faststr
+func reflect_mapaccess_faststr(t *maptype, h *hmap, key string) unsafe.Pointer {
+	elem, ok := mapaccess2_faststr(t, h, key)
+	if !ok {
+		// reflect wants nil for a missing element
+		elem = nil
+	}
+	return elem
+}
+
 //go:linkname reflect_mapassign reflect.mapassign
 func reflect_mapassign(t *maptype, h *hmap, key unsafe.Pointer, elem unsafe.Pointer) {
 	p := mapassign(t, h, key)
+	typedmemmove(t.elem, p, elem)
+}
+
+//go:linkname reflect_mapassign_faststr reflect.mapassign_faststr
+func reflect_mapassign_faststr(t *maptype, h *hmap, key string, elem unsafe.Pointer) {
+	p := mapassign_faststr(t, h, key)
 	typedmemmove(t.elem, p, elem)
 }
 
@@ -1325,11 +1366,14 @@ func reflect_mapdelete(t *maptype, h *hmap, key unsafe.Pointer) {
 	mapdelete(t, h, key)
 }
 
+//go:linkname reflect_mapdelete_faststr reflect.mapdelete_faststr
+func reflect_mapdelete_faststr(t *maptype, h *hmap, key string) {
+	mapdelete_faststr(t, h, key)
+}
+
 //go:linkname reflect_mapiterinit reflect.mapiterinit
-func reflect_mapiterinit(t *maptype, h *hmap) *hiter {
-	it := new(hiter)
+func reflect_mapiterinit(t *maptype, h *hmap, it *hiter) {
 	mapiterinit(t, h, it)
-	return it
 }
 
 //go:linkname reflect_mapiternext reflect.mapiternext
@@ -1354,9 +1398,14 @@ func reflect_maplen(h *hmap) int {
 	}
 	if raceenabled {
 		callerpc := getcallerpc()
-		racereadpc(unsafe.Pointer(h), callerpc, funcPC(reflect_maplen))
+		racereadpc(unsafe.Pointer(h), callerpc, abi.FuncPCABIInternal(reflect_maplen))
 	}
 	return h.count
+}
+
+//go:linkname reflect_mapclear reflect.mapclear
+func reflect_mapclear(t *maptype, h *hmap) {
+	mapclear(t, h)
 }
 
 //go:linkname reflectlite_maplen internal/reflectlite.maplen
@@ -1366,10 +1415,17 @@ func reflectlite_maplen(h *hmap) int {
 	}
 	if raceenabled {
 		callerpc := getcallerpc()
-		racereadpc(unsafe.Pointer(h), callerpc, funcPC(reflect_maplen))
+		racereadpc(unsafe.Pointer(h), callerpc, abi.FuncPCABIInternal(reflect_maplen))
 	}
 	return h.count
 }
 
-const maxZero = 1024 // must match value in cmd/compile/internal/gc/walk.go:zeroValSize
+const maxZero = 1024 // must match value in reflect/value.go:maxZero cmd/compile/internal/gc/walk.go:zeroValSize
 var zeroVal [maxZero]byte
+
+// mapinitnoop is a no-op function known the Go linker; if a given global
+// map (of the right size) is determined to be dead, the linker will
+// rewrite the relocation (from the package init func) from the outlined
+// map init function to this symbol. Defined in assembly so as to avoid
+// complications with instrumentation (coverage, etc).
+func mapinitnoop()

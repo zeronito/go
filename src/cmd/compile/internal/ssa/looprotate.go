@@ -8,19 +8,19 @@ package ssa
 // to loops with a check-loop-condition-at-end.
 // This helps loops avoid extra unnecessary jumps.
 //
-//   loop:
-//     CMPQ ...
-//     JGE exit
-//     ...
-//     JMP loop
-//   exit:
+//	 loop:
+//	   CMPQ ...
+//	   JGE exit
+//	   ...
+//	   JMP loop
+//	 exit:
 //
-//    JMP entry
-//  loop:
-//    ...
-//  entry:
-//    CMPQ ...
-//    JLT loop
+//	  JMP entry
+//	loop:
+//	  ...
+//	entry:
+//	  CMPQ ...
+//	  JLT loop
 func loopRotate(f *Func) {
 	loopnest := f.loopnest()
 	if loopnest.hasIrreducible {
@@ -30,7 +30,8 @@ func loopRotate(f *Func) {
 		return
 	}
 
-	idToIdx := make([]int, f.NumBlocks())
+	idToIdx := f.Cache.allocIntSlice(f.NumBlocks())
+	defer f.Cache.freeIntSlice(idToIdx)
 	for i, b := range f.Blocks {
 		idToIdx[b.ID] = i
 	}
@@ -68,12 +69,15 @@ func loopRotate(f *Func) {
 			if nextb == p { // original loop predecessor is next
 				break
 			}
-			if loopnest.b2l[nextb.ID] != loop { // about to leave loop
-				break
+			if loopnest.b2l[nextb.ID] == loop {
+				after[p.ID] = append(after[p.ID], nextb)
 			}
-			after[p.ID] = append(after[p.ID], nextb)
 			b = nextb
 		}
+		// Swap b and p so that we'll handle p before b when moving blocks.
+		f.Blocks[idToIdx[loop.header.ID]] = p
+		f.Blocks[idToIdx[p.ID]] = loop.header
+		idToIdx[loop.header.ID], idToIdx[p.ID] = idToIdx[p.ID], idToIdx[loop.header.ID]
 
 		// Place b after p.
 		for _, b := range after[p.ID] {
@@ -86,21 +90,24 @@ func loopRotate(f *Func) {
 	// before the rest of the loop.  And that relies on the
 	// fact that we only identify reducible loops.
 	j := 0
-	for i, b := range f.Blocks {
+	// Some blocks that are not part of a loop may be placed
+	// between loop blocks. In order to avoid these blocks from
+	// being overwritten, use a temporary slice.
+	oldOrder := f.Cache.allocBlockSlice(len(f.Blocks))
+	defer f.Cache.freeBlockSlice(oldOrder)
+	copy(oldOrder, f.Blocks)
+	for _, b := range oldOrder {
 		if _, ok := move[b.ID]; ok {
 			continue
 		}
 		f.Blocks[j] = b
 		j++
 		for _, a := range after[b.ID] {
-			if j > i {
-				f.Fatalf("head before tail in loop %s", b)
-			}
 			f.Blocks[j] = a
 			j++
 		}
 	}
-	if j != len(f.Blocks) {
+	if j != len(oldOrder) {
 		f.Fatalf("bad reordering in looprotate")
 	}
 }

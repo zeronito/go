@@ -12,6 +12,7 @@ import (
 	"log"
 	"math"
 	"net/http"
+	"net/url"
 	"reflect"
 	"sort"
 	"strconv"
@@ -146,10 +147,12 @@ func httpUserRegion(w http.ResponseWriter, r *http.Request) {
 		MaxTotal int64
 		Data     []regionDesc
 		Name     string
+		Filter   *regionFilter
 	}{
 		MaxTotal: maxTotal,
 		Data:     data,
 		Name:     filter.name,
+		Filter:   filter,
 	})
 	if err != nil {
 		http.Error(w, fmt.Sprintf("failed to execute template: %v", err), http.StatusInternalServerError)
@@ -367,7 +370,7 @@ func (task *taskDesc) String() string {
 	if task == nil {
 		return "task <nil>"
 	}
-	wb := new(bytes.Buffer)
+	wb := new(strings.Builder)
 	fmt.Fprintf(wb, "task %d:\t%s\n", task.id, task.name)
 	fmt.Fprintf(wb, "\tstart: %v end: %v complete: %t\n", task.firstTimestamp(), task.endTimestamp(), task.complete())
 	fmt.Fprintf(wb, "\t%d goroutines\n", len(task.goroutines))
@@ -404,10 +407,7 @@ func (tasks allTasks) task(taskID uint64) *taskDesc {
 		return t
 	}
 
-	t = &taskDesc{
-		id:         taskID,
-		goroutines: make(map[uint64]struct{}),
-	}
+	t = newTaskDesc(taskID)
 	tasks[taskID] = t
 	return t
 }
@@ -446,9 +446,7 @@ func (task *taskDesc) descendants() []*taskDesc {
 	res := []*taskDesc{task}
 	for i := 0; len(res[i:]) > 0; i++ {
 		t := res[i]
-		for _, c := range t.children {
-			res = append(res, c)
-		}
+		res = append(res, t.children...)
 	}
 	return res
 }
@@ -748,8 +746,9 @@ func taskMatches(t *taskDesc, text string) bool {
 }
 
 type regionFilter struct {
-	name string
-	cond []func(regionTypeID, regionDesc) bool
+	name   string
+	params url.Values
+	cond   []func(regionTypeID, regionDesc) bool
 }
 
 func (f *regionFilter) match(id regionTypeID, s regionDesc) bool {
@@ -768,6 +767,7 @@ func newRegionFilter(r *http.Request) (*regionFilter, error) {
 
 	var name []string
 	var conditions []func(regionTypeID, regionDesc) bool
+	filterParams := make(url.Values)
 
 	param := r.Form
 	if typ, ok := param["type"]; ok && len(typ) > 0 {
@@ -775,12 +775,15 @@ func newRegionFilter(r *http.Request) (*regionFilter, error) {
 		conditions = append(conditions, func(id regionTypeID, s regionDesc) bool {
 			return id.Type == typ[0]
 		})
+		filterParams.Add("type", typ[0])
 	}
 	if pc, err := strconv.ParseUint(r.FormValue("pc"), 16, 64); err == nil {
-		name = append(name, fmt.Sprintf("pc=%x", pc))
+		encPC := fmt.Sprintf("%x", pc)
+		name = append(name, "pc="+encPC)
 		conditions = append(conditions, func(id regionTypeID, s regionDesc) bool {
 			return id.Frame.PC == pc
 		})
+		filterParams.Add("pc", encPC)
 	}
 
 	if lat, err := time.ParseDuration(r.FormValue("latmin")); err == nil {
@@ -788,15 +791,21 @@ func newRegionFilter(r *http.Request) (*regionFilter, error) {
 		conditions = append(conditions, func(_ regionTypeID, s regionDesc) bool {
 			return s.duration() >= lat
 		})
+		filterParams.Add("latmin", lat.String())
 	}
 	if lat, err := time.ParseDuration(r.FormValue("latmax")); err == nil {
 		name = append(name, fmt.Sprintf("latency <= %s", lat))
 		conditions = append(conditions, func(_ regionTypeID, s regionDesc) bool {
 			return s.duration() <= lat
 		})
+		filterParams.Add("latmax", lat.String())
 	}
 
-	return &regionFilter{name: strings.Join(name, ","), cond: conditions}, nil
+	return &regionFilter{
+		name:   strings.Join(name, ","),
+		cond:   conditions,
+		params: filterParams,
+	}, nil
 }
 
 type durationHistogram struct {
@@ -861,7 +870,7 @@ func (h *durationHistogram) ToHTML(urlmaker func(min, max time.Duration) string)
 		}
 	}
 
-	w := new(bytes.Buffer)
+	w := new(strings.Builder)
 	fmt.Fprintf(w, `<table>`)
 	for i := h.MinBucket; i <= h.MaxBucket; i++ {
 		// Tick label.
@@ -903,7 +912,7 @@ func (h *durationHistogram) String() string {
 		}
 	}
 
-	w := new(bytes.Buffer)
+	w := new(strings.Builder)
 	for i := h.MinBucket; i <= h.MaxBucket; i++ {
 		count := h.Buckets[i]
 		bar := count * barWidth / maxCount
@@ -946,7 +955,7 @@ var templUserRegionTypes = template.Must(template.New("").Parse(`
 {{range $}}
   <tr>
     <td>{{.Type}}<br>{{.Frame.Fn}}<br>{{.Frame.File}}:{{.Frame.Line}}</td>
-    <td><a href="/userregion?type={{.Type}}&pc={{.Frame.PC}}">{{.Histogram.Count}}</a></td>
+    <td><a href="/userregion?type={{.Type}}&pc={{.Frame.PC | printf "%x"}}">{{.Histogram.Count}}</a></td>
     <td>{{.Histogram.ToHTML (.UserRegionURL)}}</td>
   </tr>
 {{end}}
@@ -1062,7 +1071,10 @@ Search log text: <form onsubmit="window.location.search+='&logtext='+window.logt
                 <td class="when">{{$el.WhenString}}</td>
                 <td class="elapsed">{{$el.Duration}}</td>
 		<td></td>
-                <td><a href="/trace?taskid={{$el.ID}}#{{asMillisecond $el.Start}}:{{asMillisecond $el.End}}">Task {{$el.ID}}</a> ({{if .Complete}}complete{{else}}incomplete{{end}})</td>
+                <td>
+<a href="/trace?focustask={{$el.ID}}#{{asMillisecond $el.Start}}:{{asMillisecond $el.End}}">Task {{$el.ID}}</a>
+<a href="/trace?taskid={{$el.ID}}#{{asMillisecond $el.Start}}:{{asMillisecond $el.End}}">(goroutine view)</a>
+({{if .Complete}}complete{{else}}incomplete{{end}})</td>
         </tr>
         {{range $el.Events}}
         <tr>
@@ -1083,7 +1095,7 @@ Search log text: <form onsubmit="window.location.search+='&logtext='+window.logt
 `))
 
 func elapsed(d time.Duration) string {
-	b := []byte(fmt.Sprintf("%.9f", d.Seconds()))
+	b := fmt.Appendf(nil, "%.9f", d.Seconds())
 
 	// For subsecond durations, blank all zeros before decimal point,
 	// and all zeros between the decimal point and the first non-zero digit.
@@ -1178,13 +1190,26 @@ var templUserRegionType = template.Must(template.New("").Funcs(template.FuncMap{
 		}
 		return 0
 	},
+	"filterParams": func(f *regionFilter) template.URL {
+		return template.URL(f.params.Encode())
+	},
 }).Parse(`
 <!DOCTYPE html>
-<title>Goroutine {{.Name}}</title>
+<title>User Region {{.Name}}</title>
 <style>
 th {
   background-color: #050505;
   color: #fff;
+}
+th.total-time,
+th.exec-time,
+th.io-time,
+th.block-time,
+th.syscall-time,
+th.sched-time,
+th.sweep-time,
+th.pause-time {
+  cursor: pointer;
 }
 table {
   border-collapse: collapse;
@@ -1232,24 +1257,33 @@ function reloadTable(key, value) {
 
 <h2>{{.Name}}</h2>
 
+{{ with $p := filterParams .Filter}}
+<table class="summary">
+	<tr><td>Network Wait Time:</td><td> <a href="/regionio?{{$p}}">graph</a><a href="/regionio?{{$p}}&raw=1" download="io.profile">(download)</a></td></tr>
+	<tr><td>Sync Block Time:</td><td> <a href="/regionblock?{{$p}}">graph</a><a href="/regionblock?{{$p}}&raw=1" download="block.profile">(download)</a></td></tr>
+	<tr><td>Blocking Syscall Time:</td><td> <a href="/regionsyscall?{{$p}}">graph</a><a href="/regionsyscall?{{$p}}&raw=1" download="syscall.profile">(download)</a></td></tr>
+	<tr><td>Scheduler Wait Time:</td><td> <a href="/regionsched?{{$p}}">graph</a><a href="/regionsched?{{$p}}&raw=1" download="sched.profile">(download)</a></td></tr>
+</table>
+{{ end }}
+<p>
 <table class="details">
 <tr>
 <th> Goroutine </th>
 <th> Task </th>
-<th onclick="reloadTable('sortby', 'TotalTime')"> Total</th>
+<th onclick="reloadTable('sortby', 'TotalTime')" class="total-time"> Total</th>
 <th></th>
 <th onclick="reloadTable('sortby', 'ExecTime')" class="exec-time"> Execution</th>
 <th onclick="reloadTable('sortby', 'IOTime')" class="io-time"> Network wait</th>
 <th onclick="reloadTable('sortby', 'BlockTime')" class="block-time"> Sync block </th>
 <th onclick="reloadTable('sortby', 'SyscallTime')" class="syscall-time"> Blocking syscall</th>
 <th onclick="reloadTable('sortby', 'SchedWaitTime')" class="sched-time"> Scheduler wait</th>
-<th onclick="reloadTable('sortby', 'SweepTime')"> GC sweeping</th>
-<th onclick="reloadTable('sortby', 'GCTime')"> GC pause</th>
+<th onclick="reloadTable('sortby', 'SweepTime')" class="sweep-time"> GC sweeping</th>
+<th onclick="reloadTable('sortby', 'GCTime')" class="pause-time"> GC pause</th>
 </tr>
 {{range .Data}}
   <tr>
     <td> <a href="/trace?goid={{.G}}">{{.G}}</a> </td>
-    <td> {{if .TaskID}}<a href="/trace?taskid={{.TaskID}}">{{.TaskID}}</a>{{end}} </td>
+    <td> {{if .TaskID}}<a href="/trace?focustask={{.TaskID}}">{{.TaskID}}</a>{{end}} </td>
     <td> {{prettyDuration .TotalTime}} </td>
     <td>
         <div class="stacked-bar-graph">
@@ -1271,4 +1305,5 @@ function reloadTable(key, value) {
   </tr>
 {{end}}
 </table>
+</p>
 `))

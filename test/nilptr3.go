@@ -214,14 +214,6 @@ func p1() byte {
 	return p[5] // ERROR "removed nil check"
 }
 
-// make sure not to do nil check for access of PAUTOHEAP
-//go:noinline
-func (p *Struct) m() {}
-func c1() {
-	var x Struct
-	func() { x.m() }() // ERROR "removed nil check"
-}
-
 type SS struct {
 	x byte
 }
@@ -248,4 +240,11 @@ func f9() []int {
 	x[0] = 1  // ERROR "removed nil check"
 	y := x[:] // ERROR "removed nil check"
 	return y
+}
+
+// See issue 42673.
+func f10(p **int) int {
+	return * // ERROR "removed nil check"
+	/* */
+	*p // ERROR "removed nil check"
 }

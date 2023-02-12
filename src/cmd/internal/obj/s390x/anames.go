@@ -179,6 +179,7 @@ var Anames = []string{
 	"CMPUBLT",
 	"CMPUBNE",
 	"MVC",
+	"MVCIN",
 	"CLC",
 	"XC",
 	"OC",
@@ -715,5 +716,6 @@ var Anames = []string{
 	"BYTE",
 	"WORD",
 	"DWORD",
+	"BRRK",
 	"LAST",
 }

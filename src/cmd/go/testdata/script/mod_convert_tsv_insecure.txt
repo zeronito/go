@@ -1,7 +1,9 @@
 env GO111MODULE=on
+env GOPROXY=direct
+env GOSUMDB=off
 
 [!net] skip
-[!exec:git] skip
+[!git] skip
 
 # secure fetch should report insecure warning
 cd $WORK/test

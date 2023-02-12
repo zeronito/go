@@ -2,14 +2,14 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// +build plan9
+//go:build plan9
 
 package runtime
 
 import "runtime/internal/atomic"
 
-var netpollInited uint32
-var netpollWaiters uint32
+var netpollInited atomic.Uint32
+var netpollWaiters atomic.Uint32
 
 var netpollStubLock mutex
 var netpollNote note
@@ -19,7 +19,7 @@ var netpollBrokenLock mutex
 var netpollBroken bool
 
 func netpollGenericInit() {
-	atomic.Store(&netpollInited, 1)
+	netpollInited.Store(1)
 }
 
 func netpollBreak() {
@@ -49,10 +49,13 @@ func netpoll(delay int64) gList {
 
 		notetsleep(&netpollNote, delay)
 		unlock(&netpollStubLock)
+		// Guard against starvation in case the lock is contended
+		// (eg when running TestNetpollBreak).
+		osyield()
 	}
 	return gList{}
 }
 
 func netpollinited() bool {
-	return atomic.Load(&netpollInited) != 0
+	return netpollInited.Load() != 0
 }

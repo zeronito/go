@@ -2,13 +2,14 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// +build aix solaris
+//go:build aix || solaris
 
 // This file handles forkAndExecInChild function for OS using libc syscall like AIX or Solaris.
 
 package syscall
 
 import (
+	"runtime"
 	"unsafe"
 )
 
@@ -16,12 +17,23 @@ type SysProcAttr struct {
 	Chroot     string      // Chroot.
 	Credential *Credential // Credential.
 	Setsid     bool        // Create session.
-	Setpgid    bool        // Set process group ID to Pgid, or, if Pgid == 0, to new pid.
-	Setctty    bool        // Set controlling terminal to fd Ctty
-	Noctty     bool        // Detach fd 0 from controlling terminal
-	Ctty       int         // Controlling TTY fd
-	Foreground bool        // Place child's process group in foreground. (Implies Setpgid. Uses Ctty as fd of controlling TTY)
-	Pgid       int         // Child's process group ID if Setpgid.
+	// Setpgid sets the process group ID of the child to Pgid,
+	// or, if Pgid == 0, to the new child's process ID.
+	Setpgid bool
+	// Setctty sets the controlling terminal of the child to
+	// file descriptor Ctty. Ctty must be a descriptor number
+	// in the child process: an index into ProcAttr.Files.
+	// This is only meaningful if Setsid is true.
+	Setctty bool
+	Noctty  bool // Detach fd 0 from controlling terminal
+	Ctty    int  // Controlling TTY fd
+	// Foreground places the child process group in the foreground.
+	// This implies Setpgid. The Ctty field must be set to
+	// the descriptor of the controlling TTY.
+	// Unlike Setctty, in this case Ctty must be a descriptor
+	// number in the parent process.
+	Foreground bool
+	Pgid       int // Child's process group ID if Setpgid.
 }
 
 // Implemented in runtime package.
@@ -31,7 +43,7 @@ func runtime_AfterForkInChild()
 
 func chdir(path uintptr) (err Errno)
 func chroot1(path uintptr) (err Errno)
-func close(fd uintptr) (err Errno)
+func closeFD(fd uintptr) (err Errno)
 func dup2child(old uintptr, new uintptr) (val uintptr, err Errno)
 func execve(path uintptr, argv uintptr, envp uintptr) (err Errno)
 func exit(code uintptr)
@@ -63,15 +75,19 @@ func init() {
 // because we need to avoid lazy-loading the functions (might malloc,
 // split the stack, or acquire mutexes). We can't call RawSyscall
 // because it's not safe even for BSD-subsystem calls.
+//
 //go:norace
 func forkAndExecInChild(argv0 *byte, argv, envv []*byte, chroot, dir *byte, attr *ProcAttr, sys *SysProcAttr, pipe int) (pid int, err Errno) {
 	// Declare all variables at top in case any
 	// declarations require heap allocation (e.g., err1).
 	var (
-		r1     uintptr
-		err1   Errno
-		nextfd int
-		i      int
+		r1              uintptr
+		err1            Errno
+		nextfd          int
+		i               int
+		pgrp            _Pid_t
+		cred            *Credential
+		ngroups, groups uintptr
 	)
 
 	// guard against side effects of shuffling fds below.
@@ -104,8 +120,6 @@ func forkAndExecInChild(argv0 *byte, argv, envv []*byte, chroot, dir *byte, attr
 
 	// Fork succeeded, now in child.
 
-	runtime_AfterForkInChild()
-
 	// Session ID
 	if sys.Setsid {
 		_, err1 = setsid()
@@ -124,7 +138,7 @@ func forkAndExecInChild(argv0 *byte, argv, envv []*byte, chroot, dir *byte, attr
 	}
 
 	if sys.Foreground {
-		pgrp := _Pid_t(sys.Pgid)
+		pgrp = _Pid_t(sys.Pgid)
 		if pgrp == 0 {
 			r1, err1 = getpid()
 			if err1 != 0 {
@@ -141,6 +155,10 @@ func forkAndExecInChild(argv0 *byte, argv, envv []*byte, chroot, dir *byte, attr
 		}
 	}
 
+	// Restore the signal mask. We do this after TIOCSPGRP to avoid
+	// having the kernel send a SIGTTOU signal to the process group.
+	runtime_AfterForkInChild()
+
 	// Chroot
 	if chroot != nil {
 		err1 = chroot1(uintptr(unsafe.Pointer(chroot)))
@@ -150,9 +168,9 @@ func forkAndExecInChild(argv0 *byte, argv, envv []*byte, chroot, dir *byte, attr
 	}
 
 	// User and groups
-	if cred := sys.Credential; cred != nil {
-		ngroups := uintptr(len(cred.Groups))
-		groups := uintptr(0)
+	if cred = sys.Credential; cred != nil {
+		ngroups = uintptr(len(cred.Groups))
+		groups = uintptr(0)
 		if ngroups > 0 {
 			groups = uintptr(unsafe.Pointer(&cred.Groups[0]))
 		}
@@ -183,24 +201,37 @@ func forkAndExecInChild(argv0 *byte, argv, envv []*byte, chroot, dir *byte, attr
 	// Pass 1: look for fd[i] < i and move those up above len(fd)
 	// so that pass 2 won't stomp on an fd it needs later.
 	if pipe < nextfd {
-		_, err1 = dup2child(uintptr(pipe), uintptr(nextfd))
-		if err1 != 0 {
-			goto childerror
-		}
-		fcntl1(uintptr(nextfd), F_SETFD, FD_CLOEXEC)
-		pipe = nextfd
-		nextfd++
-	}
-	for i = 0; i < len(fd); i++ {
-		if fd[i] >= 0 && fd[i] < int(i) {
-			if nextfd == pipe { // don't stomp on pipe
-				nextfd++
-			}
-			_, err1 = dup2child(uintptr(fd[i]), uintptr(nextfd))
+		switch runtime.GOOS {
+		case "illumos", "solaris":
+			_, err1 = fcntl1(uintptr(pipe), _F_DUP2FD_CLOEXEC, uintptr(nextfd))
+		default:
+			_, err1 = dup2child(uintptr(pipe), uintptr(nextfd))
 			if err1 != 0 {
 				goto childerror
 			}
 			_, err1 = fcntl1(uintptr(nextfd), F_SETFD, FD_CLOEXEC)
+		}
+		if err1 != 0 {
+			goto childerror
+		}
+		pipe = nextfd
+		nextfd++
+	}
+	for i = 0; i < len(fd); i++ {
+		if fd[i] >= 0 && fd[i] < i {
+			if nextfd == pipe { // don't stomp on pipe
+				nextfd++
+			}
+			switch runtime.GOOS {
+			case "illumos", "solaris":
+				_, err1 = fcntl1(uintptr(fd[i]), _F_DUP2FD_CLOEXEC, uintptr(nextfd))
+			default:
+				_, err1 = dup2child(uintptr(fd[i]), uintptr(nextfd))
+				if err1 != 0 {
+					goto childerror
+				}
+				_, err1 = fcntl1(uintptr(nextfd), F_SETFD, FD_CLOEXEC)
+			}
 			if err1 != 0 {
 				goto childerror
 			}
@@ -212,10 +243,10 @@ func forkAndExecInChild(argv0 *byte, argv, envv []*byte, chroot, dir *byte, attr
 	// Pass 2: dup fd[i] down onto i.
 	for i = 0; i < len(fd); i++ {
 		if fd[i] == -1 {
-			close(uintptr(i))
+			closeFD(uintptr(i))
 			continue
 		}
-		if fd[i] == int(i) {
+		if fd[i] == i {
 			// dup2(i, i) won't clear close-on-exec flag on Linux,
 			// probably not elsewhere either.
 			_, err1 = fcntl1(uintptr(fd[i]), F_SETFD, 0)
@@ -237,7 +268,7 @@ func forkAndExecInChild(argv0 *byte, argv, envv []*byte, chroot, dir *byte, attr
 	// Programs that know they inherit fds >= 3 will need
 	// to set them close-on-exec.
 	for i = len(fd); i < 3; i++ {
-		close(uintptr(i))
+		closeFD(uintptr(i))
 	}
 
 	// Detach fd 0 from tty

@@ -5,8 +5,12 @@
 package http
 
 import (
+	"errors"
+	"fmt"
 	"log"
 	"net"
+	"net/http/internal/ascii"
+	"net/textproto"
 	"strconv"
 	"strings"
 	"time"
@@ -60,20 +64,20 @@ func readSetCookies(h Header) []*Cookie {
 	}
 	cookies := make([]*Cookie, 0, cookieCount)
 	for _, line := range h["Set-Cookie"] {
-		parts := strings.Split(strings.TrimSpace(line), ";")
+		parts := strings.Split(textproto.TrimString(line), ";")
 		if len(parts) == 1 && parts[0] == "" {
 			continue
 		}
-		parts[0] = strings.TrimSpace(parts[0])
-		j := strings.Index(parts[0], "=")
-		if j < 0 {
+		parts[0] = textproto.TrimString(parts[0])
+		name, value, ok := strings.Cut(parts[0], "=")
+		if !ok {
 			continue
 		}
-		name, value := parts[0][:j], parts[0][j+1:]
+		name = textproto.TrimString(name)
 		if !isCookieNameValid(name) {
 			continue
 		}
-		value, ok := parseCookieValue(value, true)
+		value, ok = parseCookieValue(value, true)
 		if !ok {
 			continue
 		}
@@ -83,24 +87,29 @@ func readSetCookies(h Header) []*Cookie {
 			Raw:   line,
 		}
 		for i := 1; i < len(parts); i++ {
-			parts[i] = strings.TrimSpace(parts[i])
+			parts[i] = textproto.TrimString(parts[i])
 			if len(parts[i]) == 0 {
 				continue
 			}
 
-			attr, val := parts[i], ""
-			if j := strings.Index(attr, "="); j >= 0 {
-				attr, val = attr[:j], attr[j+1:]
+			attr, val, _ := strings.Cut(parts[i], "=")
+			lowerAttr, isASCII := ascii.ToLower(attr)
+			if !isASCII {
+				continue
 			}
-			lowerAttr := strings.ToLower(attr)
 			val, ok = parseCookieValue(val, false)
 			if !ok {
 				c.Unparsed = append(c.Unparsed, parts[i])
 				continue
 			}
+
 			switch lowerAttr {
 			case "samesite":
-				lowerVal := strings.ToLower(val)
+				lowerVal, ascii := ascii.ToLower(val)
+				if !ascii {
+					c.SameSite = SameSiteDefaultMode
+					continue
+				}
 				switch lowerVal {
 				case "lax":
 					c.SameSite = SameSiteLaxMode
@@ -219,7 +228,7 @@ func (c *Cookie) String() string {
 	}
 	switch c.SameSite {
 	case SameSiteDefaultMode:
-		b.WriteString("; SameSite")
+		// Skip, default mode is obtained by not emitting the attribute.
 	case SameSiteNoneMode:
 		b.WriteString("; SameSite=None")
 	case SameSiteLaxMode:
@@ -230,10 +239,41 @@ func (c *Cookie) String() string {
 	return b.String()
 }
 
+// Valid reports whether the cookie is valid.
+func (c *Cookie) Valid() error {
+	if c == nil {
+		return errors.New("http: nil Cookie")
+	}
+	if !isCookieNameValid(c.Name) {
+		return errors.New("http: invalid Cookie.Name")
+	}
+	if !c.Expires.IsZero() && !validCookieExpires(c.Expires) {
+		return errors.New("http: invalid Cookie.Expires")
+	}
+	for i := 0; i < len(c.Value); i++ {
+		if !validCookieValueByte(c.Value[i]) {
+			return fmt.Errorf("http: invalid byte %q in Cookie.Value", c.Value[i])
+		}
+	}
+	if len(c.Path) > 0 {
+		for i := 0; i < len(c.Path); i++ {
+			if !validCookiePathByte(c.Path[i]) {
+				return fmt.Errorf("http: invalid byte %q in Cookie.Path", c.Path[i])
+			}
+		}
+	}
+	if len(c.Domain) > 0 {
+		if !validCookieDomain(c.Domain) {
+			return errors.New("http: invalid Cookie.Domain")
+		}
+	}
+	return nil
+}
+
 // readCookies parses all "Cookie" values from the header h and
 // returns the successfully parsed Cookies.
 //
-// if filter isn't empty, only cookies of that name are returned
+// if filter isn't empty, only cookies of that name are returned.
 func readCookies(h Header, filter string) []*Cookie {
 	lines := h["Cookie"]
 	if len(lines) == 0 {
@@ -242,23 +282,17 @@ func readCookies(h Header, filter string) []*Cookie {
 
 	cookies := make([]*Cookie, 0, len(lines)+strings.Count(lines[0], ";"))
 	for _, line := range lines {
-		line = strings.TrimSpace(line)
+		line = textproto.TrimString(line)
 
 		var part string
 		for len(line) > 0 { // continue since we have rest
-			if splitIndex := strings.Index(line, ";"); splitIndex > 0 {
-				part, line = line[:splitIndex], line[splitIndex+1:]
-			} else {
-				part, line = line, ""
-			}
-			part = strings.TrimSpace(part)
-			if len(part) == 0 {
+			part, line, _ = strings.Cut(line, ";")
+			part = textproto.TrimString(part)
+			if part == "" {
 				continue
 			}
-			name, val := part, ""
-			if j := strings.Index(part, "="); j >= 0 {
-				name, val = name[:j], name[j+1:]
-			}
+			name, val, _ := strings.Cut(part, "=")
+			name = textproto.TrimString(name)
 			if !isCookieNameValid(name) {
 				continue
 			}
@@ -355,11 +389,13 @@ func sanitizeCookieName(n string) string {
 
 // sanitizeCookieValue produces a suitable cookie-value from v.
 // https://tools.ietf.org/html/rfc6265#section-4.1.1
-// cookie-value      = *cookie-octet / ( DQUOTE *cookie-octet DQUOTE )
-// cookie-octet      = %x21 / %x23-2B / %x2D-3A / %x3C-5B / %x5D-7E
-//           ; US-ASCII characters excluding CTLs,
-//           ; whitespace DQUOTE, comma, semicolon,
-//           ; and backslash
+//
+//	cookie-value      = *cookie-octet / ( DQUOTE *cookie-octet DQUOTE )
+//	cookie-octet      = %x21 / %x23-2B / %x2D-3A / %x3C-5B / %x5D-7E
+//	          ; US-ASCII characters excluding CTLs,
+//	          ; whitespace DQUOTE, comma, semicolon,
+//	          ; and backslash
+//
 // We loosen this as spaces and commas are common in cookie values
 // but we produce a quoted cookie-value if and only if v contains
 // commas or spaces.
@@ -369,7 +405,7 @@ func sanitizeCookieValue(v string) string {
 	if len(v) == 0 {
 		return v
 	}
-	if strings.IndexByte(v, ' ') >= 0 || strings.IndexByte(v, ',') >= 0 {
+	if strings.ContainsAny(v, " ,") {
 		return `"` + v + `"`
 	}
 	return v

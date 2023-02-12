@@ -2,17 +2,17 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-package rsa
+package rsa_test
 
 import (
 	"bufio"
 	"bytes"
 	"compress/bzip2"
 	"crypto"
-	_ "crypto/md5"
 	"crypto/rand"
+	. "crypto/rsa"
 	"crypto/sha1"
-	_ "crypto/sha256"
+	"crypto/sha256"
 	"encoding/hex"
 	"math/big"
 	"os"
@@ -61,7 +61,7 @@ func TestEMSAPSS(t *testing.T) {
 	hash.Write(msg)
 	hashed := hash.Sum(nil)
 
-	encoded, err := emsaPSSEncode(hashed, 1023, salt, sha1.New())
+	encoded, err := EMSAPSSEncode(hashed, 1023, salt, sha1.New())
 	if err != nil {
 		t.Errorf("Error from emsaPSSEncode: %s\n", err)
 	}
@@ -69,7 +69,7 @@ func TestEMSAPSS(t *testing.T) {
 		t.Errorf("Bad encoding. got %x, want %x", encoded, expected)
 	}
 
-	if err = emsaPSSVerify(hashed, encoded, 1023, len(salt), sha1.New()); err != nil {
+	if err = EMSAPSSVerify(hashed, encoded, 1023, len(salt), sha1.New()); err != nil {
 		t.Errorf("Bad verification: %s", err)
 	}
 }
@@ -209,9 +209,12 @@ func TestPSSSigning(t *testing.T) {
 		{PSSSaltLengthEqualsHash, 8, false},
 		{PSSSaltLengthAuto, PSSSaltLengthEqualsHash, false},
 		{8, 8, true},
+		{PSSSaltLengthAuto, 42, true},
+		{PSSSaltLengthAuto, 20, false},
+		{PSSSaltLengthAuto, -2, false},
 	}
 
-	hash := crypto.MD5
+	hash := crypto.SHA1
 	h := hash.New()
 	h.Write([]byte("testing"))
 	hashed := h.Sum(nil)
@@ -230,6 +233,28 @@ func TestPSSSigning(t *testing.T) {
 		if (err == nil) != test.good {
 			t.Errorf("#%d: bad result, wanted: %t, got: %s", i, test.good, err)
 		}
+	}
+}
+
+func TestPSS513(t *testing.T) {
+	// See Issue 42741, and separately, RFC 8017: "Note that the octet length of
+	// EM will be one less than k if modBits - 1 is divisible by 8 and equal to
+	// k otherwise, where k is the length in octets of the RSA modulus n."
+	key, err := GenerateKey(rand.Reader, 513)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256([]byte("message"))
+	signature, err := key.Sign(rand.Reader, digest[:], &PSSOptions{
+		SaltLength: PSSSaltLengthAuto,
+		Hash:       crypto.SHA256,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = VerifyPSS(&key.PublicKey, crypto.SHA256, digest[:], signature, nil)
+	if err != nil {
+		t.Error(err)
 	}
 }
 
@@ -255,4 +280,29 @@ func fromHex(hexStr string) []byte {
 		panic(err)
 	}
 	return s
+}
+
+func TestInvalidPSSSaltLength(t *testing.T) {
+	key, err := GenerateKey(rand.Reader, 245)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	digest := sha256.Sum256([]byte("message"))
+	// We don't check the exact error matches, because crypto/rsa and crypto/internal/boring
+	// return two different error variables, which have the same content but are not equal.
+	if _, err := SignPSS(rand.Reader, key, crypto.SHA256, digest[:], &PSSOptions{
+		SaltLength: -2,
+		Hash:       crypto.SHA256,
+	}); err.Error() != InvalidSaltLenErr.Error() {
+		t.Fatalf("SignPSS unexpected error: got %v, want %v", err, InvalidSaltLenErr)
+	}
+
+	// We don't check the specific error here, because crypto/rsa and crypto/internal/boring
+	// return different errors, so we just check that _an error_ was returned.
+	if err := VerifyPSS(&key.PublicKey, crypto.SHA256, []byte{1, 2, 3}, make([]byte, 31), &PSSOptions{
+		SaltLength: -2,
+	}); err == nil {
+		t.Fatal("VerifyPSS unexpected success")
+	}
 }

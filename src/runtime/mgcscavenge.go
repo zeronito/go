@@ -17,16 +17,19 @@
 // scavenger's primary goal is to bring the estimated heap RSS of the
 // application down to a goal.
 //
-// That goal is defined as:
-//   (retainExtraPercent+100) / 100 * (next_gc / last_next_gc) * last_heap_inuse
+// Before we consider what this looks like, we need to split the world into two
+// halves. One in which a memory limit is not set, and one in which it is.
+//
+// For the former, the goal is defined as:
+//   (retainExtraPercent+100) / 100 * (heapGoal / lastHeapGoal) * lastHeapInUse
 //
 // Essentially, we wish to have the application's RSS track the heap goal, but
 // the heap goal is defined in terms of bytes of objects, rather than pages like
 // RSS. As a result, we need to take into account for fragmentation internal to
-// spans. next_gc / last_next_gc defines the ratio between the current heap goal
+// spans. heapGoal / lastHeapGoal defines the ratio between the current heap goal
 // and the last heap goal, which tells us by how much the heap is growing and
 // shrinking. We estimate what the heap will grow to in terms of pages by taking
-// this ratio and multiplying it by heap_inuse at the end of the last GC, which
+// this ratio and multiplying it by heapInUse at the end of the last GC, which
 // allows us to account for this additional fragmentation. Note that this
 // procedure makes the assumption that the degree of fragmentation won't change
 // dramatically over the next GC cycle. Overestimating the amount of
@@ -41,11 +44,22 @@
 // that there's more unscavenged memory to allocate out of, since each allocation
 // out of scavenged memory incurs a potentially expensive page fault.
 //
-// The goal is updated after each GC and the scavenger's pacing parameters
-// (which live in mheap_) are updated to match. The pacing parameters work much
-// like the background sweeping parameters. The parameters define a line whose
-// horizontal axis is time and vertical axis is estimated heap RSS, and the
-// scavenger attempts to stay below that line at all times.
+// If a memory limit is set, then we wish to pick a scavenge goal that maintains
+// that memory limit. For that, we look at total memory that has been committed
+// (memstats.mappedReady) and try to bring that down below the limit. In this case,
+// we want to give buffer space in the *opposite* direction. When the application
+// is close to the limit, we want to make sure we push harder to keep it under, so
+// if we target below the memory limit, we ensure that the background scavenger is
+// giving the situation the urgency it deserves.
+//
+// In this case, the goal is defined as:
+//    (100-reduceExtraPercent) / 100 * memoryLimit
+//
+// We compute both of these goals, and check whether either of them have been met.
+// The background scavenger continues operating as long as either one of the goals
+// has not been met.
+//
+// The goals are updated after each GC.
 //
 // The synchronous heap-growth scavenging happens whenever the heap grows in
 // size, for some definition of heap-growth. The intuition behind this is that
@@ -56,6 +70,7 @@
 package runtime
 
 import (
+	"internal/goos"
 	"runtime/internal/atomic"
 	"runtime/internal/sys"
 	"unsafe"
@@ -70,12 +85,24 @@ const (
 
 	// retainExtraPercent represents the amount of memory over the heap goal
 	// that the scavenger should keep as a buffer space for the allocator.
+	// This constant is used when we do not have a memory limit set.
 	//
 	// The purpose of maintaining this overhead is to have a greater pool of
 	// unscavenged memory available for allocation (since using scavenged memory
 	// incurs an additional cost), to account for heap fragmentation and
 	// the ever-changing layout of the heap.
 	retainExtraPercent = 10
+
+	// reduceExtraPercent represents the amount of memory under the limit
+	// that the scavenger should target. For example, 5 means we target 95%
+	// of the limit.
+	//
+	// The purpose of shooting lower than the limit is to ensure that, once
+	// close to the limit, the scavenger is working hard to maintain it. If
+	// we have a memory limit set but are far away from it, there's no harm
+	// in leaving up to 100-retainExtraPercent live, and it's more efficient
+	// anyway, for the same reasons that retainExtraPercent exists.
+	reduceExtraPercent = 5
 
 	// maxPagesPerPhysPage is the maximum number of supported runtime pages per
 	// physical page, based on maxPhysPageSize.
@@ -90,16 +117,17 @@ const (
 	//
 	// This ratio is used as part of multiplicative factor to help the scavenger account
 	// for the additional costs of using scavenged memory in its pacing.
-	scavengeCostRatio = 0.7 * sys.GoosDarwin
+	scavengeCostRatio = 0.7 * (goos.IsDarwin + goos.IsIos)
 )
 
 // heapRetained returns an estimate of the current heap RSS.
 func heapRetained() uint64 {
-	return atomic.Load64(&memstats.heap_sys) - atomic.Load64(&memstats.heap_released)
+	return gcController.heapInUse.load() + gcController.heapFree.load()
 }
 
 // gcPaceScavenger updates the scavenger's pacing, particularly
-// its rate and RSS goal.
+// its rate and RSS goal. For this, it requires the current heapGoal,
+// and the heapGoal for the previous GC cycle.
 //
 // The RSS goal is based on the current heap goal with a small overhead
 // to accommodate non-determinism in the allocator.
@@ -107,114 +135,484 @@ func heapRetained() uint64 {
 // The pacing is based on scavengePageRate, which applies to both regular and
 // huge pages. See that constant for more information.
 //
+// Must be called whenever GC pacing is updated.
+//
 // mheap_.lock must be held or the world must be stopped.
-func gcPaceScavenger() {
+func gcPaceScavenger(memoryLimit int64, heapGoal, lastHeapGoal uint64) {
+	assertWorldStoppedOrLockHeld(&mheap_.lock)
+
+	// As described at the top of this file, there are two scavenge goals here: one
+	// for gcPercent and one for memoryLimit. Let's handle the latter first because
+	// it's simpler.
+
+	// We want to target retaining (100-reduceExtraPercent)% of the heap.
+	memoryLimitGoal := uint64(float64(memoryLimit) * (100.0 - reduceExtraPercent))
+
+	// mappedReady is comparable to memoryLimit, and represents how much total memory
+	// the Go runtime has committed now (estimated).
+	mappedReady := gcController.mappedReady.Load()
+
+	// If we're below the goal already indicate that we don't need the background
+	// scavenger for the memory limit. This may seems worrisome at first, but note
+	// that the allocator will assist the background scavenger in the face of a memory
+	// limit, so we'll be safe even if we stop the scavenger when we shouldn't have.
+	if mappedReady <= memoryLimitGoal {
+		scavenge.memoryLimitGoal.Store(^uint64(0))
+	} else {
+		scavenge.memoryLimitGoal.Store(memoryLimitGoal)
+	}
+
+	// Now handle the gcPercent goal.
+
 	// If we're called before the first GC completed, disable scavenging.
 	// We never scavenge before the 2nd GC cycle anyway (we don't have enough
 	// information about the heap yet) so this is fine, and avoids a fault
 	// or garbage data later.
-	if memstats.last_next_gc == 0 {
-		mheap_.scavengeGoal = ^uint64(0)
+	if lastHeapGoal == 0 {
+		scavenge.gcPercentGoal.Store(^uint64(0))
 		return
 	}
 	// Compute our scavenging goal.
-	goalRatio := float64(memstats.next_gc) / float64(memstats.last_next_gc)
-	retainedGoal := uint64(float64(memstats.last_heap_inuse) * goalRatio)
+	goalRatio := float64(heapGoal) / float64(lastHeapGoal)
+	gcPercentGoal := uint64(float64(memstats.lastHeapInUse) * goalRatio)
 	// Add retainExtraPercent overhead to retainedGoal. This calculation
 	// looks strange but the purpose is to arrive at an integer division
 	// (e.g. if retainExtraPercent = 12.5, then we get a divisor of 8)
 	// that also avoids the overflow from a multiplication.
-	retainedGoal += retainedGoal / (1.0 / (retainExtraPercent / 100.0))
+	gcPercentGoal += gcPercentGoal / (1.0 / (retainExtraPercent / 100.0))
 	// Align it to a physical page boundary to make the following calculations
 	// a bit more exact.
-	retainedGoal = (retainedGoal + uint64(physPageSize) - 1) &^ (uint64(physPageSize) - 1)
+	gcPercentGoal = (gcPercentGoal + uint64(physPageSize) - 1) &^ (uint64(physPageSize) - 1)
 
 	// Represents where we are now in the heap's contribution to RSS in bytes.
 	//
 	// Guaranteed to always be a multiple of physPageSize on systems where
-	// physPageSize <= pageSize since we map heap_sys at a rate larger than
+	// physPageSize <= pageSize since we map new heap memory at a size larger than
 	// any physPageSize and released memory in multiples of the physPageSize.
 	//
-	// However, certain functions recategorize heap_sys as other stats (e.g.
-	// stack_sys) and this happens in multiples of pageSize, so on systems
+	// However, certain functions recategorize heap memory as other stats (e.g.
+	// stacks) and this happens in multiples of pageSize, so on systems
 	// where physPageSize > pageSize the calculations below will not be exact.
 	// Generally this is OK since we'll be off by at most one regular
 	// physical page.
-	retainedNow := heapRetained()
+	heapRetainedNow := heapRetained()
 
-	// If we're already below our goal, or within one page of our goal, then disable
-	// the background scavenger. We disable the background scavenger if there's
-	// less than one physical page of work to do because it's not worth it.
-	if retainedNow <= retainedGoal || retainedNow-retainedGoal < uint64(physPageSize) {
-		mheap_.scavengeGoal = ^uint64(0)
-		return
+	// If we're already below our goal, or within one page of our goal, then indicate
+	// that we don't need the background scavenger for maintaining a memory overhead
+	// proportional to the heap goal.
+	if heapRetainedNow <= gcPercentGoal || heapRetainedNow-gcPercentGoal < uint64(physPageSize) {
+		scavenge.gcPercentGoal.Store(^uint64(0))
+	} else {
+		scavenge.gcPercentGoal.Store(gcPercentGoal)
 	}
-	mheap_.scavengeGoal = retainedGoal
-	mheap_.pages.resetScavengeAddr()
 }
+
+var scavenge struct {
+	// gcPercentGoal is the amount of retained heap memory (measured by
+	// heapRetained) that the runtime will try to maintain by returning
+	// memory to the OS. This goal is derived from gcController.gcPercent
+	// by choosing to retain enough memory to allocate heap memory up to
+	// the heap goal.
+	gcPercentGoal atomic.Uint64
+
+	// memoryLimitGoal is the amount of memory retained by the runtime (
+	// measured by gcController.mappedReady) that the runtime will try to
+	// maintain by returning memory to the OS. This goal is derived from
+	// gcController.memoryLimit by choosing to target the memory limit or
+	// some lower target to keep the scavenger working.
+	memoryLimitGoal atomic.Uint64
+
+	// assistTime is the time spent by the allocator scavenging in the last GC cycle.
+	//
+	// This is reset once a GC cycle ends.
+	assistTime atomic.Int64
+
+	// backgroundTime is the time spent by the background scavenger in the last GC cycle.
+	//
+	// This is reset once a GC cycle ends.
+	backgroundTime atomic.Int64
+}
+
+const (
+	// It doesn't really matter what value we start at, but we can't be zero, because
+	// that'll cause divide-by-zero issues. Pick something conservative which we'll
+	// also use as a fallback.
+	startingScavSleepRatio = 0.001
+
+	// Spend at least 1 ms scavenging, otherwise the corresponding
+	// sleep time to maintain our desired utilization is too low to
+	// be reliable.
+	minScavWorkTime = 1e6
+)
 
 // Sleep/wait state of the background scavenger.
-var scavenge struct {
-	lock   mutex
-	g      *g
+var scavenger scavengerState
+
+type scavengerState struct {
+	// lock protects all fields below.
+	lock mutex
+
+	// g is the goroutine the scavenger is bound to.
+	g *g
+
+	// parked is whether or not the scavenger is parked.
 	parked bool
-	timer  *timer
+
+	// timer is the timer used for the scavenger to sleep.
+	timer *timer
+
+	// sysmonWake signals to sysmon that it should wake the scavenger.
+	sysmonWake atomic.Uint32
+
+	// targetCPUFraction is the target CPU overhead for the scavenger.
+	targetCPUFraction float64
+
+	// sleepRatio is the ratio of time spent doing scavenging work to
+	// time spent sleeping. This is used to decide how long the scavenger
+	// should sleep for in between batches of work. It is set by
+	// critSleepController in order to maintain a CPU overhead of
+	// targetCPUFraction.
+	//
+	// Lower means more sleep, higher means more aggressive scavenging.
+	sleepRatio float64
+
+	// sleepController controls sleepRatio.
+	//
+	// See sleepRatio for more details.
+	sleepController piController
+
+	// cooldown is the time left in nanoseconds during which we avoid
+	// using the controller and we hold sleepRatio at a conservative
+	// value. Used if the controller's assumptions fail to hold.
+	controllerCooldown int64
+
+	// printControllerReset instructs printScavTrace to signal that
+	// the controller was reset.
+	printControllerReset bool
+
+	// sleepStub is a stub used for testing to avoid actually having
+	// the scavenger sleep.
+	//
+	// Unlike the other stubs, this is not populated if left nil
+	// Instead, it is called when non-nil because any valid implementation
+	// of this function basically requires closing over this scavenger
+	// state, and allocating a closure is not allowed in the runtime as
+	// a matter of policy.
+	sleepStub func(n int64) int64
+
+	// scavenge is a function that scavenges n bytes of memory.
+	// Returns how many bytes of memory it actually scavenged, as
+	// well as the time it took in nanoseconds. Usually mheap.pages.scavenge
+	// with nanotime called around it, but stubbed out for testing.
+	// Like mheap.pages.scavenge, if it scavenges less than n bytes of
+	// memory, the caller may assume the heap is exhausted of scavengable
+	// memory for now.
+	//
+	// If this is nil, it is populated with the real thing in init.
+	scavenge func(n uintptr) (uintptr, int64)
+
+	// shouldStop is a callback called in the work loop and provides a
+	// point that can force the scavenger to stop early, for example because
+	// the scavenge policy dictates too much has been scavenged already.
+	//
+	// If this is nil, it is populated with the real thing in init.
+	shouldStop func() bool
+
+	// gomaxprocs returns the current value of gomaxprocs. Stub for testing.
+	//
+	// If this is nil, it is populated with the real thing in init.
+	gomaxprocs func() int32
 }
 
-// wakeScavenger unparks the scavenger if necessary. It must be called
-// after any pacing update.
+// init initializes a scavenger state and wires to the current G.
 //
-// mheap_.lock and scavenge.lock must not be held.
-func wakeScavenger() {
-	lock(&scavenge.lock)
-	if scavenge.parked {
-		// Try to stop the timer but we don't really care if we succeed.
-		// It's possible that either a timer was never started, or that
-		// we're racing with it.
-		// In the case that we're racing with there's the low chance that
-		// we experience a spurious wake-up of the scavenger, but that's
-		// totally safe.
-		stopTimer(scavenge.timer)
-
-		// Unpark the goroutine and tell it that there may have been a pacing
-		// change. Note that we skip the scheduler's runnext slot because we
-		// want to avoid having the scavenger interfere with the fair
-		// scheduling of user goroutines. In effect, this schedules the
-		// scavenger at a "lower priority" but that's OK because it'll
-		// catch up on the work it missed when it does get scheduled.
-		scavenge.parked = false
-		systemstack(func() {
-			ready(scavenge.g, 0, false)
-		})
+// Must be called from a regular goroutine that can allocate.
+func (s *scavengerState) init() {
+	if s.g != nil {
+		throw("scavenger state is already wired")
 	}
-	unlock(&scavenge.lock)
+	lockInit(&s.lock, lockRankScavenge)
+	s.g = getg()
+
+	s.timer = new(timer)
+	s.timer.arg = s
+	s.timer.f = func(s any, _ uintptr) {
+		s.(*scavengerState).wake()
+	}
+
+	// input: fraction of CPU time actually used.
+	// setpoint: ideal CPU fraction.
+	// output: ratio of time worked to time slept (determines sleep time).
+	//
+	// The output of this controller is somewhat indirect to what we actually
+	// want to achieve: how much time to sleep for. The reason for this definition
+	// is to ensure that the controller's outputs have a direct relationship with
+	// its inputs (as opposed to an inverse relationship), making it somewhat
+	// easier to reason about for tuning purposes.
+	s.sleepController = piController{
+		// Tuned loosely via Ziegler-Nichols process.
+		kp: 0.3375,
+		ti: 3.2e6,
+		tt: 1e9, // 1 second reset time.
+
+		// These ranges seem wide, but we want to give the controller plenty of
+		// room to hunt for the optimal value.
+		min: 0.001,  // 1:1000
+		max: 1000.0, // 1000:1
+	}
+	s.sleepRatio = startingScavSleepRatio
+
+	// Install real functions if stubs aren't present.
+	if s.scavenge == nil {
+		s.scavenge = func(n uintptr) (uintptr, int64) {
+			start := nanotime()
+			r := mheap_.pages.scavenge(n, nil)
+			end := nanotime()
+			if start >= end {
+				return r, 0
+			}
+			scavenge.backgroundTime.Add(end - start)
+			return r, end - start
+		}
+	}
+	if s.shouldStop == nil {
+		s.shouldStop = func() bool {
+			// If background scavenging is disabled or if there's no work to do just stop.
+			return heapRetained() <= scavenge.gcPercentGoal.Load() &&
+				gcController.mappedReady.Load() <= scavenge.memoryLimitGoal.Load()
+		}
+	}
+	if s.gomaxprocs == nil {
+		s.gomaxprocs = func() int32 {
+			return gomaxprocs
+		}
+	}
 }
 
-// scavengeSleep attempts to put the scavenger to sleep for ns.
+// park parks the scavenger goroutine.
+func (s *scavengerState) park() {
+	lock(&s.lock)
+	if getg() != s.g {
+		throw("tried to park scavenger from another goroutine")
+	}
+	s.parked = true
+	goparkunlock(&s.lock, waitReasonGCScavengeWait, traceEvGoBlock, 2)
+}
+
+// ready signals to sysmon that the scavenger should be awoken.
+func (s *scavengerState) ready() {
+	s.sysmonWake.Store(1)
+}
+
+// wake immediately unparks the scavenger if necessary.
+//
+// Safe to run without a P.
+func (s *scavengerState) wake() {
+	lock(&s.lock)
+	if s.parked {
+		// Unset sysmonWake, since the scavenger is now being awoken.
+		s.sysmonWake.Store(0)
+
+		// s.parked is unset to prevent a double wake-up.
+		s.parked = false
+
+		// Ready the goroutine by injecting it. We use injectglist instead
+		// of ready or goready in order to allow us to run this function
+		// without a P. injectglist also avoids placing the goroutine in
+		// the current P's runnext slot, which is desirable to prevent
+		// the scavenger from interfering with user goroutine scheduling
+		// too much.
+		var list gList
+		list.push(s.g)
+		injectglist(&list)
+	}
+	unlock(&s.lock)
+}
+
+// sleep puts the scavenger to sleep based on the amount of time that it worked
+// in nanoseconds.
 //
 // Note that this function should only be called by the scavenger.
 //
 // The scavenger may be woken up earlier by a pacing change, and it may not go
 // to sleep at all if there's a pending pacing change.
-//
-// Returns the amount of time actually slept.
-func scavengeSleep(ns int64) int64 {
-	lock(&scavenge.lock)
+func (s *scavengerState) sleep(worked float64) {
+	lock(&s.lock)
+	if getg() != s.g {
+		throw("tried to sleep scavenger from another goroutine")
+	}
 
-	// Set the timer.
+	if worked < minScavWorkTime {
+		// This means there wasn't enough work to actually fill up minScavWorkTime.
+		// That's fine; we shouldn't try to do anything with this information
+		// because it's going result in a short enough sleep request that things
+		// will get messy. Just assume we did at least this much work.
+		// All this means is that we'll sleep longer than we otherwise would have.
+		worked = minScavWorkTime
+	}
+
+	// Multiply the critical time by 1 + the ratio of the costs of using
+	// scavenged memory vs. scavenging memory. This forces us to pay down
+	// the cost of reusing this memory eagerly by sleeping for a longer period
+	// of time and scavenging less frequently. More concretely, we avoid situations
+	// where we end up scavenging so often that we hurt allocation performance
+	// because of the additional overheads of using scavenged memory.
+	worked *= 1 + scavengeCostRatio
+
+	// sleepTime is the amount of time we're going to sleep, based on the amount
+	// of time we worked, and the sleepRatio.
+	sleepTime := int64(worked / s.sleepRatio)
+
+	var slept int64
+	if s.sleepStub == nil {
+		// Set the timer.
+		//
+		// This must happen here instead of inside gopark
+		// because we can't close over any variables without
+		// failing escape analysis.
+		start := nanotime()
+		resetTimer(s.timer, start+sleepTime)
+
+		// Mark ourselves as asleep and go to sleep.
+		s.parked = true
+		goparkunlock(&s.lock, waitReasonSleep, traceEvGoSleep, 2)
+
+		// How long we actually slept for.
+		slept = nanotime() - start
+
+		lock(&s.lock)
+		// Stop the timer here because s.wake is unable to do it for us.
+		// We don't really care if we succeed in stopping the timer. One
+		// reason we might fail is that we've already woken up, but the timer
+		// might be in the process of firing on some other P; essentially we're
+		// racing with it. That's totally OK. Double wake-ups are perfectly safe.
+		stopTimer(s.timer)
+		unlock(&s.lock)
+	} else {
+		unlock(&s.lock)
+		slept = s.sleepStub(sleepTime)
+	}
+
+	// Stop here if we're cooling down from the controller.
+	if s.controllerCooldown > 0 {
+		// worked and slept aren't exact measures of time, but it's OK to be a bit
+		// sloppy here. We're just hoping we're avoiding some transient bad behavior.
+		t := slept + int64(worked)
+		if t > s.controllerCooldown {
+			s.controllerCooldown = 0
+		} else {
+			s.controllerCooldown -= t
+		}
+		return
+	}
+
+	// idealFraction is the ideal % of overall application CPU time that we
+	// spend scavenging.
+	idealFraction := float64(scavengePercent) / 100.0
+
+	// Calculate the CPU time spent.
 	//
-	// This must happen here instead of inside gopark
-	// because we can't close over any variables without
-	// failing escape analysis.
-	start := nanotime()
-	resetTimer(scavenge.timer, start+ns)
+	// This may be slightly inaccurate with respect to GOMAXPROCS, but we're
+	// recomputing this often enough relative to GOMAXPROCS changes in general
+	// (it only changes when the world is stopped, and not during a GC) that
+	// that small inaccuracy is in the noise.
+	cpuFraction := worked / ((float64(slept) + worked) * float64(s.gomaxprocs()))
 
-	// Mark ourself as asleep and go to sleep.
-	scavenge.parked = true
-	goparkunlock(&scavenge.lock, waitReasonSleep, traceEvGoSleep, 2)
+	// Update the critSleepRatio, adjusting until we reach our ideal fraction.
+	var ok bool
+	s.sleepRatio, ok = s.sleepController.next(cpuFraction, idealFraction, float64(slept)+worked)
+	if !ok {
+		// The core assumption of the controller, that we can get a proportional
+		// response, broke down. This may be transient, so temporarily switch to
+		// sleeping a fixed, conservative amount.
+		s.sleepRatio = startingScavSleepRatio
+		s.controllerCooldown = 5e9 // 5 seconds.
 
-	// Return how long we actually slept for.
-	return nanotime() - start
+		// Signal the scav trace printer to output this.
+		s.controllerFailed()
+	}
+}
+
+// controllerFailed indicates that the scavenger's scheduling
+// controller failed.
+func (s *scavengerState) controllerFailed() {
+	lock(&s.lock)
+	s.printControllerReset = true
+	unlock(&s.lock)
+}
+
+// run is the body of the main scavenging loop.
+//
+// Returns the number of bytes released and the estimated time spent
+// releasing those bytes.
+//
+// Must be run on the scavenger goroutine.
+func (s *scavengerState) run() (released uintptr, worked float64) {
+	lock(&s.lock)
+	if getg() != s.g {
+		throw("tried to run scavenger from another goroutine")
+	}
+	unlock(&s.lock)
+
+	for worked < minScavWorkTime {
+		// If something from outside tells us to stop early, stop.
+		if s.shouldStop() {
+			break
+		}
+
+		// scavengeQuantum is the amount of memory we try to scavenge
+		// in one go. A smaller value means the scavenger is more responsive
+		// to the scheduler in case of e.g. preemption. A larger value means
+		// that the overheads of scavenging are better amortized, so better
+		// scavenging throughput.
+		//
+		// The current value is chosen assuming a cost of ~10µs/physical page
+		// (this is somewhat pessimistic), which implies a worst-case latency of
+		// about 160µs for 4 KiB physical pages. The current value is biased
+		// toward latency over throughput.
+		const scavengeQuantum = 64 << 10
+
+		// Accumulate the amount of time spent scavenging.
+		r, duration := s.scavenge(scavengeQuantum)
+
+		// On some platforms we may see end >= start if the time it takes to scavenge
+		// memory is less than the minimum granularity of its clock (e.g. Windows) or
+		// due to clock bugs.
+		//
+		// In this case, just assume scavenging takes 10 µs per regular physical page
+		// (determined empirically), and conservatively ignore the impact of huge pages
+		// on timing.
+		const approxWorkedNSPerPhysicalPage = 10e3
+		if duration == 0 {
+			worked += approxWorkedNSPerPhysicalPage * float64(r/physPageSize)
+		} else {
+			// TODO(mknyszek): If duration is small compared to worked, it could be
+			// rounded down to zero. Probably not a problem in practice because the
+			// values are all within a few orders of magnitude of each other but maybe
+			// worth worrying about.
+			worked += float64(duration)
+		}
+		released += r
+
+		// scavenge does not return until it either finds the requisite amount of
+		// memory to scavenge, or exhausts the heap. If we haven't found enough
+		// to scavenge, then the heap must be exhausted.
+		if r < scavengeQuantum {
+			break
+		}
+		// When using fake time just do one loop.
+		if faketime != 0 {
+			break
+		}
+	}
+	if released > 0 && released < physPageSize {
+		// If this happens, it means that we may have attempted to release part
+		// of a physical page, but the likely effect of that is that it released
+		// the whole physical page, some of which may have still been in-use.
+		// This could lead to memory corruption. Throw.
+		throw("released less than one physical page of memory")
+	}
+	return
 }
 
 // Background scavenger.
@@ -223,138 +621,44 @@ func scavengeSleep(ns int64) int64 {
 // the line described by the proportional scavenging statistics in
 // the mheap struct.
 func bgscavenge(c chan int) {
-	scavenge.g = getg()
-
-	lock(&scavenge.lock)
-	scavenge.parked = true
-
-	scavenge.timer = new(timer)
-	scavenge.timer.f = func(_ interface{}, _ uintptr) {
-		wakeScavenger()
-	}
+	scavenger.init()
 
 	c <- 1
-	goparkunlock(&scavenge.lock, waitReasonGCScavengeWait, traceEvGoBlock, 1)
-
-	// Exponentially-weighted moving average of the fraction of time this
-	// goroutine spends scavenging (that is, percent of a single CPU).
-	// It represents a measure of scheduling overheads which might extend
-	// the sleep or the critical time beyond what's expected. Assume no
-	// overhead to begin with.
-	//
-	// TODO(mknyszek): Consider making this based on total CPU time of the
-	// application (i.e. scavengePercent * GOMAXPROCS). This isn't really
-	// feasible now because the scavenger acquires the heap lock over the
-	// scavenging operation, which means scavenging effectively blocks
-	// allocators and isn't scalable. However, given a scalable allocator,
-	// it makes sense to also make the scavenger scale with it; if you're
-	// allocating more frequently, then presumably you're also generating
-	// more work for the scavenger.
-	const idealFraction = scavengePercent / 100.0
-	scavengeEWMA := float64(idealFraction)
+	scavenger.park()
 
 	for {
-		released := uintptr(0)
-
-		// Time in scavenging critical section.
-		crit := float64(0)
-
-		// Run on the system stack since we grab the heap lock,
-		// and a stack growth with the heap lock means a deadlock.
-		systemstack(func() {
-			lock(&mheap_.lock)
-
-			// If background scavenging is disabled or if there's no work to do just park.
-			retained, goal := heapRetained(), mheap_.scavengeGoal
-			if retained <= goal {
-				unlock(&mheap_.lock)
-				return
-			}
-			unlock(&mheap_.lock)
-
-			// Scavenge one page, and measure the amount of time spent scavenging.
-			start := nanotime()
-			released = mheap_.pages.scavengeOne(physPageSize, false)
-			atomic.Xadduintptr(&mheap_.pages.scavReleased, released)
-			crit = float64(nanotime() - start)
-		})
-
+		released, workTime := scavenger.run()
 		if released == 0 {
-			lock(&scavenge.lock)
-			scavenge.parked = true
-			goparkunlock(&scavenge.lock, waitReasonGCScavengeWait, traceEvGoBlock, 1)
+			scavenger.park()
 			continue
 		}
-
-		// Multiply the critical time by 1 + the ratio of the costs of using
-		// scavenged memory vs. scavenging memory. This forces us to pay down
-		// the cost of reusing this memory eagerly by sleeping for a longer period
-		// of time and scavenging less frequently. More concretely, we avoid situations
-		// where we end up scavenging so often that we hurt allocation performance
-		// because of the additional overheads of using scavenged memory.
-		crit *= 1 + scavengeCostRatio
-
-		// If we spent more than 10 ms (for example, if the OS scheduled us away, or someone
-		// put their machine to sleep) in the critical section, bound the time we use to
-		// calculate at 10 ms to avoid letting the sleep time get arbitrarily high.
-		const maxCrit = 10e6
-		if crit > maxCrit {
-			crit = maxCrit
-		}
-
-		// Compute the amount of time to sleep, assuming we want to use at most
-		// scavengePercent of CPU time. Take into account scheduling overheads
-		// that may extend the length of our sleep by multiplying by how far
-		// off we are from the ideal ratio. For example, if we're sleeping too
-		// much, then scavengeEMWA < idealFraction, so we'll adjust the sleep time
-		// down.
-		adjust := scavengeEWMA / idealFraction
-		sleepTime := int64(adjust * crit / (scavengePercent / 100.0))
-
-		// Go to sleep.
-		slept := scavengeSleep(sleepTime)
-
-		// Compute the new ratio.
-		fraction := crit / (crit + float64(slept))
-
-		// Set a lower bound on the fraction.
-		// Due to OS-related anomalies we may "sleep" for an inordinate amount
-		// of time. Let's avoid letting the ratio get out of hand by bounding
-		// the sleep time we use in our EWMA.
-		const minFraction = 1 / 1000
-		if fraction < minFraction {
-			fraction = minFraction
-		}
-
-		// Update scavengeEWMA by merging in the new crit/slept ratio.
-		const alpha = 0.5
-		scavengeEWMA = alpha*fraction + (1-alpha)*scavengeEWMA
+		atomic.Xadduintptr(&mheap_.pages.scav.released, released)
+		scavenger.sleep(workTime)
 	}
 }
 
 // scavenge scavenges nbytes worth of free pages, starting with the
 // highest address first. Successive calls continue from where it left
-// off until the heap is exhausted. Call resetScavengeAddr to bring it
+// off until the heap is exhausted. Call scavengeStartGen to bring it
 // back to the top of the heap.
 //
 // Returns the amount of memory scavenged in bytes.
 //
-// If locked == false, s.mheapLock must not be locked. If locked == true,
-// s.mheapLock must be locked.
-//
-// Must run on the system stack because scavengeOne must run on the
-// system stack.
-//
-//go:systemstack
-func (s *pageAlloc) scavenge(nbytes uintptr, locked bool) uintptr {
+// scavenge always tries to scavenge nbytes worth of memory, and will
+// only fail to do so if the heap is exhausted for now.
+func (p *pageAlloc) scavenge(nbytes uintptr, shouldStop func() bool) uintptr {
 	released := uintptr(0)
 	for released < nbytes {
-		r := s.scavengeOne(nbytes-released, locked)
-		if r == 0 {
-			// Nothing left to scavenge! Give up.
+		ci, pageIdx := p.scav.index.find()
+		if ci == 0 {
 			break
 		}
-		released += r
+		systemstack(func() {
+			released += p.scavengeOne(ci, pageIdx, nbytes-released)
+		})
+		if shouldStop != nil && shouldStop() {
+			break
+		}
 	}
 	return released
 }
@@ -364,53 +668,41 @@ func (s *pageAlloc) scavenge(nbytes uintptr, locked bool) uintptr {
 // released should be the amount of memory released since the last time this
 // was called, and forced indicates whether the scavenge was forced by the
 // application.
+//
+// scavenger.lock must be held.
 func printScavTrace(released uintptr, forced bool) {
+	assertLockHeld(&scavenger.lock)
+
 	printlock()
 	print("scav ",
 		released>>10, " KiB work, ",
-		atomic.Load64(&memstats.heap_released)>>10, " KiB total, ",
-		(atomic.Load64(&memstats.heap_inuse)*100)/heapRetained(), "% util",
+		gcController.heapReleased.load()>>10, " KiB total, ",
+		(gcController.heapInUse.load()*100)/heapRetained(), "% util",
 	)
 	if forced {
 		print(" (forced)")
+	} else if scavenger.printControllerReset {
+		print(" [controller reset]")
+		scavenger.printControllerReset = false
 	}
 	println()
 	printunlock()
 }
 
-// resetScavengeAddr sets the scavenge start address to the top of the heap's
-// address space. This should be called each time the scavenger's pacing
-// changes.
+// scavengeOne walks over the chunk at chunk index ci and searches for
+// a contiguous run of pages to scavenge. It will try to scavenge
+// at most max bytes at once, but may scavenge more to avoid
+// breaking huge pages. Once it scavenges some memory it returns
+// how much it scavenged in bytes.
 //
-// s.mheapLock must be held.
-func (s *pageAlloc) resetScavengeAddr() {
-	released := atomic.Loaduintptr(&s.scavReleased)
-	if debug.scavtrace > 0 {
-		printScavTrace(released, false)
-	}
-	// Subtract from scavReleased instead of just setting it to zero because
-	// the scavenger could have increased scavReleased concurrently with the
-	// load above, and we may miss an update by just blindly zeroing the field.
-	atomic.Xadduintptr(&s.scavReleased, -released)
-	s.scavAddr = chunkBase(s.end) - 1
-}
-
-// scavengeOne starts from s.scavAddr and walks down the heap until it finds
-// a contiguous run of pages to scavenge. It will try to scavenge at most
-// max bytes at once, but may scavenge more to avoid breaking huge pages. Once
-// it scavenges some memory it returns how much it scavenged and updates s.scavAddr
-// appropriately. s.scavAddr must be reset manually and externally.
+// searchIdx is the page index to start searching from in ci.
 //
-// Should it exhaust the heap, it will return 0 and set s.scavAddr to minScavAddr.
+// Returns the number of bytes scavenged.
 //
-// If locked == false, s.mheapLock must not be locked.
-// If locked == true, s.mheapLock must be locked.
-//
-// Must be run on the system stack because it either acquires the heap lock
-// or executes with the heap lock acquired.
+// Must run on the systemstack because it acquires p.mheapLock.
 //
 //go:systemstack
-func (s *pageAlloc) scavengeOne(max uintptr, locked bool) uintptr {
+func (p *pageAlloc) scavengeOne(ci chunkIdx, searchIdx uint, max uintptr) uintptr {
 	// Calculate the maximum number of pages to scavenge.
 	//
 	// This should be alignUp(max, pageSize) / pageSize but max can and will
@@ -432,164 +724,63 @@ func (s *pageAlloc) scavengeOne(max uintptr, locked bool) uintptr {
 		minPages = 1
 	}
 
-	// Helpers for locking and unlocking only if locked == false.
-	lockHeap := func() {
-		if !locked {
-			lock(s.mheapLock)
-		}
-	}
-	unlockHeap := func() {
-		if !locked {
-			unlock(s.mheapLock)
-		}
-	}
-
-	lockHeap()
-	ci := chunkIndex(s.scavAddr)
-	if ci < s.start {
-		unlockHeap()
-		return 0
-	}
-
-	// Check the chunk containing the scav addr, starting at the addr
-	// and see if there are any free and unscavenged pages.
-	//
-	// Only check this if s.scavAddr is covered by any address range
-	// in s.inUse, so that we know our check of the summary is safe.
-	if s.inUse.contains(s.scavAddr) && s.summary[len(s.summary)-1][ci].max() >= uint(minPages) {
+	lock(p.mheapLock)
+	if p.summary[len(p.summary)-1][ci].max() >= uint(minPages) {
 		// We only bother looking for a candidate if there at least
-		// minPages free pages at all. It's important that we only
-		// continue if the summary says we can because that's how
-		// we can tell if parts of the address space are unused.
-		// See the comment on s.chunks in mpagealloc.go.
-		base, npages := s.chunkOf(ci).findScavengeCandidate(chunkPageIndex(s.scavAddr), minPages, maxPages)
+		// minPages free pages at all.
+		base, npages := p.chunkOf(ci).findScavengeCandidate(searchIdx, minPages, maxPages)
 
 		// If we found something, scavenge it and return!
 		if npages != 0 {
-			s.scavengeRangeLocked(ci, base, npages)
-			unlockHeap()
+			// Compute the full address for the start of the range.
+			addr := chunkBase(ci) + uintptr(base)*pageSize
+
+			// Mark the range we're about to scavenge as allocated, because
+			// we don't want any allocating goroutines to grab it while
+			// the scavenging is in progress.
+			if scav := p.allocRange(addr, uintptr(npages)); scav != 0 {
+				throw("double scavenge")
+			}
+
+			// With that done, it's safe to unlock.
+			unlock(p.mheapLock)
+
+			if !p.test {
+				pageTraceScav(getg().m.p.ptr(), 0, addr, uintptr(npages))
+
+				// Only perform the actual scavenging if we're not in a test.
+				// It's dangerous to do so otherwise.
+				sysUnused(unsafe.Pointer(addr), uintptr(npages)*pageSize)
+
+				// Update global accounting only when not in test, otherwise
+				// the runtime's accounting will be wrong.
+				nbytes := int64(npages) * pageSize
+				gcController.heapReleased.add(nbytes)
+				gcController.heapFree.add(-nbytes)
+
+				stats := memstats.heapStats.acquire()
+				atomic.Xaddint64(&stats.committed, -nbytes)
+				atomic.Xaddint64(&stats.released, nbytes)
+				memstats.heapStats.release()
+			}
+
+			// Relock the heap, because now we need to make these pages
+			// available allocation. Free them back to the page allocator.
+			lock(p.mheapLock)
+			p.free(addr, uintptr(npages), true)
+
+			// Mark the range as scavenged.
+			p.chunkOf(ci).scavenged.setRange(base, npages)
+			unlock(p.mheapLock)
+
 			return uintptr(npages) * pageSize
 		}
 	}
-
-	// getInUseRange returns the highest range in the
-	// intersection of [0, addr] and s.inUse.
-	//
-	// s.mheapLock must be held.
-	getInUseRange := func(addr uintptr) addrRange {
-		top := s.inUse.findSucc(addr)
-		if top == 0 {
-			return addrRange{}
-		}
-		r := s.inUse.ranges[top-1]
-		// addr is inclusive, so treat it as such when
-		// updating the limit, which is exclusive.
-		if r.limit > addr+1 {
-			r.limit = addr + 1
-		}
-		return r
-	}
-
-	// Slow path: iterate optimistically over the in-use address space
-	// looking for any free and unscavenged page. If we think we see something,
-	// lock and verify it!
-	//
-	// We iterate over the address space by taking ranges from inUse.
-newRange:
-	for {
-		r := getInUseRange(s.scavAddr)
-		if r.size() == 0 {
-			break
-		}
-		unlockHeap()
-
-		// Iterate over all of the chunks described by r.
-		// Note that r.limit is the exclusive upper bound, but what
-		// we want is the top chunk instead, inclusive, so subtract 1.
-		bot, top := chunkIndex(r.base), chunkIndex(r.limit-1)
-		for i := top; i >= bot; i-- {
-			// If this chunk is totally in-use or has no unscavenged pages, don't bother
-			// doing a  more sophisticated check.
-			//
-			// Note we're accessing the summary and the chunks without a lock, but
-			// that's fine. We're being optimistic anyway.
-
-			// Check quickly if there are enough free pages at all.
-			if s.summary[len(s.summary)-1][i].max() < uint(minPages) {
-				continue
-			}
-
-			// Run over the chunk looking harder for a candidate. Again, we could
-			// race with a lot of different pieces of code, but we're just being
-			// optimistic. Make sure we load the l2 pointer atomically though, to
-			// avoid races with heap growth. It may or may not be possible to also
-			// see a nil pointer in this case if we do race with heap growth, but
-			// just defensively ignore the nils. This operation is optimistic anyway.
-			l2 := (*[1 << pallocChunksL2Bits]pallocData)(atomic.Loadp(unsafe.Pointer(&s.chunks[i.l1()])))
-			if l2 == nil || !l2[i.l2()].hasScavengeCandidate(minPages) {
-				continue
-			}
-
-			// We found a candidate, so let's lock and verify it.
-			lockHeap()
-
-			// Find, verify, and scavenge if we can.
-			chunk := s.chunkOf(i)
-			base, npages := chunk.findScavengeCandidate(pallocChunkPages-1, minPages, maxPages)
-			if npages > 0 {
-				// We found memory to scavenge! Mark the bits and report that up.
-				// scavengeRangeLocked will update scavAddr for us, also.
-				s.scavengeRangeLocked(i, base, npages)
-				unlockHeap()
-				return uintptr(npages) * pageSize
-			}
-
-			// We were fooled, let's take this opportunity to move the scavAddr
-			// all the way down to where we searched as scavenged for future calls
-			// and keep iterating. Then, go get a new range.
-			s.scavAddr = chunkBase(i-1) + pallocChunkPages*pageSize - 1
-			continue newRange
-		}
-		lockHeap()
-
-		// Move the scavenger down the heap, past everything we just searched.
-		// Since we don't check if scavAddr moved while twe let go of the heap lock,
-		// it's possible that it moved down and we're moving it up here. This
-		// raciness could result in us searching parts of the heap unnecessarily.
-		// TODO(mknyszek): Remove this racy behavior through explicit address
-		// space reservations, which are difficult to do with just scavAddr.
-		s.scavAddr = r.base - 1
-	}
-	// We reached the end of the in-use address space and couldn't find anything,
-	// so signal that there's nothing left to scavenge.
-	s.scavAddr = minScavAddr
-	unlockHeap()
+	// Mark this chunk as having no free pages.
+	p.scav.index.clear(ci)
+	unlock(p.mheapLock)
 
 	return 0
-}
-
-// scavengeRangeLocked scavenges the given region of memory.
-//
-// s.mheapLock must be held.
-func (s *pageAlloc) scavengeRangeLocked(ci chunkIdx, base, npages uint) {
-	s.chunkOf(ci).scavenged.setRange(base, npages)
-
-	// Compute the full address for the start of the range.
-	addr := chunkBase(ci) + uintptr(base)*pageSize
-
-	// Update the scav pointer.
-	s.scavAddr = addr - 1
-
-	// Only perform the actual scavenging if we're not in a test.
-	// It's dangerous to do so otherwise.
-	if s.test {
-		return
-	}
-	sysUnused(unsafe.Pointer(addr), uintptr(npages)*pageSize)
-
-	// Update global accounting only when not in test, otherwise
-	// the runtime's accounting will be wrong.
-	mSysStatInc(&memstats.heap_released, uintptr(npages)*pageSize)
 }
 
 // fillAligned returns x but with all zeroes in m-aligned
@@ -649,38 +840,6 @@ func fillAligned(x uint64, m uint) uint64 {
 	// the top bit, so just OR with the original
 	// result to set all the bits.
 	return ^((x - (x >> (m - 1))) | x)
-}
-
-// hasScavengeCandidate returns true if there's any min-page-aligned groups of
-// min pages of free-and-unscavenged memory in the region represented by this
-// pallocData.
-//
-// min must be a non-zero power of 2 <= maxPagesPerPhysPage.
-func (m *pallocData) hasScavengeCandidate(min uintptr) bool {
-	if min&(min-1) != 0 || min == 0 {
-		print("runtime: min = ", min, "\n")
-		throw("min must be a non-zero power of 2")
-	} else if min > maxPagesPerPhysPage {
-		print("runtime: min = ", min, "\n")
-		throw("min too large")
-	}
-
-	// The goal of this search is to see if the chunk contains any free and unscavenged memory.
-	for i := len(m.scavenged) - 1; i >= 0; i-- {
-		// 1s are scavenged OR non-free => 0s are unscavenged AND free
-		//
-		// TODO(mknyszek): Consider splitting up fillAligned into two
-		// functions, since here we technically could get by with just
-		// the first half of its computation. It'll save a few instructions
-		// but adds some additional code complexity.
-		x := fillAligned(m.scavenged[i]|m.pallocBits[i], uint(min))
-
-		// Quickly skip over chunks of non-free or scavenged pages.
-		if x != ^uint64(0) {
-			return true
-		}
-	}
-	return false
 }
 
 // findScavengeCandidate returns a start index and a size for this pallocData
@@ -801,4 +960,226 @@ func (m *pallocData) findScavengeCandidate(searchIdx uint, min, max uintptr) (ui
 		}
 	}
 	return start, size
+}
+
+// scavengeIndex is a structure for efficiently managing which pageAlloc chunks have
+// memory available to scavenge.
+type scavengeIndex struct {
+	// chunks is a bitmap representing the entire address space. Each bit represents
+	// a single chunk, and a 1 value indicates the presence of pages available for
+	// scavenging. Updates to the bitmap are serialized by the pageAlloc lock.
+	//
+	// The underlying storage of chunks is platform dependent and may not even be
+	// totally mapped read/write. min and max reflect the extent that is safe to access.
+	// min is inclusive, max is exclusive.
+	//
+	// searchAddr is the maximum address (in the offset address space, so we have a linear
+	// view of the address space; see mranges.go:offAddr) containing memory available to
+	// scavenge. It is a hint to the find operation to avoid O(n^2) behavior in repeated lookups.
+	//
+	// searchAddr is always inclusive and should be the base address of the highest runtime
+	// page available for scavenging.
+	//
+	// searchAddr is managed by both find and mark.
+	//
+	// Normally, find monotonically decreases searchAddr as it finds no more free pages to
+	// scavenge. However, mark, when marking a new chunk at an index greater than the current
+	// searchAddr, sets searchAddr to the *negative* index into chunks of that page. The trick here
+	// is that concurrent calls to find will fail to monotonically decrease searchAddr, and so they
+	// won't barge over new memory becoming available to scavenge. Furthermore, this ensures
+	// that some future caller of find *must* observe the new high index. That caller
+	// (or any other racing with it), then makes searchAddr positive before continuing, bringing
+	// us back to our monotonically decreasing steady-state.
+	//
+	// A pageAlloc lock serializes updates between min, max, and searchAddr, so abs(searchAddr)
+	// is always guaranteed to be >= min and < max (converted to heap addresses).
+	//
+	// TODO(mknyszek): Ideally we would use something bigger than a uint8 for faster
+	// iteration like uint32, but we lack the bit twiddling intrinsics. We'd need to either
+	// copy them from math/bits or fix the fact that we can't import math/bits' code from
+	// the runtime due to compiler instrumentation.
+	searchAddr atomicOffAddr
+	chunks     []atomic.Uint8
+	minHeapIdx atomic.Int32
+	min, max   atomic.Int32
+}
+
+// find returns the highest chunk index that may contain pages available to scavenge.
+// It also returns an offset to start searching in the highest chunk.
+func (s *scavengeIndex) find() (chunkIdx, uint) {
+	searchAddr, marked := s.searchAddr.Load()
+	if searchAddr == minOffAddr.addr() {
+		// We got a cleared search addr.
+		return 0, 0
+	}
+
+	// Starting from searchAddr's chunk, and moving down to minHeapIdx,
+	// iterate until we find a chunk with pages to scavenge.
+	min := s.minHeapIdx.Load()
+	searchChunk := chunkIndex(uintptr(searchAddr))
+	start := int32(searchChunk / 8)
+	for i := start; i >= min; i-- {
+		// Skip over irrelevant address space.
+		chunks := s.chunks[i].Load()
+		if chunks == 0 {
+			continue
+		}
+		// Note that we can't have 8 leading zeroes here because
+		// we necessarily skipped that case. So, what's left is
+		// an index. If there are no zeroes, we want the 7th
+		// index, if 1 zero, the 6th, and so on.
+		n := 7 - sys.LeadingZeros8(chunks)
+		ci := chunkIdx(uint(i)*8 + uint(n))
+		if searchChunk == ci {
+			return ci, chunkPageIndex(uintptr(searchAddr))
+		}
+		// Try to reduce searchAddr to newSearchAddr.
+		newSearchAddr := chunkBase(ci) + pallocChunkBytes - pageSize
+		if marked {
+			// Attempt to be the first one to decrease the searchAddr
+			// after an increase. If we fail, that means there was another
+			// increase, or somebody else got to it before us. Either way,
+			// it doesn't matter. We may lose some performance having an
+			// incorrect search address, but it's far more important that
+			// we don't miss updates.
+			s.searchAddr.StoreUnmark(searchAddr, newSearchAddr)
+		} else {
+			// Decrease searchAddr.
+			s.searchAddr.StoreMin(newSearchAddr)
+		}
+		return ci, pallocChunkPages - 1
+	}
+	// Clear searchAddr, because we've exhausted the heap.
+	s.searchAddr.Clear()
+	return 0, 0
+}
+
+// mark sets the inclusive range of chunks between indices start and end as
+// containing pages available to scavenge.
+//
+// Must be serialized with other mark, markRange, and clear calls.
+func (s *scavengeIndex) mark(base, limit uintptr) {
+	start, end := chunkIndex(base), chunkIndex(limit-pageSize)
+	if start == end {
+		// Within a chunk.
+		mask := uint8(1 << (start % 8))
+		s.chunks[start/8].Or(mask)
+	} else if start/8 == end/8 {
+		// Within the same byte in the index.
+		mask := uint8(uint16(1<<(end-start+1))-1) << (start % 8)
+		s.chunks[start/8].Or(mask)
+	} else {
+		// Crosses multiple bytes in the index.
+		startAligned := chunkIdx(alignUp(uintptr(start), 8))
+		endAligned := chunkIdx(alignDown(uintptr(end), 8))
+
+		// Do the end of the first byte first.
+		if width := startAligned - start; width > 0 {
+			mask := uint8(uint16(1<<width)-1) << (start % 8)
+			s.chunks[start/8].Or(mask)
+		}
+		// Do the middle aligned sections that take up a whole
+		// byte.
+		for ci := startAligned; ci < endAligned; ci += 8 {
+			s.chunks[ci/8].Store(^uint8(0))
+		}
+		// Do the end of the last byte.
+		//
+		// This width check doesn't match the one above
+		// for start because aligning down into the endAligned
+		// block means we always have at least one chunk in this
+		// block (note that end is *inclusive*). This also means
+		// that if end == endAligned+n, then what we really want
+		// is to fill n+1 chunks, i.e. width n+1. By induction,
+		// this is true for all n.
+		if width := end - endAligned + 1; width > 0 {
+			mask := uint8(uint16(1<<width) - 1)
+			s.chunks[end/8].Or(mask)
+		}
+	}
+	newSearchAddr := limit - pageSize
+	searchAddr, _ := s.searchAddr.Load()
+	// N.B. Because mark is serialized, it's not necessary to do a
+	// full CAS here. mark only ever increases searchAddr, while
+	// find only ever decreases it. Since we only ever race with
+	// decreases, even if the value we loaded is stale, the actual
+	// value will never be larger.
+	if (offAddr{searchAddr}).lessThan(offAddr{newSearchAddr}) {
+		s.searchAddr.StoreMarked(newSearchAddr)
+	}
+}
+
+// clear sets the chunk at index ci as not containing pages available to scavenge.
+//
+// Must be serialized with other mark, markRange, and clear calls.
+func (s *scavengeIndex) clear(ci chunkIdx) {
+	s.chunks[ci/8].And(^uint8(1 << (ci % 8)))
+}
+
+type piController struct {
+	kp float64 // Proportional constant.
+	ti float64 // Integral time constant.
+	tt float64 // Reset time.
+
+	min, max float64 // Output boundaries.
+
+	// PI controller state.
+
+	errIntegral float64 // Integral of the error from t=0 to now.
+
+	// Error flags.
+	errOverflow   bool // Set if errIntegral ever overflowed.
+	inputOverflow bool // Set if an operation with the input overflowed.
+}
+
+// next provides a new sample to the controller.
+//
+// input is the sample, setpoint is the desired point, and period is how much
+// time (in whatever unit makes the most sense) has passed since the last sample.
+//
+// Returns a new value for the variable it's controlling, and whether the operation
+// completed successfully. One reason this might fail is if error has been growing
+// in an unbounded manner, to the point of overflow.
+//
+// In the specific case of an error overflow occurs, the errOverflow field will be
+// set and the rest of the controller's internal state will be fully reset.
+func (c *piController) next(input, setpoint, period float64) (float64, bool) {
+	// Compute the raw output value.
+	prop := c.kp * (setpoint - input)
+	rawOutput := prop + c.errIntegral
+
+	// Clamp rawOutput into output.
+	output := rawOutput
+	if isInf(output) || isNaN(output) {
+		// The input had a large enough magnitude that either it was already
+		// overflowed, or some operation with it overflowed.
+		// Set a flag and reset. That's the safest thing to do.
+		c.reset()
+		c.inputOverflow = true
+		return c.min, false
+	}
+	if output < c.min {
+		output = c.min
+	} else if output > c.max {
+		output = c.max
+	}
+
+	// Update the controller's state.
+	if c.ti != 0 && c.tt != 0 {
+		c.errIntegral += (c.kp*period/c.ti)*(setpoint-input) + (period/c.tt)*(output-rawOutput)
+		if isInf(c.errIntegral) || isNaN(c.errIntegral) {
+			// So much error has accumulated that we managed to overflow.
+			// The assumptions around the controller have likely broken down.
+			// Set a flag and reset. That's the safest thing to do.
+			c.reset()
+			c.errOverflow = true
+			return c.min, false
+		}
+	}
+	return output, true
+}
+
+// reset resets the controller state, except for controller error flags.
+func (c *piController) reset() {
+	c.errIntegral = 0
 }

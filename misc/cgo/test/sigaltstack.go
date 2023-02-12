@@ -2,6 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+//go:build !windows && !android
 // +build !windows,!android
 
 // Test that the Go runtime still works if C code changes the signal stack.
@@ -62,10 +63,8 @@ import (
 
 func testSigaltstack(t *testing.T) {
 	switch {
-	case runtime.GOOS == "solaris", runtime.GOOS == "illumos", runtime.GOOS == "darwin" && (runtime.GOARCH == "arm" || runtime.GOARCH == "arm64"):
+	case runtime.GOOS == "solaris", runtime.GOOS == "illumos", runtime.GOOS == "ios" && runtime.GOARCH == "arm64":
 		t.Skipf("switching signal stack not implemented on %s/%s", runtime.GOOS, runtime.GOARCH)
-	case runtime.GOOS == "darwin" && runtime.GOARCH == "386":
-		t.Skipf("sigaltstack fails on darwin/386")
 	}
 
 	C.changeSignalStack()

@@ -18,6 +18,7 @@ package runtime
 //  c.qcount < c.dataqsiz implies that c.sendq is empty.
 
 import (
+	"internal/abi"
 	"runtime/internal/atomic"
 	"runtime/internal/math"
 	"unsafe"
@@ -109,6 +110,7 @@ func makechan(t *chantype, size int) *hchan {
 	c.elemsize = uint16(elem.size)
 	c.elemtype = elem
 	c.dataqsiz = uint(size)
+	lockInit(&c.lock, lockRankHchan)
 
 	if debugChan {
 		print("makechan: chan=", c, "; elemsize=", elem.size, "; dataqsiz=", size, "\n")
@@ -136,7 +138,8 @@ func full(c *hchan) bool {
 	return c.qcount == c.dataqsiz
 }
 
-// entry point for c <- x from compiled code
+// entry point for c <- x from compiled code.
+//
 //go:nosplit
 func chansend1(c *hchan, elem unsafe.Pointer) {
 	chansend(c, elem, true, getcallerpc())
@@ -168,7 +171,7 @@ func chansend(c *hchan, ep unsafe.Pointer, block bool, callerpc uintptr) bool {
 	}
 
 	if raceenabled {
-		racereadpc(c.raceaddr(), callerpc, funcPC(chansend))
+		racereadpc(c.raceaddr(), callerpc, abi.FuncPCABIInternal(chansend))
 	}
 
 	// Fast path: check for failed non-blocking operation without acquiring the lock.
@@ -214,8 +217,7 @@ func chansend(c *hchan, ep unsafe.Pointer, block bool, callerpc uintptr) bool {
 		// Space is available in the channel buffer. Enqueue the element to send.
 		qp := chanbuf(c, c.sendx)
 		if raceenabled {
-			raceacquire(qp)
-			racerelease(qp)
+			racenotify(c, c.sendx, nil)
 		}
 		typedmemmove(c.elemtype, qp, ep)
 		c.sendx++
@@ -249,6 +251,11 @@ func chansend(c *hchan, ep unsafe.Pointer, block bool, callerpc uintptr) bool {
 	gp.waiting = mysg
 	gp.param = nil
 	c.sendq.enqueue(mysg)
+	// Signal to anyone trying to shrink our stack that we're about
+	// to park on a channel. The window between when this G's status
+	// changes and when we set gp.activeStackChans is not safe for
+	// stack shrinking.
+	gp.parkingOnChan.Store(true)
 	gopark(chanparkcommit, unsafe.Pointer(&c.lock), waitReasonChanSend, traceEvGoBlockSend, 2)
 	// Ensure the value being sent is kept alive until the
 	// receiver copies it out. The sudog has a pointer to the
@@ -262,18 +269,19 @@ func chansend(c *hchan, ep unsafe.Pointer, block bool, callerpc uintptr) bool {
 	}
 	gp.waiting = nil
 	gp.activeStackChans = false
-	if gp.param == nil {
-		if c.closed == 0 {
-			throw("chansend: spurious wakeup")
-		}
-		panic(plainError("send on closed channel"))
-	}
+	closed := !mysg.success
 	gp.param = nil
 	if mysg.releasetime > 0 {
 		blockevent(mysg.releasetime-t0, 2)
 	}
 	mysg.c = nil
 	releaseSudog(mysg)
+	if closed {
+		if c.closed == 0 {
+			throw("chansend: spurious wakeup")
+		}
+		panic(plainError("send on closed channel"))
+	}
 	return true
 }
 
@@ -291,11 +299,8 @@ func send(c *hchan, sg *sudog, ep unsafe.Pointer, unlockf func(), skip int) {
 			// Pretend we go through the buffer, even though
 			// we copy directly. Note that we need to increment
 			// the head/tail locations only when raceenabled.
-			qp := chanbuf(c, c.recvx)
-			raceacquire(qp)
-			racerelease(qp)
-			raceacquireg(sg.g, qp)
-			racereleaseg(sg.g, qp)
+			racenotify(c, c.recvx, nil)
+			racenotify(c, c.recvx, sg)
 			c.recvx++
 			if c.recvx == c.dataqsiz {
 				c.recvx = 0
@@ -310,6 +315,7 @@ func send(c *hchan, sg *sudog, ep unsafe.Pointer, unlockf func(), skip int) {
 	gp := sg.g
 	unlockf()
 	gp.param = unsafe.Pointer(sg)
+	sg.success = true
 	if sg.releasetime != 0 {
 		sg.releasetime = cputicks()
 	}
@@ -361,7 +367,7 @@ func closechan(c *hchan) {
 
 	if raceenabled {
 		callerpc := getcallerpc()
-		racewritepc(c.raceaddr(), callerpc, funcPC(closechan))
+		racewritepc(c.raceaddr(), callerpc, abi.FuncPCABIInternal(closechan))
 		racerelease(c.raceaddr())
 	}
 
@@ -383,7 +389,8 @@ func closechan(c *hchan) {
 			sg.releasetime = cputicks()
 		}
 		gp := sg.g
-		gp.param = nil
+		gp.param = unsafe.Pointer(sg)
+		sg.success = false
 		if raceenabled {
 			raceacquireg(gp, c.raceaddr())
 		}
@@ -401,7 +408,8 @@ func closechan(c *hchan) {
 			sg.releasetime = cputicks()
 		}
 		gp := sg.g
-		gp.param = nil
+		gp.param = unsafe.Pointer(sg)
+		sg.success = false
 		if raceenabled {
 			raceacquireg(gp, c.raceaddr())
 		}
@@ -427,7 +435,8 @@ func empty(c *hchan) bool {
 	return atomic.Loaduint(&c.qcount) == 0
 }
 
-// entry points for <- c from compiled code
+// entry points for <- c from compiled code.
+//
 //go:nosplit
 func chanrecv1(c *hchan, elem unsafe.Pointer) {
 	chanrecv(c, elem, true)
@@ -501,32 +510,35 @@ func chanrecv(c *hchan, ep unsafe.Pointer, block bool) (selected, received bool)
 
 	lock(&c.lock)
 
-	if c.closed != 0 && c.qcount == 0 {
-		if raceenabled {
-			raceacquire(c.raceaddr())
+	if c.closed != 0 {
+		if c.qcount == 0 {
+			if raceenabled {
+				raceacquire(c.raceaddr())
+			}
+			unlock(&c.lock)
+			if ep != nil {
+				typedmemclr(c.elemtype, ep)
+			}
+			return true, false
 		}
-		unlock(&c.lock)
-		if ep != nil {
-			typedmemclr(c.elemtype, ep)
+		// The channel has been closed, but the channel's buffer have data.
+	} else {
+		// Just found waiting sender with not closed.
+		if sg := c.sendq.dequeue(); sg != nil {
+			// Found a waiting sender. If buffer is size 0, receive value
+			// directly from sender. Otherwise, receive from head of queue
+			// and add sender's value to the tail of the queue (both map to
+			// the same buffer slot because the queue is full).
+			recv(c, sg, ep, func() { unlock(&c.lock) }, 3)
+			return true, true
 		}
-		return true, false
-	}
-
-	if sg := c.sendq.dequeue(); sg != nil {
-		// Found a waiting sender. If buffer is size 0, receive value
-		// directly from sender. Otherwise, receive from head of queue
-		// and add sender's value to the tail of the queue (both map to
-		// the same buffer slot because the queue is full).
-		recv(c, sg, ep, func() { unlock(&c.lock) }, 3)
-		return true, true
 	}
 
 	if c.qcount > 0 {
 		// Receive directly from queue
 		qp := chanbuf(c, c.recvx)
 		if raceenabled {
-			raceacquire(qp)
-			racerelease(qp)
+			racenotify(c, c.recvx, nil)
 		}
 		if ep != nil {
 			typedmemmove(c.elemtype, ep, qp)
@@ -563,6 +575,11 @@ func chanrecv(c *hchan, ep unsafe.Pointer, block bool) (selected, received bool)
 	mysg.c = c
 	gp.param = nil
 	c.recvq.enqueue(mysg)
+	// Signal to anyone trying to shrink our stack that we're about
+	// to park on a channel. The window between when this G's status
+	// changes and when we set gp.activeStackChans is not safe for
+	// stack shrinking.
+	gp.parkingOnChan.Store(true)
 	gopark(chanparkcommit, unsafe.Pointer(&c.lock), waitReasonChanReceive, traceEvGoBlockRecv, 2)
 
 	// someone woke us up
@@ -574,19 +591,20 @@ func chanrecv(c *hchan, ep unsafe.Pointer, block bool) (selected, received bool)
 	if mysg.releasetime > 0 {
 		blockevent(mysg.releasetime-t0, 2)
 	}
-	closed := gp.param == nil
+	success := mysg.success
 	gp.param = nil
 	mysg.c = nil
 	releaseSudog(mysg)
-	return true, !closed
+	return true, success
 }
 
 // recv processes a receive operation on a full channel c.
 // There are 2 parts:
-// 1) The value sent by the sender sg is put into the channel
-//    and the sender is woken up to go on its merry way.
-// 2) The value received by the receiver (the current G) is
-//    written to ep.
+//  1. The value sent by the sender sg is put into the channel
+//     and the sender is woken up to go on its merry way.
+//  2. The value received by the receiver (the current G) is
+//     written to ep.
+//
 // For synchronous channels, both values are the same.
 // For asynchronous channels, the receiver gets its data from
 // the channel buffer and the sender's data is put in the
@@ -610,10 +628,8 @@ func recv(c *hchan, sg *sudog, ep unsafe.Pointer, unlockf func(), skip int) {
 		// queue is full, those are both the same slot.
 		qp := chanbuf(c, c.recvx)
 		if raceenabled {
-			raceacquire(qp)
-			racerelease(qp)
-			raceacquireg(sg.g, qp)
-			racereleaseg(sg.g, qp)
+			racenotify(c, c.recvx, nil)
+			racenotify(c, c.recvx, sg)
 		}
 		// copy data from queue to receiver
 		if ep != nil {
@@ -631,6 +647,7 @@ func recv(c *hchan, sg *sudog, ep unsafe.Pointer, unlockf func(), skip int) {
 	gp := sg.g
 	unlockf()
 	gp.param = unsafe.Pointer(sg)
+	sg.success = true
 	if sg.releasetime != 0 {
 		sg.releasetime = cputicks()
 	}
@@ -640,7 +657,19 @@ func recv(c *hchan, sg *sudog, ep unsafe.Pointer, unlockf func(), skip int) {
 func chanparkcommit(gp *g, chanLock unsafe.Pointer) bool {
 	// There are unlocked sudogs that point into gp's stack. Stack
 	// copying must lock the channels of those sudogs.
+	// Set activeStackChans here instead of before we try parking
+	// because we could self-deadlock in stack growth on the
+	// channel lock.
 	gp.activeStackChans = true
+	// Mark that it's safe for stack shrinking to occur now,
+	// because any thread acquiring this G's stack for shrinking
+	// is guaranteed to observe activeStackChans after this store.
+	gp.parkingOnChan.Store(false)
+	// Make sure we unlock after setting activeStackChans and
+	// unsetting parkingOnChan. The moment we unlock chanLock
+	// we risk gp getting readied by a channel operation and
+	// so gp could continue running before everything before
+	// the unlock is visible (even to gp itself).
 	unlock((*mutex)(chanLock))
 	return true
 }
@@ -661,31 +690,8 @@ func chanparkcommit(gp *g, chanLock unsafe.Pointer) bool {
 //	} else {
 //		... bar
 //	}
-//
 func selectnbsend(c *hchan, elem unsafe.Pointer) (selected bool) {
 	return chansend(c, elem, false, getcallerpc())
-}
-
-// compiler implements
-//
-//	select {
-//	case v = <-c:
-//		... foo
-//	default:
-//		... bar
-//	}
-//
-// as
-//
-//	if selectnbrecv(&v, c) {
-//		... foo
-//	} else {
-//		... bar
-//	}
-//
-func selectnbrecv(elem unsafe.Pointer, c *hchan) (selected bool) {
-	selected, _ = chanrecv(c, elem, false)
-	return
 }
 
 // compiler implements
@@ -699,16 +705,13 @@ func selectnbrecv(elem unsafe.Pointer, c *hchan) (selected bool) {
 //
 // as
 //
-//	if c != nil && selectnbrecv2(&v, &ok, c) {
+//	if selected, ok = selectnbrecv(&v, c); selected {
 //		... foo
 //	} else {
 //		... bar
 //	}
-//
-func selectnbrecv2(elem unsafe.Pointer, received *bool, c *hchan) (selected bool) {
-	// TODO(khr): just return 2 values from this function, now that it is in Go.
-	selected, *received = chanrecv(c, elem, false)
-	return
+func selectnbrecv(elem unsafe.Pointer, c *hchan) (selected, received bool) {
+	return chanrecv(c, elem, false)
 }
 
 //go:linkname reflect_chansend reflect.chansend
@@ -777,7 +780,7 @@ func (q *waitq) dequeue() *sudog {
 		} else {
 			y.prev = nil
 			q.first = y
-			sgp.next = nil // mark as removed (see dequeueSudog)
+			sgp.next = nil // mark as removed (see dequeueSudoG)
 		}
 
 		// if a goroutine was put on this queue because of a
@@ -788,7 +791,7 @@ func (q *waitq) dequeue() *sudog {
 		// We use a flag in the G struct to tell us when someone
 		// else has won the race to signal this goroutine but the goroutine
 		// hasn't removed itself from the queue yet.
-		if sgp.isSelect && !atomic.Cas(&sgp.g.selectDone, 0, 1) {
+		if sgp.isSelect && !sgp.g.selectDone.CompareAndSwap(0, 1) {
 			continue
 		}
 
@@ -810,4 +813,39 @@ func racesync(c *hchan, sg *sudog) {
 	raceacquireg(sg.g, chanbuf(c, 0))
 	racereleaseg(sg.g, chanbuf(c, 0))
 	raceacquire(chanbuf(c, 0))
+}
+
+// Notify the race detector of a send or receive involving buffer entry idx
+// and a channel c or its communicating partner sg.
+// This function handles the special case of c.elemsize==0.
+func racenotify(c *hchan, idx uint, sg *sudog) {
+	// We could have passed the unsafe.Pointer corresponding to entry idx
+	// instead of idx itself.  However, in a future version of this function,
+	// we can use idx to better handle the case of elemsize==0.
+	// A future improvement to the detector is to call TSan with c and idx:
+	// this way, Go will continue to not allocating buffer entries for channels
+	// of elemsize==0, yet the race detector can be made to handle multiple
+	// sync objects underneath the hood (one sync object per idx)
+	qp := chanbuf(c, idx)
+	// When elemsize==0, we don't allocate a full buffer for the channel.
+	// Instead of individual buffer entries, the race detector uses the
+	// c.buf as the only buffer entry.  This simplification prevents us from
+	// following the memory model's happens-before rules (rules that are
+	// implemented in racereleaseacquire).  Instead, we accumulate happens-before
+	// information in the synchronization object associated with c.buf.
+	if c.elemsize == 0 {
+		if sg == nil {
+			raceacquire(qp)
+			racerelease(qp)
+		} else {
+			raceacquireg(sg.g, qp)
+			racereleaseg(sg.g, qp)
+		}
+	} else {
+		if sg == nil {
+			racereleaseacquire(qp)
+		} else {
+			racereleaseacquireg(sg.g, qp)
+		}
+	}
 }

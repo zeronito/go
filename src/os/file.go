@@ -37,17 +37,19 @@
 // Note: The maximum number of concurrent operations on a File may be limited by
 // the OS or the system. The number should be high, but exceeding it may degrade
 // performance or cause other issues.
-//
 package os
 
 import (
 	"errors"
 	"internal/poll"
+	"internal/safefilepath"
 	"internal/testlog"
 	"io"
+	"io/fs"
 	"runtime"
 	"syscall"
 	"time"
+	"unsafe"
 )
 
 // Name returns the name of the file as presented to Open.
@@ -106,7 +108,7 @@ func (e *LinkError) Unwrap() error {
 	return e.Err
 }
 
-// Read reads up to len(b) bytes from the File.
+// Read reads up to len(b) bytes from the File and stores them in b.
 // It returns the number of bytes read and any error encountered.
 // At end of file, Read returns 0, io.EOF.
 func (f *File) Read(b []byte) (n int, err error) {
@@ -127,7 +129,7 @@ func (f *File) ReadAt(b []byte, off int64) (n int, err error) {
 	}
 
 	if off < 0 {
-		return 0, &PathError{"readat", f.name, errors.New("negative offset")}
+		return 0, &PathError{Op: "readat", Path: f.name, Err: errors.New("negative offset")}
 	}
 
 	for len(b) > 0 {
@@ -143,7 +145,27 @@ func (f *File) ReadAt(b []byte, off int64) (n int, err error) {
 	return
 }
 
-// Write writes len(b) bytes to the File.
+// ReadFrom implements io.ReaderFrom.
+func (f *File) ReadFrom(r io.Reader) (n int64, err error) {
+	if err := f.checkValid("write"); err != nil {
+		return 0, err
+	}
+	n, handled, e := f.readFrom(r)
+	if !handled {
+		return genericReadFrom(f, r) // without wrapping
+	}
+	return n, f.wrapErr("write", e)
+}
+
+func genericReadFrom(f *File, r io.Reader) (int64, error) {
+	return io.Copy(onlyWriter{f}, r)
+}
+
+type onlyWriter struct {
+	io.Writer
+}
+
+// Write writes len(b) bytes from b to the File.
 // It returns the number of bytes written and an error, if any.
 // Write returns a non-nil error when n != len(b).
 func (f *File) Write(b []byte) (n int, err error) {
@@ -183,7 +205,7 @@ func (f *File) WriteAt(b []byte, off int64) (n int, err error) {
 	}
 
 	if off < 0 {
-		return 0, &PathError{"writeat", f.name, errors.New("negative offset")}
+		return 0, &PathError{Op: "writeat", Path: f.name, Err: errors.New("negative offset")}
 	}
 
 	for len(b) > 0 {
@@ -204,10 +226,6 @@ func (f *File) WriteAt(b []byte, off int64) (n int, err error) {
 // relative to the current offset, and 2 means relative to the end.
 // It returns the new offset and an error, if any.
 // The behavior of Seek on a file opened with O_APPEND is not specified.
-//
-// If f is a directory, the behavior of Seek varies by operating
-// system; you can seek to the beginning of the directory on Unix-like
-// operating systems, but not on Windows.
 func (f *File) Seek(offset int64, whence int) (ret int64, err error) {
 	if err := f.checkValid("seek"); err != nil {
 		return 0, err
@@ -225,20 +243,21 @@ func (f *File) Seek(offset int64, whence int) (ret int64, err error) {
 // WriteString is like Write, but writes the contents of string s rather than
 // a slice of bytes.
 func (f *File) WriteString(s string) (n int, err error) {
-	return f.Write([]byte(s))
+	b := unsafe.Slice(unsafe.StringData(s), len(s))
+	return f.Write(b)
 }
 
 // Mkdir creates a new directory with the specified name and permission
 // bits (before umask).
 // If there is an error, it will be of type *PathError.
 func Mkdir(name string, perm FileMode) error {
-	if runtime.GOOS == "windows" && isWindowsNulName(name) {
-		return &PathError{"mkdir", name, syscall.ENOTDIR}
-	}
-	e := syscall.Mkdir(fixLongPath(name), syscallMode(perm))
+	longName := fixLongPath(name)
+	e := ignoringEINTR(func() error {
+		return syscall.Mkdir(longName, syscallMode(perm))
+	})
 
 	if e != nil {
-		return &PathError{"mkdir", name, e}
+		return &PathError{Op: "mkdir", Path: name, Err: e}
 	}
 
 	// mkdir(2) itself won't handle the sticky bit on *BSD and Solaris
@@ -268,7 +287,7 @@ func setStickyBit(name string) error {
 func Chdir(dir string) error {
 	if e := syscall.Chdir(dir); e != nil {
 		testlog.Open(dir) // observe likely non-existent directory
-		return &PathError{"chdir", dir, e}
+		return &PathError{Op: "chdir", Path: dir, Err: e}
 	}
 	if log := testlog.Logger(); log != nil {
 		wd, err := Getwd()
@@ -319,6 +338,7 @@ var lstat = Lstat
 // Rename renames (moves) oldpath to newpath.
 // If newpath already exists and is not a directory, Rename replaces it.
 // OS-specific restrictions may apply when oldpath and newpath are in different directories.
+// Even within the same directory, on non-Unix platforms Rename is not an atomic operation.
 // If there is an error, it will be of type *LinkError.
 func Rename(oldpath, newpath string) error {
 	return rename(oldpath, newpath)
@@ -343,7 +363,7 @@ func (f *File) wrapErr(op string, err error) error {
 	if err == poll.ErrFileClosing {
 		err = ErrClosed
 	}
-	return &PathError{op, f.name, err}
+	return &PathError{Op: op, Path: f.name, Err: err}
 }
 
 // TempDir returns the default directory to use for temporary files.
@@ -364,7 +384,7 @@ func TempDir() string {
 // within this one and use that.
 //
 // On Unix systems, it returns $XDG_CACHE_HOME as specified by
-// https://standards.freedesktop.org/basedir-spec/basedir-spec-latest.html if
+// https://specifications.freedesktop.org/basedir-spec/basedir-spec-latest.html if
 // non-empty, else $HOME/.cache.
 // On Darwin, it returns $HOME/Library/Caches.
 // On Windows, it returns %LocalAppData%.
@@ -382,7 +402,7 @@ func UserCacheDir() (string, error) {
 			return "", errors.New("%LocalAppData% is not defined")
 		}
 
-	case "darwin":
+	case "darwin", "ios":
 		dir = Getenv("HOME")
 		if dir == "" {
 			return "", errors.New("$HOME is not defined")
@@ -433,7 +453,7 @@ func UserConfigDir() (string, error) {
 			return "", errors.New("%AppData% is not defined")
 		}
 
-	case "darwin":
+	case "darwin", "ios":
 		dir = Getenv("HOME")
 		if dir == "" {
 			return "", errors.New("$HOME is not defined")
@@ -466,6 +486,9 @@ func UserConfigDir() (string, error) {
 // On Unix, including macOS, it returns the $HOME environment variable.
 // On Windows, it returns %USERPROFILE%.
 // On Plan 9, it returns the $home environment variable.
+//
+// If the expected variable is not set in the environment, UserHomeDir
+// returns either a platform-specific default value or a non-nil error.
 func UserHomeDir() (string, error) {
 	env, enverr := "HOME", "$HOME"
 	switch runtime.GOOS {
@@ -481,10 +504,8 @@ func UserHomeDir() (string, error) {
 	switch runtime.GOOS {
 	case "android":
 		return "/sdcard", nil
-	case "darwin":
-		if runtime.GOARCH == "arm" || runtime.GOARCH == "arm64" {
-			return "/", nil
-		}
+	case "ios":
+		return "/", nil
 	}
 	return "", errors.New(enverr + " is not defined")
 }
@@ -526,10 +547,12 @@ func (f *File) Chmod(mode FileMode) error { return f.chmod(mode) }
 // After a deadline has been exceeded, the connection can be refreshed
 // by setting a deadline in the future.
 //
-// An error returned after a timeout fails will implement the
-// Timeout method, and calling the Timeout method will return true.
-// The PathError and SyscallError types implement the Timeout method.
-// In general, call IsTimeout to test whether an error indicates a timeout.
+// If the deadline is exceeded a call to Read or Write or to other I/O
+// methods will return an error that wraps ErrDeadlineExceeded.
+// This can be tested using errors.Is(err, os.ErrDeadlineExceeded).
+// That error implements the Timeout method, and calling the Timeout
+// method will return true, but there are other possible errors for which
+// the Timeout will return true even if the deadline has not been exceeded.
 //
 // An idle timeout can be implemented by repeatedly extending
 // the deadline after successful Read or Write calls.
@@ -566,20 +589,145 @@ func (f *File) SyscallConn() (syscall.RawConn, error) {
 	return newRawConn(f)
 }
 
-// isWindowsNulName reports whether name is os.DevNull ('NUL') on Windows.
-// True is returned if name is 'NUL' whatever the case.
-func isWindowsNulName(name string) bool {
-	if len(name) != 3 {
-		return false
+// DirFS returns a file system (an fs.FS) for the tree of files rooted at the directory dir.
+//
+// Note that DirFS("/prefix") only guarantees that the Open calls it makes to the
+// operating system will begin with "/prefix": DirFS("/prefix").Open("file") is the
+// same as os.Open("/prefix/file"). So if /prefix/file is a symbolic link pointing outside
+// the /prefix tree, then using DirFS does not stop the access any more than using
+// os.Open does. Additionally, the root of the fs.FS returned for a relative path,
+// DirFS("prefix"), will be affected by later calls to Chdir. DirFS is therefore not
+// a general substitute for a chroot-style security mechanism when the directory tree
+// contains arbitrary content.
+//
+// The directory dir must not be "".
+//
+// The result implements fs.StatFS.
+func DirFS(dir string) fs.FS {
+	return dirFS(dir)
+}
+
+// containsAny reports whether any bytes in chars are within s.
+func containsAny(s, chars string) bool {
+	for i := 0; i < len(s); i++ {
+		for j := 0; j < len(chars); j++ {
+			if s[i] == chars[j] {
+				return true
+			}
+		}
 	}
-	if name[0] != 'n' && name[0] != 'N' {
-		return false
+	return false
+}
+
+type dirFS string
+
+func (dir dirFS) Open(name string) (fs.File, error) {
+	fullname, err := dir.join(name)
+	if err != nil {
+		return nil, &PathError{Op: "stat", Path: name, Err: err}
 	}
-	if name[1] != 'u' && name[1] != 'U' {
-		return false
+	f, err := Open(fullname)
+	if err != nil {
+		// DirFS takes a string appropriate for GOOS,
+		// while the name argument here is always slash separated.
+		// dir.join will have mixed the two; undo that for
+		// error reporting.
+		err.(*PathError).Path = name
+		return nil, err
 	}
-	if name[2] != 'l' && name[2] != 'L' {
-		return false
+	return f, nil
+}
+
+func (dir dirFS) Stat(name string) (fs.FileInfo, error) {
+	fullname, err := dir.join(name)
+	if err != nil {
+		return nil, &PathError{Op: "stat", Path: name, Err: err}
 	}
-	return true
+	f, err := Stat(fullname)
+	if err != nil {
+		// See comment in dirFS.Open.
+		err.(*PathError).Path = name
+		return nil, err
+	}
+	return f, nil
+}
+
+// join returns the path for name in dir.
+func (dir dirFS) join(name string) (string, error) {
+	if dir == "" {
+		return "", errors.New("os: DirFS with empty root")
+	}
+	if !fs.ValidPath(name) {
+		return "", ErrInvalid
+	}
+	name, err := safefilepath.FromFS(name)
+	if err != nil {
+		return "", ErrInvalid
+	}
+	if IsPathSeparator(dir[len(dir)-1]) {
+		return string(dir) + name, nil
+	}
+	return string(dir) + string(PathSeparator) + name, nil
+}
+
+// ReadFile reads the named file and returns the contents.
+// A successful call returns err == nil, not err == EOF.
+// Because ReadFile reads the whole file, it does not treat an EOF from Read
+// as an error to be reported.
+func ReadFile(name string) ([]byte, error) {
+	f, err := Open(name)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	var size int
+	if info, err := f.Stat(); err == nil {
+		size64 := info.Size()
+		if int64(int(size64)) == size64 {
+			size = int(size64)
+		}
+	}
+	size++ // one byte for final read at EOF
+
+	// If a file claims a small size, read at least 512 bytes.
+	// In particular, files in Linux's /proc claim size 0 but
+	// then do not work right if read in small pieces,
+	// so an initial read of 1 byte would not work correctly.
+	if size < 512 {
+		size = 512
+	}
+
+	data := make([]byte, 0, size)
+	for {
+		if len(data) >= cap(data) {
+			d := append(data[:cap(data)], 0)
+			data = d[:len(data)]
+		}
+		n, err := f.Read(data[len(data):cap(data)])
+		data = data[:len(data)+n]
+		if err != nil {
+			if err == io.EOF {
+				err = nil
+			}
+			return data, err
+		}
+	}
+}
+
+// WriteFile writes data to the named file, creating it if necessary.
+// If the file does not exist, WriteFile creates it with permissions perm (before umask);
+// otherwise WriteFile truncates it before writing, without changing permissions.
+// Since Writefile requires multiple system calls to complete, a failure mid-operation
+// can leave the file in a partially written state.
+func WriteFile(name string, data []byte, perm FileMode) error {
+	f, err := OpenFile(name, O_WRONLY|O_CREATE|O_TRUNC, perm)
+	if err != nil {
+		return err
+	}
+	_, err = f.Write(data)
+	if err1 := f.Close(); err1 != nil && err == nil {
+		err = err1
+	}
+	return err
 }

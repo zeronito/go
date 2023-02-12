@@ -10,9 +10,10 @@ import (
 	"image"
 	"image/color"
 	"image/png"
-	"io/ioutil"
+	"io"
 	"math/rand"
 	"os"
+	"strings"
 	"testing"
 )
 
@@ -82,7 +83,7 @@ func TestUnscaledQuant(t *testing.T) {
 	}
 	if bad {
 		names := [nQuantIndex]string{"Luminance", "Chrominance"}
-		buf := &bytes.Buffer{}
+		buf := &strings.Builder{}
 		for i, name := range names {
 			fmt.Fprintf(buf, "// %s.\n{\n", name)
 			for zig := 0; zig < blockSize; zig++ {
@@ -261,7 +262,7 @@ func BenchmarkEncodeRGBA(b *testing.B) {
 	b.ResetTimer()
 	options := &Options{Quality: 90}
 	for i := 0; i < b.N; i++ {
-		Encode(ioutil.Discard, img, options)
+		Encode(io.Discard, img, options)
 	}
 }
 
@@ -283,6 +284,6 @@ func BenchmarkEncodeYCbCr(b *testing.B) {
 	b.ResetTimer()
 	options := &Options{Quality: 90}
 	for i := 0; i < b.N; i++ {
-		Encode(ioutil.Discard, img, options)
+		Encode(io.Discard, img, options)
 	}
 }

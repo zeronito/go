@@ -6,7 +6,7 @@ package multipart
 
 import (
 	"bytes"
-	"io/ioutil"
+	"io"
 	"mime"
 	"net/textproto"
 	"strings"
@@ -51,7 +51,7 @@ func TestWriter(t *testing.T) {
 	if g, e := part.FormName(), "myfile"; g != e {
 		t.Errorf("part 1: want form name %q, got %q", e, g)
 	}
-	slurp, err := ioutil.ReadAll(part)
+	slurp, err := io.ReadAll(part)
 	if err != nil {
 		t.Fatalf("part 1: ReadAll: %v", err)
 	}
@@ -66,7 +66,7 @@ func TestWriter(t *testing.T) {
 	if g, e := part.FormName(), "key"; g != e {
 		t.Errorf("part 2: want form name %q, got %q", e, g)
 	}
-	slurp, err = ioutil.ReadAll(part)
+	slurp, err = io.ReadAll(part)
 	if err != nil {
 		t.Fatalf("part 2: ReadAll: %v", err)
 	}
@@ -98,7 +98,7 @@ func TestWriterSetBoundary(t *testing.T) {
 		{"(boundary)", true},
 	}
 	for i, tt := range tests {
-		var b bytes.Buffer
+		var b strings.Builder
 		w := NewWriter(&b)
 		err := w.SetBoundary(tt.b)
 		got := err == nil
@@ -134,7 +134,7 @@ func TestWriterBoundaryGoroutines(t *testing.T) {
 	// different goroutines. This was previously broken by
 	// https://codereview.appspot.com/95760043/ and reverted in
 	// https://codereview.appspot.com/117600043/
-	w := NewWriter(ioutil.Discard)
+	w := NewWriter(io.Discard)
 	done := make(chan int)
 	go func() {
 		w.CreateFormField("foo")
@@ -145,7 +145,7 @@ func TestWriterBoundaryGoroutines(t *testing.T) {
 }
 
 func TestSortedHeader(t *testing.T) {
-	var buf bytes.Buffer
+	var buf strings.Builder
 	w := NewWriter(&buf)
 	if err := w.SetBoundary("MIMEBOUNDARY"); err != nil {
 		t.Fatalf("Error setting mime boundary: %v", err)

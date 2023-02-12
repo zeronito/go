@@ -11,7 +11,7 @@
 
 package foo
 
-func f(buf []byte) []byte { // ERROR "leaking param: buf to result ~r1 level=0$"
+func f(buf []byte) []byte { // ERROR "leaking param: buf to result ~r0 level=0$"
 	return buf
 }
 
@@ -50,5 +50,5 @@ func bar() {
 	f := prototype
 	f = func(ss []string) { got = append(got, ss) } // ERROR "leaking param: ss" "func literal does not escape"
 	s := "string"
-	f([]string{s}) // ERROR "\[\]string literal escapes to heap"
+	f([]string{s}) // ERROR "\[\]string{...} escapes to heap"
 }

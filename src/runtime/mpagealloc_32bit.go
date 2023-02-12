@@ -2,22 +2,19 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// +build 386 arm mips mipsle wasm darwin,arm64
+//go:build 386 || arm || mips || mipsle || wasm
 
 // wasm is a treated as a 32-bit architecture for the purposes of the page
 // allocator, even though it has 64-bit pointers. This is because any wasm
 // pointer always has its top 32 bits as zero, so the effective heap address
 // space is only 2^32 bytes in size (see heapAddrBits).
 
-// darwin/arm64 is treated as a 32-bit architecture for the purposes of the
-// page allocator, even though it has 64-bit pointers and a 33-bit address
-// space (see heapAddrBits). The 33 bit address space cannot be rounded up
-// to 64 bits because there are too many summary levels to fit in just 33
-// bits.
-
 package runtime
 
-import "unsafe"
+import (
+	"runtime/internal/atomic"
+	"unsafe"
+)
 
 const (
 	// The number of levels in the radix tree.
@@ -59,8 +56,12 @@ var levelLogPages = [summaryLevels]uint{
 	logPallocChunkPages,
 }
 
+// scavengeIndexArray is the backing store for p.scav.index.chunks.
+// On 32-bit platforms, it's small enough to just be a global.
+var scavengeIndexArray [((1 << heapAddrBits) / pallocChunkBytes) / 8]atomic.Uint8
+
 // See mpagealloc_64bit.go for details.
-func (s *pageAlloc) sysInit() {
+func (p *pageAlloc) sysInit() {
 	// Calculate how much memory all our entries will take up.
 	//
 	// This should be around 12 KiB or less.
@@ -76,8 +77,9 @@ func (s *pageAlloc) sysInit() {
 		throw("failed to reserve page summary memory")
 	}
 	// There isn't much. Just map it and mark it as used immediately.
-	sysMap(reservation, totalSize, s.sysStat)
-	sysUsed(reservation, totalSize)
+	sysMap(reservation, totalSize, p.sysStat)
+	sysUsed(reservation, totalSize, totalSize)
+	p.summaryMappedReady += totalSize
 
 	// Iterate over the reservation and cut it up into slices.
 	//
@@ -88,29 +90,32 @@ func (s *pageAlloc) sysInit() {
 
 		// Put this reservation into a slice.
 		sl := notInHeapSlice{(*notInHeap)(reservation), 0, entries}
-		s.summary[l] = *(*[]pallocSum)(unsafe.Pointer(&sl))
+		p.summary[l] = *(*[]pallocSum)(unsafe.Pointer(&sl))
 
 		reservation = add(reservation, uintptr(entries)*pallocSumBytes)
 	}
+
+	// Set up the scavenge index.
+	p.scav.index.chunks = scavengeIndexArray[:]
 }
 
 // See mpagealloc_64bit.go for details.
-func (s *pageAlloc) sysGrow(base, limit uintptr) {
+func (p *pageAlloc) sysGrow(base, limit uintptr) {
 	if base%pallocChunkBytes != 0 || limit%pallocChunkBytes != 0 {
 		print("runtime: base = ", hex(base), ", limit = ", hex(limit), "\n")
 		throw("sysGrow bounds not aligned to pallocChunkBytes")
 	}
 
 	// Walk up the tree and update the summary slices.
-	for l := len(s.summary) - 1; l >= 0; l-- {
+	for l := len(p.summary) - 1; l >= 0; l-- {
 		// Figure out what part of the summary array this new address space needs.
 		// Note that we need to align the ranges to the block width (1<<levelBits[l])
 		// at this level because the full block is needed to compute the summary for
 		// the next level.
 		lo, hi := addrsToSummaryRange(l, base, limit)
 		_, hi = blockAlignSummaryRange(l, lo, hi)
-		if hi > len(s.summary[l]) {
-			s.summary[l] = s.summary[l][:hi]
+		if hi > len(p.summary[l]) {
+			p.summary[l] = p.summary[l][:hi]
 		}
 	}
 }

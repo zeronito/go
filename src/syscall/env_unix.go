@@ -2,13 +2,16 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// +build aix darwin dragonfly freebsd js,wasm linux netbsd openbsd solaris
+//go:build unix || (js && wasm) || plan9
 
 // Unix environment variables.
 
 package syscall
 
-import "sync"
+import (
+	"runtime"
+	"sync"
+)
 
 var (
 	// envOnce guards initialization by copyenv, which populates env.
@@ -27,11 +30,6 @@ var (
 )
 
 func runtime_envs() []string // in package runtime
-
-// setenv_c and unsetenv_c are provided by the runtime but are no-ops
-// if cgo isn't loaded.
-func setenv_c(k, v string)
-func unsetenv_c(k string)
 
 func copyenv() {
 	env = make(map[string]int)
@@ -64,7 +62,7 @@ func Unsetenv(key string) error {
 		envs[i] = ""
 		delete(env, key)
 	}
-	unsetenv_c(key)
+	runtimeUnsetenv(key)
 	return nil
 }
 
@@ -100,9 +98,12 @@ func Setenv(key, value string) error {
 			return EINVAL
 		}
 	}
-	for i := 0; i < len(value); i++ {
-		if value[i] == 0 {
-			return EINVAL
+	// On Plan 9, null is used as a separator, eg in $path.
+	if runtime.GOOS != "plan9" {
+		for i := 0; i < len(value); i++ {
+			if value[i] == 0 {
+				return EINVAL
+			}
 		}
 	}
 
@@ -118,7 +119,7 @@ func Setenv(key, value string) error {
 		envs = append(envs, kv)
 	}
 	env[key] = i
-	setenv_c(key, value)
+	runtimeSetenv(key, value)
 	return nil
 }
 
@@ -129,7 +130,7 @@ func Clearenv() {
 	defer envLock.Unlock()
 
 	for k := range env {
-		unsetenv_c(k)
+		runtimeUnsetenv(k)
 	}
 	env = make(map[string]int)
 	envs = []string{}

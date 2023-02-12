@@ -9,7 +9,6 @@ import (
 	"bytes"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/url"
 	"reflect"
 	"strings"
@@ -417,7 +416,7 @@ func TestReadRequest(t *testing.T) {
 		req.Body = nil
 		testName := fmt.Sprintf("Test %d (%q)", i, tt.Raw)
 		diff(t, testName, req, tt.Req)
-		var bout bytes.Buffer
+		var bout strings.Builder
 		if rbody != nil {
 			_, err := io.Copy(&bout, rbody)
 			if err != nil {
@@ -451,24 +450,25 @@ Content-Length: 3
 Content-Length: 4
 
 abc`)},
-	{"smuggle_content_len_head", reqBytes(`HEAD / HTTP/1.1
+	{"smuggle_two_content_len_head", reqBytes(`HEAD / HTTP/1.1
 Host: foo
-Content-Length: 5`)},
+Content-Length: 4
+Content-Length: 5
+
+1234`)},
 
 	// golang.org/issue/22464
-	{"leading_space_in_header", reqBytes(`HEAD / HTTP/1.1
- Host: foo
-Content-Length: 5`)},
-	{"leading_tab_in_header", reqBytes(`HEAD / HTTP/1.1
-\tHost: foo
-Content-Length: 5`)},
+	{"leading_space_in_header", reqBytes(`GET / HTTP/1.1
+ Host: foo`)},
+	{"leading_tab_in_header", reqBytes(`GET / HTTP/1.1
+` + "\t" + `Host: foo`)},
 }
 
 func TestReadRequest_Bad(t *testing.T) {
 	for _, tt := range badRequestTests {
 		got, err := ReadRequest(bufio.NewReader(bytes.NewReader(tt.req)))
 		if err == nil {
-			all, err := ioutil.ReadAll(got.Body)
+			all, err := io.ReadAll(got.Body)
 			t.Errorf("%s: got unexpected request = %#v\n  Body = %q, %v", tt.name, got, all, err)
 		}
 	}

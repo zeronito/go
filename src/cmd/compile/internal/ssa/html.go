@@ -28,18 +28,23 @@ type HTMLWriter struct {
 }
 
 func NewHTMLWriter(path string, f *Func, cfgMask string) *HTMLWriter {
+	path = strings.Replace(path, "/", string(filepath.Separator), -1)
 	out, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
 	if err != nil {
 		f.Fatalf("%v", err)
 	}
-	pwd, err := os.Getwd()
-	if err != nil {
-		f.Fatalf("%v", err)
+	reportPath := path
+	if !filepath.IsAbs(reportPath) {
+		pwd, err := os.Getwd()
+		if err != nil {
+			f.Fatalf("%v", err)
+		}
+		reportPath = filepath.Join(pwd, path)
 	}
 	html := HTMLWriter{
 		w:    out,
 		Func: f,
-		path: filepath.Join(pwd, path),
+		path: reportPath,
 		dot:  newDotWriter(cfgMask),
 	}
 	html.start()
@@ -119,7 +124,8 @@ td.collapsed {
 }
 
 td.collapsed div {
-    /* TODO: Flip the direction of the phase's title 90 degrees on a collapsed column. */
+    text-align: right;
+    transform: rotate(180deg);
     writing-mode: vertical-lr;
     white-space: pre;
 }
@@ -143,6 +149,7 @@ pre {
     float: left;
     overflow: hidden;
     text-align: right;
+    margin-top: 7px;
 }
 
 .lines div {
@@ -356,6 +363,21 @@ body.darkmode ellipse.outline-black { outline: gray solid 2px; }
 </style>
 
 <script type="text/javascript">
+
+// Contains phase names which are expanded by default. Other columns are collapsed.
+let expandedDefault = [
+    "start",
+    "deadcode",
+    "opt",
+    "lower",
+    "late-deadcode",
+    "regalloc",
+    "genssa",
+];
+if (history.state === null) {
+    history.pushState({expandedDefault}, "", location.href);
+}
+
 // ordered list of all available highlight colors
 var highlights = [
     "highlight-aquamarine",
@@ -400,6 +422,9 @@ for (var i = 0; i < outlines.length; i++) {
 }
 
 window.onload = function() {
+    if (history.state !== null) {
+        expandedDefault = history.state.expandedDefault;
+    }
     if (window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches) {
         toggleDarkMode();
         document.getElementById("dark-mode-button").checked = true;
@@ -407,9 +432,6 @@ window.onload = function() {
 
     var ssaElemClicked = function(elem, event, selections, selected) {
         event.stopPropagation();
-
-        // TODO: pushState with updated state and read it on page load,
-        // so that state can survive across reloads
 
         // find all values with the same name
         var c = elem.classList.item(0);
@@ -488,21 +510,18 @@ window.onload = function() {
         lines[i].addEventListener('click', ssaValueClicked);
     }
 
-    // Contains phase names which are expanded by default. Other columns are collapsed.
-    var expandedDefault = [
-        "start",
-        "deadcode",
-        "opt",
-        "lower",
-        "late-deadcode",
-        "regalloc",
-        "genssa",
-    ];
 
     function toggler(phase) {
         return function() {
             toggle_cell(phase+'-col');
             toggle_cell(phase+'-exp');
+            const i = expandedDefault.indexOf(phase);
+            if (i !== -1) {
+                expandedDefault.splice(i, 1);
+            } else {
+                expandedDefault.push(phase);
+            }
+            history.pushState({expandedDefault}, "", location.href);
         };
     }
 
@@ -530,9 +549,13 @@ window.onload = function() {
             const len = combined.length;
             if (len > 1) {
                 for (let i = 0; i < len; i++) {
-                    if (expandedDefault.indexOf(combined[i]) !== -1) {
-                        show = true;
-                        break;
+                    const num = expandedDefault.indexOf(combined[i]);
+                    if (num !== -1) {
+                        expandedDefault.splice(num, 1);
+                        if (expandedDefault.indexOf(phase) === -1) {
+                            expandedDefault.push(phase);
+                            show = true;
+                        }
                     }
                 }
             }
@@ -825,7 +848,7 @@ func (w *HTMLWriter) WriteSources(phase string, all []*FuncLines) {
 	if w == nil {
 		return // avoid generating HTML just to discard it
 	}
-	var buf bytes.Buffer
+	var buf strings.Builder
 	fmt.Fprint(&buf, "<div class=\"lines\" style=\"width: 8%\">")
 	filename := ""
 	for _, fl := range all {
@@ -867,7 +890,7 @@ func (w *HTMLWriter) WriteAST(phase string, buf *bytes.Buffer) {
 		return // avoid generating HTML just to discard it
 	}
 	lines := strings.Split(buf.String(), "\n")
-	var out bytes.Buffer
+	var out strings.Builder
 
 	fmt.Fprint(&out, "<div>")
 	for _, l := range lines {
@@ -880,15 +903,12 @@ func (w *HTMLWriter) WriteAST(phase string, buf *bytes.Buffer) {
 			if strings.HasPrefix(l, "buildssa") {
 				escaped = fmt.Sprintf("<b>%v</b>", l)
 			} else {
-				// Parse the line number from the format l(123).
-				idx := strings.Index(l, " l(")
-				if idx != -1 {
-					subl := l[idx+3:]
-					idxEnd := strings.Index(subl, ")")
-					if idxEnd != -1 {
-						if _, err := strconv.Atoi(subl[:idxEnd]); err == nil {
-							lineNo = subl[:idxEnd]
-						}
+				// Parse the line number from the format file:line:col.
+				// See the implementation in ir/fmt.go:dumpNodeHeader.
+				sl := strings.Split(l, ":")
+				if len(sl) >= 3 {
+					if _, err := strconv.Atoi(sl[len(sl)-2]); err == nil {
+						lineNo = sl[len(sl)-2]
 					}
 				}
 				escaped = html.EscapeString(l)
@@ -974,6 +994,9 @@ func (v *Value) LongHTML() string {
 	if int(v.ID) < len(r) && r[v.ID] != nil {
 		s += " : " + html.EscapeString(r[v.ID].String())
 	}
+	if reg := v.Block.Func.tempRegs[v.ID]; reg != nil {
+		s += " tmp=" + reg.String()
+	}
 	var names []string
 	for name, values := range v.Block.Func.NamedValues {
 		for _, value := range values {
@@ -1033,7 +1056,7 @@ func (b *Block) LongHTML() string {
 }
 
 func (f *Func) HTML(phase string, dot *dotWriter) string {
-	buf := new(bytes.Buffer)
+	buf := new(strings.Builder)
 	if dot != nil {
 		dot.writeFuncSVG(buf, phase, f)
 	}
@@ -1041,7 +1064,7 @@ func (f *Func) HTML(phase string, dot *dotWriter) string {
 	p := htmlFuncPrinter{w: buf}
 	fprintFunc(p, f)
 
-	// fprintFunc(&buf, f) // TODO: HTML, not text, <br /> for line breaks, etc.
+	// fprintFunc(&buf, f) // TODO: HTML, not text, <br> for line breaks, etc.
 	fmt.Fprint(buf, "</code>")
 	return buf.String()
 }
@@ -1062,7 +1085,7 @@ func (d *dotWriter) writeFuncSVG(w io.Writer, phase string, f *Func) {
 	}
 	buf := new(bytes.Buffer)
 	cmd.Stdout = buf
-	bufErr := new(bytes.Buffer)
+	bufErr := new(strings.Builder)
 	cmd.Stderr = bufErr
 	err = cmd.Start()
 	if err != nil {
@@ -1198,7 +1221,7 @@ func (p htmlFuncPrinter) startBlock(b *Block, reachable bool) {
 	}
 }
 
-func (p htmlFuncPrinter) endBlock(b *Block) {
+func (p htmlFuncPrinter) endBlock(b *Block, reachable bool) {
 	if len(b.Values) > 0 { // end list of values
 		io.WriteString(p.w, "</ul>")
 		io.WriteString(p.w, "</li>")

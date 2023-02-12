@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// +build aix darwin netbsd openbsd plan9 solaris windows
+//go:build aix || darwin || netbsd || openbsd || plan9 || solaris || windows
 
 package runtime
 
@@ -23,7 +23,6 @@ import (
 //
 //	func semawakeup(mp *m)
 //		Wake up mp, which is or will soon be sleeping on its semaphore.
-//
 const (
 	locked uintptr = 1
 
@@ -33,6 +32,10 @@ const (
 )
 
 func lock(l *mutex) {
+	lockWithRank(l, getLockRank(l))
+}
+
+func lock2(l *mutex) {
 	gp := getg()
 	if gp.m.locks < 0 {
 		throw("runtime·lock: lock count")
@@ -89,9 +92,14 @@ Loop:
 	}
 }
 
-//go:nowritebarrier
-// We might not be holding a p in this code.
 func unlock(l *mutex) {
+	unlockWithRank(l)
+}
+
+// We might not be holding a p in this code.
+//
+//go:nowritebarrier
+func unlock2(l *mutex) {
 	gp := getg()
 	var mp *m
 	for {
@@ -276,7 +284,7 @@ func notetsleep(n *note, ns int64) bool {
 }
 
 // same as runtime·notetsleep, but called on user g (not g0)
-// calls only nosplit functions between entersyscallblock/exitsyscall
+// calls only nosplit functions between entersyscallblock/exitsyscall.
 func notetsleepg(n *note, ns int64) bool {
 	gp := getg()
 	if gp == gp.m.g0 {
@@ -289,8 +297,8 @@ func notetsleepg(n *note, ns int64) bool {
 	return ok
 }
 
-func beforeIdle(int64) bool {
-	return false
+func beforeIdle(int64, int64) (*g, bool) {
+	return nil, false
 }
 
 func checkTimeouts() {}

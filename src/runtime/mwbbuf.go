@@ -23,8 +23,8 @@
 package runtime
 
 import (
+	"internal/goarch"
 	"runtime/internal/atomic"
-	"runtime/internal/sys"
 	"unsafe"
 )
 
@@ -57,12 +57,6 @@ type wbBuf struct {
 	// on. This must be a multiple of wbBufEntryPointers because
 	// the write barrier only checks for overflow once per entry.
 	buf [wbBufEntryPointers * wbBufEntries]uintptr
-
-	// debugGen causes the write barrier buffer to flush after
-	// every write barrier if equal to gcWorkPauseGen. This is for
-	// debugging #27993. This is only set if debugCachedWork is
-	// set.
-	debugGen uint32
 }
 
 const (
@@ -86,7 +80,7 @@ const (
 func (b *wbBuf) reset() {
 	start := uintptr(unsafe.Pointer(&b.buf[0]))
 	b.next = start
-	if writeBarrier.cgo || (debugCachedWork && (throwOnGCWork || b.debugGen == atomic.Load(&gcWorkPauseGen))) {
+	if writeBarrier.cgo {
 		// Effectively disable the buffer by forcing a flush
 		// on every barrier.
 		b.end = uintptr(unsafe.Pointer(&b.buf[wbBufEntryPointers]))
@@ -122,11 +116,11 @@ func (b *wbBuf) empty() bool {
 // putFast adds old and new to the write barrier buffer and returns
 // false if a flush is necessary. Callers should use this as:
 //
-//     buf := &getg().m.p.ptr().wbBuf
-//     if !buf.putFast(old, new) {
-//         wbBufFlush(...)
-//     }
-//     ... actual memory write ...
+//	buf := &getg().m.p.ptr().wbBuf
+//	if !buf.putFast(old, new) {
+//	    wbBufFlush(...)
+//	}
+//	... actual memory write ...
 //
 // The arguments to wbBufFlush depend on whether the caller is doing
 // its own cgo pointer checks. If it is, then this can be
@@ -151,7 +145,7 @@ func (b *wbBuf) putFast(old, new uintptr) bool {
 	p := (*[2]uintptr)(unsafe.Pointer(b.next))
 	p[0] = old
 	p[1] = new
-	b.next += 2 * sys.PtrSize
+	b.next += 2 * goarch.PtrSize
 	return b.next != b.end
 }
 
@@ -204,30 +198,8 @@ func wbBufFlush(dst *uintptr, src uintptr) {
 	// Switch to the system stack so we don't have to worry about
 	// the untyped stack slots or safe points.
 	systemstack(func() {
-		if debugCachedWork {
-			// For debugging, include the old value of the
-			// slot and some other data in the traceback.
-			wbBuf := &getg().m.p.ptr().wbBuf
-			var old uintptr
-			if dst != nil {
-				// dst may be nil in direct calls to wbBufFlush.
-				old = *dst
-			}
-			wbBufFlush1Debug(old, wbBuf.buf[0], wbBuf.buf[1], &wbBuf.buf[0], wbBuf.next)
-		} else {
-			wbBufFlush1(getg().m.p.ptr())
-		}
+		wbBufFlush1(getg().m.p.ptr())
 	})
-}
-
-// wbBufFlush1Debug is a temporary function for debugging issue
-// #27993. It exists solely to add some context to the traceback.
-//
-//go:nowritebarrierrec
-//go:systemstack
-//go:noinline
-func wbBufFlush1Debug(old, buf1, buf2 uintptr, start *uintptr, next uintptr) {
-	wbBufFlush1(getg().m.p.ptr())
 }
 
 // wbBufFlush1 flushes p's write barrier buffer to the GC work queue.
@@ -240,22 +212,22 @@ func wbBufFlush1Debug(old, buf1, buf2 uintptr, start *uintptr, next uintptr) {
 //
 //go:nowritebarrierrec
 //go:systemstack
-func wbBufFlush1(_p_ *p) {
+func wbBufFlush1(pp *p) {
 	// Get the buffered pointers.
-	start := uintptr(unsafe.Pointer(&_p_.wbBuf.buf[0]))
-	n := (_p_.wbBuf.next - start) / unsafe.Sizeof(_p_.wbBuf.buf[0])
-	ptrs := _p_.wbBuf.buf[:n]
+	start := uintptr(unsafe.Pointer(&pp.wbBuf.buf[0]))
+	n := (pp.wbBuf.next - start) / unsafe.Sizeof(pp.wbBuf.buf[0])
+	ptrs := pp.wbBuf.buf[:n]
 
 	// Poison the buffer to make extra sure nothing is enqueued
 	// while we're processing the buffer.
-	_p_.wbBuf.next = 0
+	pp.wbBuf.next = 0
 
 	if useCheckmark {
 		// Slow path for checkmark mode.
 		for _, ptr := range ptrs {
 			shade(ptr)
 		}
-		_p_.wbBuf.reset()
+		pp.wbBuf.reset()
 		return
 	}
 
@@ -273,7 +245,7 @@ func wbBufFlush1(_p_ *p) {
 	// could track whether any un-shaded goroutine has used the
 	// buffer, or just track globally whether there are any
 	// un-shaded stacks and flush after each stack scan.
-	gcw := &_p_.gcw
+	gcw := &pp.gcw
 	pos := 0
 	for _, ptr := range ptrs {
 		if ptr < minLegalPointer {
@@ -296,6 +268,13 @@ func wbBufFlush1(_p_ *p) {
 			continue
 		}
 		mbits.setMarked()
+
+		// Mark span.
+		arena, pageIdx, pageMask := pageIndexOf(span.base())
+		if arena.pageMarks[pageIdx]&pageMask == 0 {
+			atomic.Or8(&arena.pageMarks[pageIdx], pageMask)
+		}
+
 		if span.spanclass.noscan() {
 			gcw.bytesMarked += uint64(span.elemsize)
 			continue
@@ -307,5 +286,5 @@ func wbBufFlush1(_p_ *p) {
 	// Enqueue the greyed objects.
 	gcw.putBatch(ptrs[:pos])
 
-	_p_.wbBuf.reset()
+	pp.wbBuf.reset()
 }

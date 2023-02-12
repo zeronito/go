@@ -88,11 +88,12 @@ run="sh"
 
 case "$1" in
 -syscalls)
-	for i in zsyscall*go
+	shift
+	for i in ${@:-zsyscall*go}
 	do
 		# Run the command line that appears in the first line
 		# of the generated file to regenerate it.
-		sed 1q $i | sed 's;^// ;;' | sh > _$i && gofmt < _$i > $i
+		sed 1q $i | sed 's;^// ;./;' | sh > _$i && gofmt < _$i > $i
 		rm _$i
 	done
 	exit 0
@@ -121,33 +122,17 @@ aix_ppc64)
 	mksyscall="./mksyscall_libc.pl -aix"
 	mktypes="GOARCH=$GOARCH go tool cgo -godefs"
 	;;
-darwin_386)
-	mkerrors="$mkerrors -m32"
-	mksyscall="./mksyscall.pl -l32 -darwin"
-	mksysnum="./mksysnum_darwin.pl /usr/include/sys/syscall.h"
-	mktypes="GOARCH=$GOARCH go tool cgo -godefs"
-	mkasm="go run mkasm_darwin.go"
-	;;
 darwin_amd64)
 	mkerrors="$mkerrors -m64"
 	mksyscall="./mksyscall.pl -darwin"
-	mksysnum="./mksysnum_darwin.pl /usr/include/sys/syscall.h"
 	mktypes="GOARCH=$GOARCH go tool cgo -godefs"
-	mkasm="go run mkasm_darwin.go"
+	mkasm="go run mkasm.go"
 	;;
 darwin_arm64)
 	mkerrors="$mkerrors -m64"
 	mksyscall="./mksyscall.pl -darwin"
-	mksysnum="./mksysnum_darwin.pl /usr/include/sys/syscall.h"
 	mktypes="GOARCH=$GOARCH go tool cgo -godefs"
-	mkasm="go run mkasm_darwin.go"
-	;;
-darwin_arm)
-	mkerrors="$mkerrors -m32"
-	mksyscall="./mksyscall.pl -l32 -darwin"
-	mksysnum="./mksysnum_darwin.pl /usr/include/sys/syscall.h"
-	mktypes="GOARCH=$GOARCH go tool cgo -godefs"
-	mkasm="go run mkasm_darwin.go"
+	mkasm="go run mkasm.go"
 	;;
 dragonfly_amd64)
 	mkerrors="$mkerrors -m64"
@@ -177,6 +162,13 @@ freebsd_arm)
 freebsd_arm64)
 	mkerrors="$mkerrors"
 	mksysnum="curl -s 'http://svn.freebsd.org/base/stable/10/sys/kern/syscalls.master' | ./mksysnum_freebsd.pl"
+	# Let the type of C char be signed to make the bare syscall
+	# API consistent between platforms.
+	mktypes="GOARCH=$GOARCH go tool cgo -godefs -- -fsigned-char"
+	;;
+freebsd_riscv64)
+	mkerrors="$mkerrors"
+	mksysnum="curl -s 'https://cgit.freebsd.org/src/plain/sys/kern/syscalls.master?h=stable/12' | ./mksysnum_freebsd.pl"
 	# Let the type of C char be signed to make the bare syscall
 	# API consistent between platforms.
 	mktypes="GOARCH=$GOARCH go tool cgo -godefs -- -fsigned-char"
@@ -214,6 +206,16 @@ linux_arm64)
 	# API consistent between platforms.
 	mktypes="GOARCH=$GOARCH go tool cgo -godefs -- -fsigned-char"
 	;;
+linux_loong64)
+        GOOSARCH_in=syscall_linux_loong64.go
+        unistd_h=$(ls -1 /usr/include/asm/unistd.h /usr/include/asm-generic/unistd.h 2>/dev/null | head -1)
+        if [ "$unistd_h" = "" ]; then
+                echo >&2 cannot find unistd.h
+                exit 1
+        fi
+        mksysnum="./mksysnum_linux.pl $unistd_h"
+        mktypes="GOARCH=$GOARCH go tool cgo -godefs"
+        ;;
 linux_mips)
 	GOOSARCH_in=syscall_linux_mipsx.go
 	unistd_h=/usr/include/asm/unistd.h
@@ -299,32 +301,51 @@ netbsd_arm64)
 	mktypes="GOARCH=$GOARCH go tool cgo -godefs"
 	;;
 openbsd_386)
+	GOOSARCH_in="syscall_openbsd_libc.go syscall_openbsd_$GOARCH.go"
 	mkerrors="$mkerrors -m32"
-	mksyscall="./mksyscall.pl -l32 -openbsd"
+	mksyscall="./mksyscall.pl -l32 -openbsd -libc"
 	mksysctl="./mksysctl_openbsd.pl"
 	zsysctl="zsysctl_openbsd.go"
 	mksysnum="curl -s 'http://cvsweb.openbsd.org/cgi-bin/cvsweb/~checkout~/src/sys/kern/syscalls.master' | ./mksysnum_openbsd.pl"
 	mktypes="GOARCH=$GOARCH go tool cgo -godefs"
+	mkasm="go run mkasm.go"
 	;;
 openbsd_amd64)
+	GOOSARCH_in="syscall_openbsd_libc.go syscall_openbsd_$GOARCH.go"
 	mkerrors="$mkerrors -m64"
-	mksyscall="./mksyscall.pl -openbsd"
+	mksyscall="./mksyscall.pl -openbsd -libc"
 	mksysctl="./mksysctl_openbsd.pl"
 	zsysctl="zsysctl_openbsd.go"
 	mksysnum="curl -s 'http://cvsweb.openbsd.org/cgi-bin/cvsweb/~checkout~/src/sys/kern/syscalls.master' | ./mksysnum_openbsd.pl"
 	mktypes="GOARCH=$GOARCH go tool cgo -godefs"
+	mkasm="go run mkasm.go"
 	;;
 openbsd_arm)
+	GOOSARCH_in="syscall_openbsd_libc.go syscall_openbsd_$GOARCH.go"
 	mkerrors="$mkerrors"
-	mksyscall="./mksyscall.pl -l32 -openbsd -arm"
+	mksyscall="./mksyscall.pl -l32 -openbsd -arm -libc"
 	mksysctl="./mksysctl_openbsd.pl"
 	zsysctl="zsysctl_openbsd.go"
 	mksysnum="curl -s 'http://cvsweb.openbsd.org/cgi-bin/cvsweb/~checkout~/src/sys/kern/syscalls.master' | ./mksysnum_openbsd.pl"
 	# Let the type of C char be signed to make the bare syscall
 	# API consistent between platforms.
 	mktypes="GOARCH=$GOARCH go tool cgo -godefs -- -fsigned-char"
+	mkasm="go run mkasm.go"
 	;;
 openbsd_arm64)
+	GOOSARCH_in="syscall_openbsd_libc.go syscall_openbsd_$GOARCH.go"
+	mkerrors="$mkerrors -m64"
+	mksyscall="./mksyscall.pl -openbsd -libc"
+	mksysctl="./mksysctl_openbsd.pl"
+	zsysctl="zsysctl_openbsd.go"
+	mksysnum="curl -s 'http://cvsweb.openbsd.org/cgi-bin/cvsweb/~checkout~/src/sys/kern/syscalls.master' | ./mksysnum_openbsd.pl"
+	# Let the type of C char be signed to make the bare syscall
+	# API consistent between platforms.
+	mktypes="GOARCH=$GOARCH go tool cgo -godefs -- -fsigned-char"
+	mkasm="go run mkasm.go"
+	;;
+openbsd_mips64)
+	GOOSARCH_in="syscall_openbsd1.go syscall_openbsd_$GOARCH.go"
 	mkerrors="$mkerrors -m64"
 	mksyscall="./mksyscall.pl -openbsd"
 	mksysctl="./mksysctl_openbsd.pl"
@@ -372,5 +393,5 @@ esac
 		# Therefore, "go run" tries to recompile syscall package but ztypes is empty and it fails.
 		echo "$mktypes types_$GOOS.go |go run mkpost.go >ztypes_$GOOSARCH.go.NEW && mv ztypes_$GOOSARCH.go.NEW ztypes_$GOOSARCH.go";
 	fi
-	if [ -n "$mkasm" ]; then echo "$mkasm $GOARCH"; fi
+	if [ -n "$mkasm" ]; then echo "$mkasm $GOOS $GOARCH"; fi
 ) | $run

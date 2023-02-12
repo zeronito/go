@@ -8,9 +8,10 @@ import (
 	"bytes"
 	cmddwarf "cmd/internal/dwarf"
 	"cmd/internal/objfile"
+	"cmd/internal/quoted"
 	"debug/dwarf"
+	"internal/platform"
 	"internal/testenv"
-	"io/ioutil"
 	"os"
 	"os/exec"
 	"path"
@@ -20,6 +21,36 @@ import (
 	"testing"
 )
 
+// TestMain allows this test binary to run as a -toolexec wrapper for the 'go'
+// command. If LINK_TEST_TOOLEXEC is set, TestMain runs the binary as if it were
+// cmd/link, and otherwise runs the requested tool as a subprocess.
+//
+// This allows the test to verify the behavior of the current contents of the
+// cmd/link package even if the installed cmd/link binary is stale.
+func TestMain(m *testing.M) {
+	if os.Getenv("LINK_TEST_TOOLEXEC") == "" {
+		// Not running as a -toolexec wrapper. Just run the tests.
+		os.Exit(m.Run())
+	}
+
+	if strings.TrimSuffix(filepath.Base(os.Args[1]), ".exe") == "link" {
+		// Running as a -toolexec linker, and the tool is cmd/link.
+		// Substitute this test binary for the linker.
+		os.Args = os.Args[1:]
+		main()
+		os.Exit(0)
+	}
+
+	cmd := exec.Command(os.Args[1], os.Args[2:]...)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		os.Exit(1)
+	}
+	os.Exit(0)
+}
+
 func testDWARF(t *testing.T, buildmode string, expectDWARF bool, env ...string) {
 	testenv.MustHaveCGO(t)
 	testenv.MustHaveGoBuild(t)
@@ -28,16 +59,7 @@ func testDWARF(t *testing.T, buildmode string, expectDWARF bool, env ...string) 
 		t.Skip("skipping on plan9; no DWARF symbol table in executables")
 	}
 
-	out, err := exec.Command(testenv.GoToolPath(t), "list", "-f", "{{.Stale}}", "cmd/link").CombinedOutput()
-	if err != nil {
-		t.Fatalf("go list: %v\n%s", err, out)
-	}
-	if string(out) != "false\n" {
-		if os.Getenv("GOROOT_FINAL_OLD") != "" {
-			t.Skip("cmd/link is stale, but $GOROOT_FINAL_OLD is set")
-		}
-		t.Fatalf("cmd/link is stale - run go install cmd/link")
-	}
+	t.Parallel()
 
 	for _, prog := range []string{"testprog", "testprogcgo"} {
 		prog := prog
@@ -47,33 +69,31 @@ func testDWARF(t *testing.T, buildmode string, expectDWARF bool, env ...string) 
 			if extld == "" {
 				extld = "gcc"
 			}
-			expectDWARF, err = cmddwarf.IsDWARFEnabledOnAIXLd(extld)
+			extldArgs, err := quoted.Split(extld)
 			if err != nil {
 				t.Fatal(err)
 			}
-
+			expectDWARF, err = cmddwarf.IsDWARFEnabledOnAIXLd(extldArgs)
+			if err != nil {
+				t.Fatal(err)
+			}
 		}
 
 		t.Run(prog, func(t *testing.T) {
 			t.Parallel()
 
-			tmpDir, err := ioutil.TempDir("", "go-link-TestDWARF")
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer os.RemoveAll(tmpDir)
+			tmpDir := t.TempDir()
 
 			exe := filepath.Join(tmpDir, prog+".exe")
 			dir := "../../runtime/testdata/" + prog
-			cmd := exec.Command(testenv.GoToolPath(t), "build", "-o", exe)
+			cmd := testenv.Command(t, testenv.GoToolPath(t), "build", "-toolexec", os.Args[0], "-o", exe)
 			if buildmode != "" {
 				cmd.Args = append(cmd.Args, "-buildmode", buildmode)
 			}
 			cmd.Args = append(cmd.Args, dir)
-			if env != nil {
-				cmd.Env = append(os.Environ(), env...)
-				cmd.Env = append(cmd.Env, "CGO_CFLAGS=") // ensure CGO_CFLAGS does not contain any flags. Issue #35459
-			}
+			cmd.Env = append(os.Environ(), env...)
+			cmd.Env = append(cmd.Env, "CGO_CFLAGS=") // ensure CGO_CFLAGS does not contain any flags. Issue #35459
+			cmd.Env = append(cmd.Env, "LINK_TEST_TOOLEXEC=1")
 			out, err := cmd.CombinedOutput()
 			if err != nil {
 				t.Fatalf("go build -o %v %v: %v\n%s", exe, dir, err, out)
@@ -81,7 +101,7 @@ func testDWARF(t *testing.T, buildmode string, expectDWARF bool, env ...string) 
 
 			if buildmode == "c-archive" {
 				// Extract the archive and use the go.o object within.
-				cmd := exec.Command("ar", "-x", exe)
+				cmd := testenv.Command(t, "ar", "-x", exe)
 				cmd.Dir = tmpDir
 				if out, err := cmd.CombinedOutput(); err != nil {
 					t.Fatalf("ar -x %s: %v\n%s", exe, err, out)
@@ -89,10 +109,11 @@ func testDWARF(t *testing.T, buildmode string, expectDWARF bool, env ...string) 
 				exe = filepath.Join(tmpDir, "go.o")
 			}
 
-			if runtime.GOOS == "darwin" {
+			darwinSymbolTestIsTooFlaky := true // Turn this off, it is too flaky -- See #32218
+			if runtime.GOOS == "darwin" && !darwinSymbolTestIsTooFlaky {
 				if _, err = exec.LookPath("symbols"); err == nil {
 					// Ensure Apple's tooling can parse our object for symbols.
-					out, err = exec.Command("symbols", exe).CombinedOutput()
+					out, err = testenv.Command(t, "symbols", exe).CombinedOutput()
 					if err != nil {
 						t.Fatalf("symbols %v: %v: %s", filepath.Base(exe), err, out)
 					} else {
@@ -172,6 +193,9 @@ func TestDWARF(t *testing.T) {
 		if runtime.GOOS == "windows" {
 			t.Skip("skipping Windows/c-archive; see Issue 35512 for more.")
 		}
+		if !platform.BuildModeSupported(runtime.Compiler, "c-archive", runtime.GOOS, runtime.GOARCH) {
+			t.Skipf("skipping c-archive test on unsupported platform %s-%s", runtime.GOOS, runtime.GOARCH)
+		}
 		t.Run("c-archive", func(t *testing.T) {
 			testDWARF(t, "c-archive", true)
 		})
@@ -188,12 +212,23 @@ func TestDWARFiOS(t *testing.T) {
 	if runtime.GOARCH != "amd64" || runtime.GOOS != "darwin" {
 		t.Skip("skipping on non-darwin/amd64 platform")
 	}
-	if err := exec.Command("xcrun", "--help").Run(); err != nil {
+	if err := testenv.Command(t, "xcrun", "--help").Run(); err != nil {
 		t.Skipf("error running xcrun, required for iOS cross build: %v", err)
+	}
+	// Check to see if the ios tools are installed. It's possible to have the command line tools
+	// installed without the iOS sdk.
+	if output, err := testenv.Command(t, "xcodebuild", "-showsdks").CombinedOutput(); err != nil {
+		t.Skipf("error running xcodebuild, required for iOS cross build: %v", err)
+	} else if !strings.Contains(string(output), "iOS SDK") {
+		t.Skipf("iOS SDK not detected.")
 	}
 	cc := "CC=" + runtime.GOROOT() + "/misc/ios/clangwrap.sh"
 	// iOS doesn't allow unmapped segments, so iOS executables don't have DWARF.
-	testDWARF(t, "", false, cc, "CGO_ENABLED=1", "GOOS=darwin", "GOARCH=arm64")
+	t.Run("exe", func(t *testing.T) {
+		testDWARF(t, "", false, cc, "CGO_ENABLED=1", "GOOS=ios", "GOARCH=arm64")
+	})
 	// However, c-archive iOS objects have embedded DWARF.
-	testDWARF(t, "c-archive", true, cc, "CGO_ENABLED=1", "GOOS=darwin", "GOARCH=arm64")
+	t.Run("c-archive", func(t *testing.T) {
+		testDWARF(t, "c-archive", true, cc, "CGO_ENABLED=1", "GOOS=ios", "GOARCH=arm64")
+	})
 }

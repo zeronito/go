@@ -152,7 +152,7 @@ func (d *Data) LineReader(cu *Entry) (*LineReader, error) {
 		// cu has no line table.
 		return nil, nil
 	}
-	if off > int64(len(d.line)) {
+	if off < 0 || off > int64(len(d.line)) {
 		return nil, errors.New("AttrStmtList value out of range")
 	}
 	// AttrCompDir is optional if all file names are absolute. Use
@@ -215,7 +215,11 @@ func (r *LineReader) readHeader(compDir string) error {
 	} else {
 		headerLength = Offset(buf.uint32())
 	}
-	r.programOffset = buf.off + headerLength
+	programOffset := buf.off + headerLength
+	if programOffset > r.endOffset {
+		return DecodeError{"line", hdrOffset, fmt.Sprintf("malformed line table: program offset %d exceeds end offset %d", programOffset, r.endOffset)}
+	}
+	r.programOffset = programOffset
 	r.minInstructionLength = int(buf.uint8())
 	if r.version >= 4 {
 		// [DWARF4 6.2.4]
@@ -814,7 +818,11 @@ func pathJoin(dirname, filename string) string {
 		// Drives are the same. Ignore drive on filename.
 	}
 	if !(strings.HasSuffix(dirname, "/") || strings.HasSuffix(dirname, `\`)) && dirname != "" {
-		dirname += `\`
+		sep := `\`
+		if strings.HasPrefix(dirname, "/") {
+			sep = `/`
+		}
+		dirname += sep
 	}
 	return drive + dirname + filename
 }

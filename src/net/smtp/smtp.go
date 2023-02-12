@@ -4,15 +4,17 @@
 
 // Package smtp implements the Simple Mail Transfer Protocol as defined in RFC 5321.
 // It also implements the following extensions:
+//
 //	8BITMIME  RFC 1652
 //	AUTH      RFC 2554
 //	STARTTLS  RFC 3207
+//
 // Additional extensions may be handled by clients.
 //
 // The smtp package is frozen and is not accepting new features.
 // Some external packages provide more functionality. See:
 //
-//   https://godoc.org/?q=smtp
+//	https://godoc.org/?q=smtp
 package smtp
 
 import (
@@ -105,7 +107,7 @@ func (c *Client) Hello(localName string) error {
 }
 
 // cmd is a convenience function that sends a command and returns the response
-func (c *Client) cmd(expectCode int, format string, args ...interface{}) (int, string, error) {
+func (c *Client) cmd(expectCode int, format string, args ...any) (int, string, error) {
 	id, err := c.Text.Cmd(format, args...)
 	if err != nil {
 		return 0, "", err
@@ -136,12 +138,8 @@ func (c *Client) ehlo() error {
 	if len(extList) > 1 {
 		extList = extList[1:]
 		for _, line := range extList {
-			args := strings.SplitN(line, " ", 2)
-			if len(args) > 1 {
-				ext[args[0]] = args[1]
-			} else {
-				ext[args[0]] = ""
-			}
+			k, v, _ := strings.Cut(line, " ")
+			ext[k] = v
 		}
 	}
 	if mechs, ok := ext["AUTH"]; ok {
@@ -241,7 +239,8 @@ func (c *Client) Auth(a Auth) error {
 
 // Mail issues a MAIL command to the server using the provided email address.
 // If the server supports the 8BITMIME extension, Mail adds the BODY=8BITMIME
-// parameter.
+// parameter. If the server supports the SMTPUTF8 extension, Mail adds the
+// SMTPUTF8 parameter.
 // This initiates a mail transaction and is followed by one or more Rcpt calls.
 func (c *Client) Mail(from string) error {
 	if err := validateLine(from); err != nil {
@@ -254,6 +253,9 @@ func (c *Client) Mail(from string) error {
 	if c.ext != nil {
 		if _, ok := c.ext["8BITMIME"]; ok {
 			cmdStr += " BODY=8BITMIME"
+		}
+		if _, ok := c.ext["SMTPUTF8"]; ok {
+			cmdStr += " SMTPUTF8"
 		}
 	}
 	_, _, err := c.cmd(250, cmdStr, from)
@@ -421,7 +423,7 @@ func (c *Client) Quit() error {
 	return c.Text.Close()
 }
 
-// validateLine checks to see if a line has CR or LF as per RFC 5321
+// validateLine checks to see if a line has CR or LF as per RFC 5321.
 func validateLine(line string) error {
 	if strings.ContainsAny(line, "\n\r") {
 		return errors.New("smtp: A line must not contain CR or LF")

@@ -2,13 +2,12 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// +build js,wasm
+//go:build js && wasm
 
 package syscall
 
 import (
 	"errors"
-	"io"
 	"sync"
 	"syscall/js"
 )
@@ -456,11 +455,11 @@ func Seek(fd int, offset int64, whence int) (int64, error) {
 
 	var newPos int64
 	switch whence {
-	case io.SeekStart:
+	case 0:
 		newPos = offset
-	case io.SeekCurrent:
+	case 1:
 		newPos = f.pos + offset
-	case io.SeekEnd:
+	case 2:
 		var st Stat_t
 		if err := Fstat(fd, &st); err != nil {
 			return 0, err
@@ -492,14 +491,14 @@ func Pipe(fd []int) error {
 	return ENOSYS
 }
 
-func fsCall(name string, args ...interface{}) (js.Value, error) {
+func fsCall(name string, args ...any) (js.Value, error) {
 	type callResult struct {
 		val js.Value
 		err error
 	}
 
 	c := make(chan callResult, 1)
-	f := js.FuncOf(func(this js.Value, args []js.Value) interface{} {
+	f := js.FuncOf(func(this js.Value, args []js.Value) any {
 		var res callResult
 
 		if len(args) >= 1 { // on Node.js 8, fs.utimes calls the callback without any arguments
@@ -545,7 +544,7 @@ func recoverErr(errPtr *error) {
 	}
 }
 
-// mapJSError maps an error given by Node.js to the appropriate Go error
+// mapJSError maps an error given by Node.js to the appropriate Go error.
 func mapJSError(jsErr js.Value) error {
 	errno, ok := errnoByCode[jsErr.Get("code").String()]
 	if !ok {

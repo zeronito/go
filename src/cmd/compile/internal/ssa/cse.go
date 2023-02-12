@@ -31,7 +31,9 @@ func cse(f *Func) {
 	// until it reaches a fixed point.
 
 	// Make initial coarse partitions by using a subset of the conditions above.
-	a := make([]*Value, 0, f.NumValues())
+	a := f.Cache.allocValueSlice(f.NumValues())
+	defer func() { f.Cache.freeValueSlice(a) }() // inside closure to use final value of a
+	a = a[:0]
 	if f.auxmap == nil {
 		f.auxmap = auxmap{}
 	}
@@ -49,7 +51,8 @@ func cse(f *Func) {
 	partition := partitionValues(a, f.auxmap)
 
 	// map from value id back to eqclass id
-	valueEqClass := make([]ID, f.NumValues())
+	valueEqClass := f.Cache.allocIDSlice(f.NumValues())
+	defer f.Cache.freeIDSlice(valueEqClass)
 	for _, b := range f.Blocks {
 		for _, v := range b.Values {
 			// Use negative equivalence class #s for unique values.
@@ -83,7 +86,7 @@ func cse(f *Func) {
 	// non-equivalent arguments.  Repeat until we can't find any
 	// more splits.
 	var splitPoints []int
-	byArgClass := new(partitionByArgClass) // reuseable partitionByArgClass to reduce allocations
+	byArgClass := new(partitionByArgClass) // reusable partitionByArgClass to reduce allocations
 	for {
 		changed := false
 
@@ -159,7 +162,8 @@ func cse(f *Func) {
 
 	// Compute substitutions we would like to do. We substitute v for w
 	// if v and w are in the same equivalence class and v dominates w.
-	rewrite := make([]*Value, f.NumValues())
+	rewrite := f.Cache.allocValueSlice(f.NumValues())
+	defer f.Cache.freeValueSlice(rewrite)
 	byDom := new(partitionByDom) // reusable partitionByDom to reduce allocs
 	for _, e := range partition {
 		byDom.a = e
@@ -186,43 +190,6 @@ func cse(f *Func) {
 					// e is sorted by domorder, so v.Block doesn't dominate any subsequent blocks in e
 					break
 				}
-			}
-		}
-	}
-
-	// if we rewrite a tuple generator to a new one in a different block,
-	// copy its selectors to the new generator's block, so tuple generator
-	// and selectors stay together.
-	// be careful not to copy same selectors more than once (issue 16741).
-	copiedSelects := make(map[ID][]*Value)
-	for _, b := range f.Blocks {
-	out:
-		for _, v := range b.Values {
-			// New values are created when selectors are copied to
-			// a new block. We can safely ignore those new values,
-			// since they have already been copied (issue 17918).
-			if int(v.ID) >= len(rewrite) || rewrite[v.ID] != nil {
-				continue
-			}
-			if v.Op != OpSelect0 && v.Op != OpSelect1 {
-				continue
-			}
-			if !v.Args[0].Type.IsTuple() {
-				f.Fatalf("arg of tuple selector %s is not a tuple: %s", v.String(), v.Args[0].LongString())
-			}
-			t := rewrite[v.Args[0].ID]
-			if t != nil && t.Block != b {
-				// v.Args[0] is tuple generator, CSE'd into a different block as t, v is left behind
-				for _, c := range copiedSelects[t.ID] {
-					if v.Op == c.Op {
-						// an equivalent selector is already copied
-						rewrite[v.ID] = c
-						continue out
-					}
-				}
-				c := v.copyInto(t.Block)
-				rewrite[v.ID] = c
-				copiedSelects[t.ID] = append(copiedSelects[t.ID], c)
 			}
 		}
 	}
@@ -259,6 +226,7 @@ func cse(f *Func) {
 			}
 		}
 	}
+
 	if f.pass.stats > 0 {
 		f.LogStat("CSE REWRITES", rewrites)
 	}
@@ -271,14 +239,15 @@ type eqclass []*Value
 
 // partitionValues partitions the values into equivalence classes
 // based on having all the following features match:
-//  - opcode
-//  - type
-//  - auxint
-//  - aux
-//  - nargs
-//  - block # if a phi op
-//  - first two arg's opcodes and auxint
-//  - NOT first two arg's aux; that can break CSE.
+//   - opcode
+//   - type
+//   - auxint
+//   - aux
+//   - nargs
+//   - block # if a phi op
+//   - first two arg's opcodes and auxint
+//   - NOT first two arg's aux; that can break CSE.
+//
 // partitionValues returns a list of equivalence classes, each
 // being a sorted by ID list of *Values. The eqclass slices are
 // backed by the same storage as the input slice.
@@ -311,7 +280,7 @@ func lt2Cmp(isLt bool) types.Cmp {
 	return types.CMPgt
 }
 
-type auxmap map[interface{}]int32
+type auxmap map[Aux]int32
 
 func cmpVal(v, w *Value, auxIDs auxmap) types.Cmp {
 	// Try to order these comparison by cost (cheaper first)
@@ -335,7 +304,7 @@ func cmpVal(v, w *Value, auxIDs auxmap) types.Cmp {
 	// OpSelect is a pseudo-op. We need to be more aggressive
 	// regarding CSE to keep multiple OpSelect's of the same
 	// argument from existing.
-	if v.Op != OpSelect0 && v.Op != OpSelect1 {
+	if v.Op != OpSelect0 && v.Op != OpSelect1 && v.Op != OpSelectN {
 		if tc := v.Type.Compare(w.Type); tc != types.CMPeq {
 			return tc
 		}

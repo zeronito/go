@@ -9,7 +9,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -59,20 +58,28 @@ const (
 
 var outputLock sync.Mutex
 
-// run runs the command line cmd in dir.
+// run is like runEnv with no additional environment.
+func run(dir string, mode int, cmd ...string) string {
+	return runEnv(dir, mode, nil, cmd...)
+}
+
+// runEnv runs the command line cmd in dir with additional environment env.
 // If mode has ShowOutput set and Background unset, run passes cmd's output to
 // stdout/stderr directly. Otherwise, run returns cmd's output as a string.
 // If mode has CheckExit set and the command fails, run calls fatalf.
 // If mode has Background set, this command is being run as a
 // Background job. Only bgrun should use the Background mode,
 // not other callers.
-func run(dir string, mode int, cmd ...string) string {
+func runEnv(dir string, mode int, env []string, cmd ...string) string {
 	if vflag > 1 {
 		errprintf("run: %s\n", strings.Join(cmd, " "))
 	}
 
 	xcmd := exec.Command(cmd[0], cmd[1:]...)
-	xcmd.Dir = dir
+	if env != nil {
+		xcmd.Env = append(os.Environ(), env...)
+	}
+	setDir(xcmd, dir)
 	var data []byte
 	var err error
 
@@ -82,7 +89,7 @@ func run(dir string, mode int, cmd ...string) string {
 	// as it runs without fear of mixing the output with some
 	// other command's output. Not buffering lets the output
 	// appear as it is printed instead of once the command exits.
-	// This is most important for the invocation of 'go1.4 build -v bootstrap/...'.
+	// This is most important for the invocation of 'go build -v bootstrap/...'.
 	if mode&(Background|ShowOutput) == ShowOutput {
 		xcmd.Stdout = os.Stdout
 		xcmd.Stderr = os.Stderr
@@ -172,6 +179,9 @@ func bgwait(wg *sync.WaitGroup) {
 	select {
 	case <-done:
 	case <-dying:
+		// Don't return to the caller, to avoid reporting additional errors
+		// to the user.
+		select {}
 	}
 }
 
@@ -221,7 +231,7 @@ func mtime(p string) time.Time {
 
 // readfile returns the content of the named file.
 func readfile(file string) string {
-	data, err := ioutil.ReadFile(file)
+	data, err := os.ReadFile(file)
 	if err != nil {
 		fatalf("%v", err)
 	}
@@ -240,7 +250,7 @@ const (
 func writefile(text, file string, flag int) {
 	new := []byte(text)
 	if flag&writeSkipSame != 0 {
-		old, err := ioutil.ReadFile(file)
+		old, err := os.ReadFile(file)
 		if err == nil && bytes.Equal(old, new) {
 			return
 		}
@@ -249,7 +259,8 @@ func writefile(text, file string, flag int) {
 	if flag&writeExec != 0 {
 		mode = 0777
 	}
-	err := ioutil.WriteFile(file, new, mode)
+	xremove(file) // in case of symlink tricks by misc/reboot test
+	err := os.WriteFile(file, new, mode)
 	if err != nil {
 		fatalf("%v", err)
 	}
@@ -302,31 +313,10 @@ func xreaddir(dir string) []string {
 	return names
 }
 
-// xreaddir replaces dst with a list of the names of the files in dir.
-// The names are relative to dir; they are not full paths.
-func xreaddirfiles(dir string) []string {
-	f, err := os.Open(dir)
-	if err != nil {
-		fatalf("%v", err)
-	}
-	defer f.Close()
-	infos, err := f.Readdir(-1)
-	if err != nil {
-		fatalf("reading %s: %v", dir, err)
-	}
-	var names []string
-	for _, fi := range infos {
-		if !fi.IsDir() {
-			names = append(names, fi.Name())
-		}
-	}
-	return names
-}
-
 // xworkdir creates a new temporary directory to hold object files
 // and returns the name of that directory.
 func xworkdir() string {
-	name, err := ioutil.TempDir(os.Getenv("GOTMPDIR"), "go-tool-dist-")
+	name, err := os.MkdirTemp(os.Getenv("GOTMPDIR"), "go-tool-dist-")
 	if err != nil {
 		fatalf("%v", err)
 	}
@@ -372,7 +362,7 @@ func errprintf(format string, args ...interface{}) {
 	fmt.Fprintf(os.Stderr, format, args...)
 }
 
-// xsamefile reports whether f1 and f2 are the same file (or dir)
+// xsamefile reports whether f1 and f2 are the same file (or dir).
 func xsamefile(f1, f2 string) bool {
 	fi1, err1 := os.Stat(f1)
 	fi2, err2 := os.Stat(f2)
@@ -383,10 +373,14 @@ func xsamefile(f1, f2 string) bool {
 }
 
 func xgetgoarm() string {
-	if goos == "darwin" || goos == "android" {
-		// Assume all darwin/arm and android devices have VFPv3.
+	if goos == "android" {
+		// Assume all android devices have VFPv3.
 		// These ports are also mostly cross-compiled, so it makes little
 		// sense to auto-detect the setting.
+		return "7"
+	}
+	if goos == "windows" {
+		// windows/arm only works with ARMv7 executables.
 		return "7"
 	}
 	if gohostarch != "arm" || goos != gohostos {

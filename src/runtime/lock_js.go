@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// +build js,wasm
+//go:build js && wasm
 
 package runtime
 
@@ -26,6 +26,10 @@ const (
 )
 
 func lock(l *mutex) {
+	lockWithRank(l, getLockRank(l))
+}
+
+func lock2(l *mutex) {
 	if l.key == mutex_locked {
 		// js/wasm is single-threaded so we should never
 		// observe this.
@@ -40,6 +44,10 @@ func lock(l *mutex) {
 }
 
 func unlock(l *mutex) {
+	unlockWithRank(l)
+}
+
+func unlock2(l *mutex) {
 	if l.key == mutex_unlocked {
 		throw("unlock of unlocked lock")
 	}
@@ -136,8 +144,12 @@ func notetsleepg(n *note, ns int64) bool {
 }
 
 // checkTimeouts resumes goroutines that are waiting on a note which has reached its deadline.
+// TODO(drchase): need to understand if write barriers are really okay in this context.
+//
+//go:yeswritebarrierrec
 func checkTimeouts() {
 	now := nanotime()
+	// TODO: map iteration has the write barriers in it; is that okay?
 	for n, nt := range notesWithTimeout {
 		if n.key == note_cleared && now >= nt.deadline {
 			n.key = note_timeout
@@ -165,7 +177,17 @@ var idleID int32
 // beforeIdle gets called by the scheduler if no goroutine is awake.
 // If we are not already handling an event, then we pause for an async event.
 // If an event handler returned, we resume it and it will pause the execution.
-func beforeIdle(delay int64) bool {
+// beforeIdle either returns the specific goroutine to schedule next or
+// indicates with otherReady that some goroutine became ready.
+// TODO(drchase): need to understand if write barriers are really okay in this context.
+//
+//go:yeswritebarrierrec
+func beforeIdle(now, pollUntil int64) (gp *g, otherReady bool) {
+	delay := int64(-1)
+	if pollUntil != 0 {
+		delay = pollUntil - now
+	}
+
 	if delay > 0 {
 		clearIdleID()
 		if delay < 1e6 {
@@ -181,16 +203,16 @@ func beforeIdle(delay int64) bool {
 	}
 
 	if len(events) == 0 {
+		// TODO: this is the line that requires the yeswritebarrierrec
 		go handleAsyncEvent()
-		return true
+		return nil, true
 	}
 
 	e := events[len(events)-1]
 	if e.returned {
-		goready(e.gp, 1)
-		return true
+		return e.gp, false
 	}
-	return false
+	return nil, false
 }
 
 func handleAsyncEvent() {

@@ -124,6 +124,7 @@ func TestTRun(t *T) {
 		ok     bool
 		maxPar int
 		chatty bool
+		json   bool
 		output string
 		f      func(*T)
 	}{{
@@ -201,6 +202,36 @@ func TestTRun(t *T) {
 		f: func(t *T) {
 			t.Run("", func(t *T) {
 				t.Run("", func(t *T) {})
+			})
+		},
+	}, {
+		desc:   "chatty with recursion and json",
+		ok:     false,
+		chatty: true,
+		json:   true,
+		output: `
+^V=== RUN   chatty with recursion and json
+^V=== RUN   chatty with recursion and json/#00
+^V=== RUN   chatty with recursion and json/#00/#00
+^V--- PASS: chatty with recursion and json/#00/#00 (N.NNs)
+^V=== NAME  chatty with recursion and json/#00
+^V=== RUN   chatty with recursion and json/#00/#01
+    sub_test.go:NNN: skip
+^V--- SKIP: chatty with recursion and json/#00/#01 (N.NNs)
+^V=== NAME  chatty with recursion and json/#00
+^V=== RUN   chatty with recursion and json/#00/#02
+    sub_test.go:NNN: fail
+^V--- FAIL: chatty with recursion and json/#00/#02 (N.NNs)
+^V=== NAME  chatty with recursion and json/#00
+^V--- FAIL: chatty with recursion and json/#00 (N.NNs)
+^V=== NAME  chatty with recursion and json
+^V--- FAIL: chatty with recursion and json (N.NNs)
+^V=== NAME  `,
+		f: func(t *T) {
+			t.Run("", func(t *T) {
+				t.Run("", func(t *T) {})
+				t.Run("", func(t *T) { t.Skip("skip") })
+				t.Run("", func(t *T) { t.Fatal("fail") })
 			})
 		},
 	}, {
@@ -438,8 +469,6 @@ func TestTRun(t *T) {
 	}, {
 		// A chatty test should always log with fmt.Print, even if the
 		// parent test has completed.
-		// TODO(deklerk) Capture the log of fmt.Print and assert that the
-		// subtest message is not lost.
 		desc:   "log in finished sub test with chatty",
 		ok:     false,
 		chatty: true,
@@ -477,35 +506,41 @@ func TestTRun(t *T) {
 		},
 	}}
 	for _, tc := range testCases {
-		ctx := newTestContext(tc.maxPar, newMatcher(regexp.MatchString, "", ""))
-		buf := &bytes.Buffer{}
-		root := &T{
-			common: common{
-				signal: make(chan bool),
-				name:   "Test",
-				w:      buf,
-				chatty: tc.chatty,
-			},
-			context: ctx,
-		}
-		ok := root.Run(tc.desc, tc.f)
-		ctx.release()
+		t.Run(tc.desc, func(t *T) {
+			ctx := newTestContext(tc.maxPar, allMatcher())
+			buf := &strings.Builder{}
+			root := &T{
+				common: common{
+					signal:  make(chan bool),
+					barrier: make(chan bool),
+					name:    "",
+					w:       buf,
+				},
+				context: ctx,
+			}
+			if tc.chatty {
+				root.chatty = newChattyPrinter(root.w)
+				root.chatty.json = tc.json
+			}
+			ok := root.Run(tc.desc, tc.f)
+			ctx.release()
 
-		if ok != tc.ok {
-			t.Errorf("%s:ok: got %v; want %v", tc.desc, ok, tc.ok)
-		}
-		if ok != !root.Failed() {
-			t.Errorf("%s:root failed: got %v; want %v", tc.desc, !ok, root.Failed())
-		}
-		if ctx.running != 0 || ctx.numWaiting != 0 {
-			t.Errorf("%s:running and waiting non-zero: got %d and %d", tc.desc, ctx.running, ctx.numWaiting)
-		}
-		got := strings.TrimSpace(buf.String())
-		want := strings.TrimSpace(tc.output)
-		re := makeRegexp(want)
-		if ok, err := regexp.MatchString(re, got); !ok || err != nil {
-			t.Errorf("%s:output:\ngot:\n%s\nwant:\n%s", tc.desc, got, want)
-		}
+			if ok != tc.ok {
+				t.Errorf("%s:ok: got %v; want %v", tc.desc, ok, tc.ok)
+			}
+			if ok != !root.Failed() {
+				t.Errorf("%s:root failed: got %v; want %v", tc.desc, !ok, root.Failed())
+			}
+			if ctx.running != 0 || ctx.numWaiting != 0 {
+				t.Errorf("%s:running and waiting non-zero: got %d and %d", tc.desc, ctx.running, ctx.numWaiting)
+			}
+			got := strings.TrimSpace(buf.String())
+			want := strings.TrimSpace(tc.output)
+			re := makeRegexp(want)
+			if ok, err := regexp.MatchString(re, got); !ok || err != nil {
+				t.Errorf("%s:output:\ngot:\n%s\nwant:\n%s", tc.desc, got, want)
+			}
+		})
 	}
 }
 
@@ -654,44 +689,53 @@ func TestBRun(t *T) {
 			}
 		},
 	}}
+	hideStdoutForTesting = true
+	defer func() {
+		hideStdoutForTesting = false
+	}()
 	for _, tc := range testCases {
-		var ok bool
-		buf := &bytes.Buffer{}
-		// This is almost like the Benchmark function, except that we override
-		// the benchtime and catch the failure result of the subbenchmark.
-		root := &B{
-			common: common{
-				signal: make(chan bool),
-				name:   "root",
-				w:      buf,
-				chatty: tc.chatty,
-			},
-			benchFunc: func(b *B) { ok = b.Run("test", tc.f) }, // Use Run to catch failure.
-			benchTime: benchTimeFlag{d: 1 * time.Microsecond},
-		}
-		root.runN(1)
-		if ok != !tc.failed {
-			t.Errorf("%s:ok: got %v; want %v", tc.desc, ok, !tc.failed)
-		}
-		if !ok != root.Failed() {
-			t.Errorf("%s:root failed: got %v; want %v", tc.desc, !ok, root.Failed())
-		}
-		// All tests are run as subtests
-		if root.result.N != 1 {
-			t.Errorf("%s: N for parent benchmark was %d; want 1", tc.desc, root.result.N)
-		}
-		got := strings.TrimSpace(buf.String())
-		want := strings.TrimSpace(tc.output)
-		re := makeRegexp(want)
-		if ok, err := regexp.MatchString(re, got); !ok || err != nil {
-			t.Errorf("%s:output:\ngot:\n%s\nwant:\n%s", tc.desc, got, want)
-		}
+		t.Run(tc.desc, func(t *T) {
+			var ok bool
+			buf := &strings.Builder{}
+			// This is almost like the Benchmark function, except that we override
+			// the benchtime and catch the failure result of the subbenchmark.
+			root := &B{
+				common: common{
+					signal: make(chan bool),
+					name:   "root",
+					w:      buf,
+				},
+				benchFunc: func(b *B) { ok = b.Run("test", tc.f) }, // Use Run to catch failure.
+				benchTime: durationOrCountFlag{d: 1 * time.Microsecond},
+			}
+			if tc.chatty {
+				root.chatty = newChattyPrinter(root.w)
+			}
+			root.runN(1)
+			if ok != !tc.failed {
+				t.Errorf("%s:ok: got %v; want %v", tc.desc, ok, !tc.failed)
+			}
+			if !ok != root.Failed() {
+				t.Errorf("%s:root failed: got %v; want %v", tc.desc, !ok, root.Failed())
+			}
+			// All tests are run as subtests
+			if root.result.N != 1 {
+				t.Errorf("%s: N for parent benchmark was %d; want 1", tc.desc, root.result.N)
+			}
+			got := strings.TrimSpace(buf.String())
+			want := strings.TrimSpace(tc.output)
+			re := makeRegexp(want)
+			if ok, err := regexp.MatchString(re, got); !ok || err != nil {
+				t.Errorf("%s:output:\ngot:\n%s\nwant:\n%s", tc.desc, got, want)
+			}
+		})
 	}
 }
 
 func makeRegexp(s string) string {
 	s = regexp.QuoteMeta(s)
-	s = strings.ReplaceAll(s, ":NNN:", `:\d\d\d:`)
+	s = strings.ReplaceAll(s, "^V", "\x16")
+	s = strings.ReplaceAll(s, ":NNN:", `:\d\d\d\d?:`)
 	s = strings.ReplaceAll(s, "N\\.NNs", `\d*\.\d*s`)
 	return s
 }
@@ -717,7 +761,7 @@ func TestBenchmarkReadMemStatsBeforeFirstRun(t *T) {
 	var first = true
 	Benchmark(func(b *B) {
 		if first && (b.startAllocs == 0 || b.startBytes == 0) {
-			panic(fmt.Sprintf("ReadMemStats not called before first run"))
+			panic("ReadMemStats not called before first run")
 		}
 		first = false
 	})
@@ -739,9 +783,13 @@ func TestParallelSub(t *T) {
 	}
 }
 
-type funcWriter func([]byte) (int, error)
+type funcWriter struct {
+	write func([]byte) (int, error)
+}
 
-func (fw funcWriter) Write(b []byte) (int, error) { return fw(b) }
+func (fw *funcWriter) Write(b []byte) (int, error) {
+	return fw.write(b)
+}
 
 func TestRacyOutput(t *T) {
 	var runs int32  // The number of running Writes
@@ -757,12 +805,13 @@ func TestRacyOutput(t *T) {
 		return len(b), nil
 	}
 
-	var wg sync.WaitGroup
 	root := &T{
-		common:  common{w: funcWriter(raceDetector), chatty: true},
-		context: newTestContext(1, newMatcher(regexp.MatchString, "", "")),
+		common:  common{w: &funcWriter{raceDetector}},
+		context: newTestContext(1, allMatcher()),
 	}
+	root.chatty = newChattyPrinter(root.w)
 	root.Run("", func(t *T) {
+		var wg sync.WaitGroup
 		for i := 0; i < 100; i++ {
 			wg.Add(1)
 			go func(i int) {
@@ -772,8 +821,8 @@ func TestRacyOutput(t *T) {
 				})
 			}(i)
 		}
+		wg.Wait()
 	})
-	wg.Wait()
 
 	if races > 0 {
 		t.Errorf("detected %d racy Writes", races)
@@ -782,7 +831,7 @@ func TestRacyOutput(t *T) {
 
 // The late log message did not include the test name.  Issue 29388.
 func TestLogAfterComplete(t *T) {
-	ctx := newTestContext(1, newMatcher(regexp.MatchString, "", ""))
+	ctx := newTestContext(1, allMatcher())
 	var buf bytes.Buffer
 	t1 := &T{
 		common: common{
@@ -811,7 +860,7 @@ func TestLogAfterComplete(t *T) {
 						c2 <- fmt.Sprintf("subtest panic with unexpected value %v", p)
 						return
 					}
-					const want = "Log in goroutine after TestLateLog has completed"
+					const want = "Log in goroutine after TestLateLog has completed: log after test"
 					if !strings.Contains(s, want) {
 						c2 <- fmt.Sprintf("subtest panic %q does not contain %q", s, want)
 					}
@@ -924,5 +973,32 @@ func TestCleanupParallelSubtests(t *T) {
 	})
 	if ranCleanup != 1 {
 		t.Errorf("unexpected cleanup count; got %d want 1", ranCleanup)
+	}
+}
+
+func TestNestedCleanup(t *T) {
+	ranCleanup := 0
+	t.Run("test", func(t *T) {
+		t.Cleanup(func() {
+			if ranCleanup != 2 {
+				t.Errorf("unexpected cleanup count in first cleanup: got %d want 2", ranCleanup)
+			}
+			ranCleanup++
+		})
+		t.Cleanup(func() {
+			if ranCleanup != 0 {
+				t.Errorf("unexpected cleanup count in second cleanup: got %d want 0", ranCleanup)
+			}
+			ranCleanup++
+			t.Cleanup(func() {
+				if ranCleanup != 1 {
+					t.Errorf("unexpected cleanup count in nested cleanup: got %d want 1", ranCleanup)
+				}
+				ranCleanup++
+			})
+		})
+	})
+	if ranCleanup != 3 {
+		t.Errorf("unexpected cleanup count: got %d want 3", ranCleanup)
 	}
 }

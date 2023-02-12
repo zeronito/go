@@ -1,3 +1,7 @@
+// Copyright 2018 The Go Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
 package trace_test
 
 import (
@@ -143,7 +147,7 @@ func TestUserTaskRegion(t *testing.T) {
 		pretty := func(data []testData) string {
 			var s strings.Builder
 			for _, d := range data {
-				s.WriteString(fmt.Sprintf("\t%+v\n", d))
+				fmt.Fprintf(&s, "\t%+v\n", d)
 			}
 			return s.String()
 		}

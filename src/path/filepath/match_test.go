@@ -7,7 +7,6 @@ package filepath_test
 import (
 	"fmt"
 	"internal/testenv"
-	"io/ioutil"
 	"os"
 	. "path/filepath"
 	"reflect"
@@ -75,8 +74,10 @@ var matchTests = []MatchTest{
 	{"[", "a", false, ErrBadPattern},
 	{"[^", "a", false, ErrBadPattern},
 	{"[^bc", "a", false, ErrBadPattern},
-	{"a[", "a", false, nil},
+	{"a[", "a", false, ErrBadPattern},
 	{"a[", "ab", false, ErrBadPattern},
+	{"a[", "x", false, ErrBadPattern},
+	{"a/b[", "x", false, ErrBadPattern},
 	{"*x", "xxx", true, nil},
 }
 
@@ -154,10 +155,22 @@ func TestGlob(t *testing.T) {
 	}
 }
 
+func TestCVE202230632(t *testing.T) {
+	// Prior to CVE-2022-30632, this would cause a stack exhaustion given a
+	// large number of separators (more than 4,000,000). There is now a limit
+	// of 10,000.
+	_, err := Glob("/*" + strings.Repeat("/", 10001))
+	if err != ErrBadPattern {
+		t.Fatalf("Glob returned err=%v, want ErrBadPattern", err)
+	}
+}
+
 func TestGlobError(t *testing.T) {
-	_, err := Glob("[]")
-	if err == nil {
-		t.Error("expected error for bad pattern; got none")
+	bad := []string{`[]`, `nonexist/[]`}
+	for _, pattern := range bad {
+		if _, err := Glob(pattern); err != ErrBadPattern {
+			t.Errorf("Glob(%#q) returned err=%v, want ErrBadPattern", pattern, err)
+		}
 	}
 }
 
@@ -178,12 +191,7 @@ var globSymlinkTests = []struct {
 func TestGlobSymlink(t *testing.T) {
 	testenv.MustHaveSymlink(t)
 
-	tmpDir, err := ioutil.TempDir("", "globsymlink")
-	if err != nil {
-		t.Fatal("creating temp dir:", err)
-	}
-	defer os.RemoveAll(tmpDir)
-
+	tmpDir := t.TempDir()
 	for _, tt := range globSymlinkTests {
 		path := Join(tmpDir, tt.path)
 		dest := Join(tmpDir, tt.dest)
@@ -264,18 +272,7 @@ func TestWindowsGlob(t *testing.T) {
 		t.Skipf("skipping windows specific test")
 	}
 
-	tmpDir, err := ioutil.TempDir("", "TestWindowsGlob")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(tmpDir)
-
-	// /tmp may itself be a symlink
-	tmpDir, err = EvalSymlinks(tmpDir)
-	if err != nil {
-		t.Fatal("eval symlink for tmp dir:", err)
-	}
-
+	tmpDir := tempDirCanonical(t)
 	if len(tmpDir) < 3 {
 		t.Fatalf("tmpDir path %q is too short", tmpDir)
 	}
@@ -298,7 +295,7 @@ func TestWindowsGlob(t *testing.T) {
 		}
 	}
 	for _, file := range files {
-		err := ioutil.WriteFile(Join(tmpDir, file), nil, 0666)
+		err := os.WriteFile(Join(tmpDir, file), nil, 0666)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -320,15 +317,13 @@ func TestWindowsGlob(t *testing.T) {
 	// test absolute paths
 	for _, test := range tests {
 		var p string
-		err = test.globAbs(tmpDir, tmpDir)
-		if err != nil {
+		if err := test.globAbs(tmpDir, tmpDir); err != nil {
 			t.Error(err)
 		}
 		// test C:\*Documents and Settings\...
 		p = tmpDir
 		p = strings.Replace(p, `:\`, `:\*`, 1)
-		err = test.globAbs(tmpDir, p)
-		if err != nil {
+		if err := test.globAbs(tmpDir, p); err != nil {
 			t.Error(err)
 		}
 		// test C:\Documents and Settings*\...
@@ -336,8 +331,7 @@ func TestWindowsGlob(t *testing.T) {
 		p = strings.Replace(p, `:\`, `:`, 1)
 		p = strings.Replace(p, `\`, `*\`, 1)
 		p = strings.Replace(p, `:`, `:\`, 1)
-		err = test.globAbs(tmpDir, p)
-		if err != nil {
+		if err := test.globAbs(tmpDir, p); err != nil {
 			t.Error(err)
 		}
 	}

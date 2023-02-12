@@ -8,7 +8,6 @@ import (
 	"bytes"
 	"errors"
 	"io"
-	"io/ioutil"
 	"strings"
 	"testing"
 )
@@ -43,7 +42,7 @@ var bigtest = testpair{
 	"KR3WC4ZAMJZGS3DMNFTSYIDBNZSCA5DIMUQHG3DJORUHSIDUN53GK4Y=",
 }
 
-func testEqual(t *testing.T, msg string, args ...interface{}) bool {
+func testEqual(t *testing.T, msg string, args ...any) bool {
 	t.Helper()
 	if args[len(args)-2] != args[len(args)-1] {
 		t.Errorf(msg, args...)
@@ -61,7 +60,7 @@ func TestEncode(t *testing.T) {
 
 func TestEncoder(t *testing.T) {
 	for _, p := range pairs {
-		bb := &bytes.Buffer{}
+		bb := &strings.Builder{}
 		encoder := NewEncoder(StdEncoding, bb)
 		encoder.Write([]byte(p.decoded))
 		encoder.Close()
@@ -72,7 +71,7 @@ func TestEncoder(t *testing.T) {
 func TestEncoderBuffering(t *testing.T) {
 	input := []byte(bigtest.decoded)
 	for bs := 1; bs <= 12; bs++ {
-		bb := &bytes.Buffer{}
+		bb := &strings.Builder{}
 		encoder := NewEncoder(StdEncoding, bb)
 		for pos := 0; pos < len(input); pos += bs {
 			end := pos + bs
@@ -269,7 +268,7 @@ func TestReaderEOF(t *testing.T) {
 		decoder := NewDecoder(StdEncoding, &br)
 		dbuf := make([]byte, StdEncoding.DecodedLen(len(input)))
 		n, err := decoder.Read(dbuf)
-		testEqual(t, "Decoding of %q err = %v, expected %v", string(input), err, error(nil))
+		testEqual(t, "Decoding of %q err = %v, expected %v", input, err, error(nil))
 		n, err = decoder.Read(dbuf)
 		testEqual(t, "Read after EOF, n = %d, expected %d", n, 0)
 		testEqual(t, "Read after EOF, err = %v, expected %v", err, io.EOF)
@@ -361,9 +360,9 @@ func TestBig(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Encoder.Close() = %v want nil", err)
 	}
-	decoded, err := ioutil.ReadAll(NewDecoder(StdEncoding, encoded))
+	decoded, err := io.ReadAll(NewDecoder(StdEncoding, encoded))
 	if err != nil {
-		t.Fatalf("ioutil.ReadAll(NewDecoder(...)): %v", err)
+		t.Fatalf("io.ReadAll(NewDecoder(...)): %v", err)
 	}
 
 	if !bytes.Equal(raw, decoded) {
@@ -428,14 +427,14 @@ LNEBUWIIDFON2CA3DBMJXXE5LNFY==
 	encodedShort := strings.ReplaceAll(encoded, "\n", "")
 
 	dec := NewDecoder(StdEncoding, strings.NewReader(encoded))
-	res1, err := ioutil.ReadAll(dec)
+	res1, err := io.ReadAll(dec)
 	if err != nil {
 		t.Errorf("ReadAll failed: %v", err)
 	}
 
 	dec = NewDecoder(StdEncoding, strings.NewReader(encodedShort))
 	var res2 []byte
-	res2, err = ioutil.ReadAll(dec)
+	res2, err = io.ReadAll(dec)
 	if err != nil {
 		t.Errorf("ReadAll failed: %v", err)
 	}
@@ -619,11 +618,63 @@ func TestBufferedDecodingSameError(t *testing.T) {
 			}()
 
 			decoder := NewDecoder(StdEncoding, pr)
-			_, err := ioutil.ReadAll(decoder)
+			_, err := io.ReadAll(decoder)
 
 			if err != testcase.expected {
 				t.Errorf("Expected %v, got %v; case %s %+v", testcase.expected, err, testcase.prefix, chunks)
 			}
+		}
+	}
+}
+
+func TestBufferedDecodingPadding(t *testing.T) {
+	testcases := []struct {
+		chunks        []string
+		expectedError string
+	}{
+		{[]string{
+			"I4======",
+			"==",
+		}, "unexpected EOF"},
+
+		{[]string{
+			"I4======N4======",
+		}, "illegal base32 data at input byte 2"},
+
+		{[]string{
+			"I4======",
+			"N4======",
+		}, "illegal base32 data at input byte 0"},
+
+		{[]string{
+			"I4======",
+			"========",
+		}, "illegal base32 data at input byte 0"},
+
+		{[]string{
+			"I4I4I4I4",
+			"I4======",
+			"I4======",
+		}, "illegal base32 data at input byte 0"},
+	}
+
+	for _, testcase := range testcases {
+		testcase := testcase
+		pr, pw := io.Pipe()
+		go func() {
+			for _, chunk := range testcase.chunks {
+				_, _ = pw.Write([]byte(chunk))
+			}
+			_ = pw.Close()
+		}()
+
+		decoder := NewDecoder(StdEncoding, pr)
+		_, err := io.ReadAll(decoder)
+
+		if err == nil && len(testcase.expectedError) != 0 {
+			t.Errorf("case %q: got nil error, want %v", testcase.chunks, testcase.expectedError)
+		} else if err.Error() != testcase.expectedError {
+			t.Errorf("case %q: got %v, want %v", testcase.chunks, err, testcase.expectedError)
 		}
 	}
 }
@@ -686,7 +737,7 @@ func TestWithoutPaddingClose(t *testing.T) {
 	for _, encoding := range encodings {
 		for _, testpair := range pairs {
 
-			var buf bytes.Buffer
+			var buf strings.Builder
 			encoder := NewEncoder(encoding, &buf)
 			encoder.Write([]byte(testpair.decoded))
 			encoder.Close()
@@ -718,7 +769,7 @@ func TestDecodeReadAll(t *testing.T) {
 				encoded = strings.ReplaceAll(encoded, "=", "")
 			}
 
-			decReader, err := ioutil.ReadAll(NewDecoder(encoding, strings.NewReader(encoded)))
+			decReader, err := io.ReadAll(NewDecoder(encoding, strings.NewReader(encoded)))
 			if err != nil {
 				t.Errorf("NewDecoder error: %v", err)
 			}

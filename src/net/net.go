@@ -36,7 +36,7 @@ The Listen function creates servers:
 		go handleConnection(conn)
 	}
 
-Name Resolution
+# Name Resolution
 
 The method for resolving domain names, whether indirectly with functions like Dial
 or directly with functions like LookupHost and LookupAddr, varies by operating system.
@@ -61,7 +61,7 @@ The resolver decision can be overridden by setting the netdns value of the
 GODEBUG environment variable (see package runtime) to go or cgo, as in:
 
 	export GODEBUG=netdns=go    # force pure Go resolver
-	export GODEBUG=netdns=cgo   # force cgo resolver
+	export GODEBUG=netdns=cgo   # force native resolver (cgo, win32)
 
 The decision can also be forced while building the Go source tree
 by setting the netgo or netcgo build tag.
@@ -73,8 +73,8 @@ join the two settings by a plus sign, as in GODEBUG=netdns=go+1.
 
 On Plan 9, the resolver always accesses /net/cs and /net/dns.
 
-On Windows, the resolver always uses C library functions, such as GetAddrInfo and DnsQuery.
-
+On Windows, in Go 1.18.x and earlier, the resolver always used C
+library functions, such as GetAddrInfo and DnsQuery.
 */
 package net
 
@@ -112,23 +112,23 @@ type Addr interface {
 // Multiple goroutines may invoke methods on a Conn simultaneously.
 type Conn interface {
 	// Read reads data from the connection.
-	// Read can be made to time out and return an Error with Timeout() == true
-	// after a fixed time limit; see SetDeadline and SetReadDeadline.
+	// Read can be made to time out and return an error after a fixed
+	// time limit; see SetDeadline and SetReadDeadline.
 	Read(b []byte) (n int, err error)
 
 	// Write writes data to the connection.
-	// Write can be made to time out and return an Error with Timeout() == true
-	// after a fixed time limit; see SetDeadline and SetWriteDeadline.
+	// Write can be made to time out and return an error after a fixed
+	// time limit; see SetDeadline and SetWriteDeadline.
 	Write(b []byte) (n int, err error)
 
 	// Close closes the connection.
 	// Any blocked Read or Write operations will be unblocked and return errors.
 	Close() error
 
-	// LocalAddr returns the local network address.
+	// LocalAddr returns the local network address, if known.
 	LocalAddr() Addr
 
-	// RemoteAddr returns the remote network address.
+	// RemoteAddr returns the remote network address, if known.
 	RemoteAddr() Addr
 
 	// SetDeadline sets the read and write deadlines associated
@@ -136,23 +136,22 @@ type Conn interface {
 	// SetReadDeadline and SetWriteDeadline.
 	//
 	// A deadline is an absolute time after which I/O operations
-	// fail with a timeout (see type Error) instead of
-	// blocking. The deadline applies to all future and pending
-	// I/O, not just the immediately following call to Read or
-	// Write. After a deadline has been exceeded, the connection
-	// can be refreshed by setting a deadline in the future.
+	// fail instead of blocking. The deadline applies to all future
+	// and pending I/O, not just the immediately following call to
+	// Read or Write. After a deadline has been exceeded, the
+	// connection can be refreshed by setting a deadline in the future.
+	//
+	// If the deadline is exceeded a call to Read or Write or to other
+	// I/O methods will return an error that wraps os.ErrDeadlineExceeded.
+	// This can be tested using errors.Is(err, os.ErrDeadlineExceeded).
+	// The error's Timeout method will return true, but note that there
+	// are other possible errors for which the Timeout method will
+	// return true even if the deadline has not been exceeded.
 	//
 	// An idle timeout can be implemented by repeatedly extending
 	// the deadline after successful Read or Write calls.
 	//
 	// A zero value for t means I/O operations will not time out.
-	//
-	// Note that if a TCP connection has keep-alive turned on,
-	// which is the default unless overridden by Dialer.KeepAlive
-	// or ListenConfig.KeepAlive, then a keep-alive failure may
-	// also return a timeout error. On Unix systems a keep-alive
-	// failure on I/O can be detected using
-	// errors.Is(err, syscall.ETIMEDOUT).
 	SetDeadline(t time.Time) error
 
 	// SetReadDeadline sets the deadline for future Read calls
@@ -315,15 +314,13 @@ type PacketConn interface {
 	// It returns the number of bytes read (0 <= n <= len(p))
 	// and any error encountered. Callers should always process
 	// the n > 0 bytes returned before considering the error err.
-	// ReadFrom can be made to time out and return
-	// an Error with Timeout() == true after a fixed time limit;
-	// see SetDeadline and SetReadDeadline.
+	// ReadFrom can be made to time out and return an error after a
+	// fixed time limit; see SetDeadline and SetReadDeadline.
 	ReadFrom(p []byte) (n int, addr Addr, err error)
 
 	// WriteTo writes a packet with payload p to addr.
-	// WriteTo can be made to time out and return
-	// an Error with Timeout() == true after a fixed time limit;
-	// see SetDeadline and SetWriteDeadline.
+	// WriteTo can be made to time out and return an Error after a
+	// fixed time limit; see SetDeadline and SetWriteDeadline.
 	// On packet-oriented connections, write timeouts are rare.
 	WriteTo(p []byte, addr Addr) (n int, err error)
 
@@ -331,7 +328,7 @@ type PacketConn interface {
 	// Any blocked ReadFrom or WriteTo operations will be unblocked and return errors.
 	Close() error
 
-	// LocalAddr returns the local network address.
+	// LocalAddr returns the local network address, if known.
 	LocalAddr() Addr
 
 	// SetDeadline sets the read and write deadlines associated
@@ -339,11 +336,17 @@ type PacketConn interface {
 	// SetReadDeadline and SetWriteDeadline.
 	//
 	// A deadline is an absolute time after which I/O operations
-	// fail with a timeout (see type Error) instead of
-	// blocking. The deadline applies to all future and pending
-	// I/O, not just the immediately following call to ReadFrom or
-	// WriteTo. After a deadline has been exceeded, the connection
-	// can be refreshed by setting a deadline in the future.
+	// fail instead of blocking. The deadline applies to all future
+	// and pending I/O, not just the immediately following call to
+	// Read or Write. After a deadline has been exceeded, the
+	// connection can be refreshed by setting a deadline in the future.
+	//
+	// If the deadline is exceeded a call to Read or Write or to other
+	// I/O methods will return an error that wraps os.ErrDeadlineExceeded.
+	// This can be tested using errors.Is(err, os.ErrDeadlineExceeded).
+	// The error's Timeout method will return true, but note that there
+	// are other possible errors for which the Timeout method will
+	// return true even if the deadline has not been exceeded.
 	//
 	// An idle timeout can be implemented by repeatedly extending
 	// the deadline after successful ReadFrom or WriteTo calls.
@@ -393,8 +396,12 @@ type Listener interface {
 // An Error represents a network error.
 type Error interface {
 	error
-	Timeout() bool   // Is the error a timeout?
-	Temporary() bool // Is the error temporary?
+	Timeout() bool // Is the error a timeout?
+
+	// Deprecated: Temporary errors are not well-defined.
+	// Most "temporary" errors are timeouts, and the few exceptions are surprising.
+	// Do not use this method.
+	Temporary() bool
 }
 
 // Various errors contained in OpError.
@@ -406,21 +413,26 @@ var (
 	errMissingAddress = errors.New("missing address")
 
 	// For both read and write operations.
-	errCanceled         = errors.New("operation was canceled")
+	errCanceled         = canceledError{}
 	ErrWriteToConnected = errors.New("use of WriteTo with pre-connected connection")
 )
 
+// canceledError lets us return the same error string we have always
+// returned, while still being Is context.Canceled.
+type canceledError struct{}
+
+func (canceledError) Error() string { return "operation was canceled" }
+
+func (canceledError) Is(err error) bool { return err == context.Canceled }
+
 // mapErr maps from the context errors to the historical internal net
 // error values.
-//
-// TODO(bradfitz): get rid of this after adjusting tests and making
-// context.DeadlineExceeded implement net.Error?
 func mapErr(err error) error {
 	switch err {
 	case context.Canceled:
 		return errCanceled
 	case context.DeadlineExceeded:
-		return poll.ErrTimeout
+		return errTimeout
 	default:
 		return err
 	}
@@ -486,7 +498,7 @@ var (
 	// immediate cancellation of dials.
 	aLongTimeAgo = time.Unix(1, 0)
 
-	// nonDeadline and noCancel are just zero values for
+	// noDeadline and noCancel are just zero values for
 	// readability with functions taking too many parameters.
 	noDeadline = time.Time{}
 	noCancel   = (chan struct{})(nil)
@@ -536,6 +548,9 @@ type ParseError struct {
 
 func (e *ParseError) Error() string { return "invalid " + e.Type + ": " + e.Text }
 
+func (e *ParseError) Timeout() bool   { return false }
+func (e *ParseError) Temporary() bool { return false }
+
 type AddrError struct {
 	Err  string
 	Addr string
@@ -566,6 +581,29 @@ type InvalidAddrError string
 func (e InvalidAddrError) Error() string   { return string(e) }
 func (e InvalidAddrError) Timeout() bool   { return false }
 func (e InvalidAddrError) Temporary() bool { return false }
+
+// errTimeout exists to return the historical "i/o timeout" string
+// for context.DeadlineExceeded. See mapErr.
+// It is also used when Dialer.Deadline is exceeded.
+// error.Is(errTimeout, context.DeadlineExceeded) returns true.
+//
+// TODO(iant): We could consider changing this to os.ErrDeadlineExceeded
+// in the future, if we make
+//
+//	errors.Is(os.ErrDeadlineExceeded, context.DeadlineExceeded)
+//
+// return true.
+var errTimeout error = &timeoutError{}
+
+type timeoutError struct{}
+
+func (e *timeoutError) Error() string   { return "i/o timeout" }
+func (e *timeoutError) Timeout() bool   { return true }
+func (e *timeoutError) Temporary() bool { return true }
+
+func (e *timeoutError) Is(err error) bool {
+	return err == context.DeadlineExceeded
+}
 
 // DNSConfigError represents an error reading the machine's DNS configuration.
 // (No longer used; kept for compatibility.)
@@ -614,6 +652,17 @@ func (e *DNSError) Timeout() bool { return e.IsTimeout }
 // This is not always known; a DNS lookup may fail due to a temporary
 // error and return a DNSError for which Temporary returns false.
 func (e *DNSError) Temporary() bool { return e.IsTimeout || e.IsTemporary }
+
+// errClosed exists just so that the docs for ErrClosed don't mention
+// the internal package poll.
+var errClosed = poll.ErrNetClosing
+
+// ErrClosed is the error returned by an I/O call on a network
+// connection that has already been closed, or that is closed by
+// another goroutine before the I/O is completed. This may be wrapped
+// in another error, and should normally be tested using
+// errors.Is(err, net.ErrClosed).
+var ErrClosed error = errClosed
 
 type writerOnly struct {
 	io.Writer
@@ -667,6 +716,12 @@ var (
 	_ io.Reader   = (*Buffers)(nil)
 )
 
+// WriteTo writes contents of the buffers to w.
+//
+// WriteTo implements io.WriterTo for Buffers.
+//
+// WriteTo modifies the slice v as well as v[i] for 0 <= i < len(v),
+// but does not modify v[i][j] for any i, j.
 func (v *Buffers) WriteTo(w io.Writer) (n int64, err error) {
 	if wv, ok := w.(buffersWriter); ok {
 		return wv.writeBuffers(v)
@@ -683,6 +738,12 @@ func (v *Buffers) WriteTo(w io.Writer) (n int64, err error) {
 	return n, nil
 }
 
+// Read from the buffers.
+//
+// Read implements io.Reader for Buffers.
+//
+// Read modifies the slice v as well as v[i] for 0 <= i < len(v),
+// but does not modify v[i][j] for any i, j.
 func (v *Buffers) Read(p []byte) (n int, err error) {
 	for len(p) > 0 && len(*v) > 0 {
 		n0 := copy(p, (*v)[0])
@@ -704,6 +765,7 @@ func (v *Buffers) consume(n int64) {
 			return
 		}
 		n -= ln0
+		(*v)[0] = nil
 		*v = (*v)[1:]
 	}
 }

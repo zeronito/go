@@ -13,6 +13,16 @@ import (
 	"testing"
 )
 
+// First test, so that it can be the one to initialize castagnoliTable.
+func TestCastagnoliRace(t *testing.T) {
+	// The MakeTable(Castagnoli) lazily initializes castagnoliTable,
+	// which races with the switch on tab during Write to check
+	// whether tab == castagnoliTable.
+	ieee := NewIEEE()
+	go MakeTable(Castagnoli)
+	ieee.Write([]byte("hello"))
+}
+
 type test struct {
 	ieee, castagnoli    uint32
 	in                  string
@@ -319,11 +329,14 @@ func benchmark(b *testing.B, h hash.Hash32, n, alignment int64) {
 	h.Reset()
 	h.Write(data)
 	h.Sum(in)
+	// Avoid further allocations
+	in = in[:0]
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		h.Reset()
 		h.Write(data)
 		h.Sum(in)
+		in = in[:0]
 	}
 }

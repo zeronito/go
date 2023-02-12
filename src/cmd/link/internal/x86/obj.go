@@ -1,5 +1,5 @@
 // Inferno utils/8l/obj.c
-// https://bitbucket.org/inferno-os/inferno-os/src/default/utils/8l/obj.c
+// https://bitbucket.org/inferno-os/inferno-os/src/master/utils/8l/obj.c
 //
 //	Copyright © 1994-1999 Lucent Technologies Inc.  All rights reserved.
 //	Portions Copyright © 1995-1997 C H Forsyth (forsyth@terzarima.net)
@@ -45,24 +45,31 @@ func Init() (*sys.Arch, ld.Arch) {
 		Minalign:   minAlign,
 		Dwarfregsp: dwarfRegSP,
 		Dwarfreglr: dwarfRegLR,
+		// 0xCC is INT $3 - breakpoint instruction
+		CodePad: []byte{0xCC},
+
+		Plan9Magic: uint32(4*11*11 + 7),
 
 		Adddynrel:        adddynrel,
 		Archinit:         archinit,
 		Archreloc:        archreloc,
 		Archrelocvariant: archrelocvariant,
-		Asmb:             asmb,
-		Asmb2:            asmb2,
-		Elfreloc1:        elfreloc1,
-		Elfsetupplt:      elfsetupplt,
 		Gentext:          gentext,
 		Machoreloc1:      machoreloc1,
 		PEreloc1:         pereloc1,
 
-		Linuxdynld:   "/lib/ld-linux.so.2",
-		Freebsddynld: "/usr/libexec/ld-elf.so.1",
-		Openbsddynld: "/usr/libexec/ld.so",
-		Netbsddynld:  "/usr/libexec/ld.elf_so",
-		Solarisdynld: "/lib/ld.so.1",
+		ELF: ld.ELFArch{
+			Linuxdynld:     "/lib/ld-linux.so.2",
+			LinuxdynldMusl: "/lib/ld-musl-i386.so.1",
+			Freebsddynld:   "/usr/libexec/ld-elf.so.1",
+			Openbsddynld:   "/usr/libexec/ld.so",
+			Netbsddynld:    "/usr/libexec/ld.elf_so",
+			Solarisdynld:   "/lib/ld.so.1",
+
+			Reloc1:    elfreloc1,
+			RelocSize: 8,
+			SetupPLT:  elfsetupplt,
+		},
 	}
 
 	return arch, theArch

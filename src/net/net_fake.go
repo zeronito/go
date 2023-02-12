@@ -4,7 +4,7 @@
 
 // Fake networking for js/wasm. It is intended to allow tests of other package to pass.
 
-// +build js,wasm
+//go:build js && wasm
 
 package net
 
@@ -16,6 +16,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"golang.org/x/net/dns/dnsmessage"
 )
 
 var listenersMu sync.Mutex
@@ -55,7 +57,7 @@ type netFD struct {
 
 // socket returns a network file descriptor that is ready for
 // asynchronous I/O using the network poller.
-func socket(ctx context.Context, net string, family, sotype, proto int, ipv6only bool, laddr, raddr sockaddr, ctrlFn func(string, string, syscall.RawConn) error) (*netFD, error) {
+func socket(ctx context.Context, net string, family, sotype, proto int, ipv6only bool, laddr, raddr sockaddr, ctrlCtxFn func(context.Context, string, string, syscall.RawConn) error) (*netFD, error) {
 	fd := &netFD{family: family, sotype: sotype, net: net}
 
 	if laddr != nil && raddr == nil { // listener
@@ -192,7 +194,7 @@ func (p *bufferedPipe) Read(b []byte) (int, error) {
 		if !p.rDeadline.IsZero() {
 			d := time.Until(p.rDeadline)
 			if d <= 0 {
-				return 0, syscall.EAGAIN
+				return 0, os.ErrDeadlineExceeded
 			}
 			time.AfterFunc(d, p.rCond.Broadcast)
 		}
@@ -219,7 +221,7 @@ func (p *bufferedPipe) Write(b []byte) (int, error) {
 		if !p.wDeadline.IsZero() {
 			d := time.Until(p.wDeadline)
 			if d <= 0 {
-				return 0, syscall.EAGAIN
+				return 0, os.ErrDeadlineExceeded
 			}
 			time.AfterFunc(d, p.wCond.Broadcast)
 		}
@@ -265,13 +267,45 @@ func sysSocket(family, sotype, proto int) (int, error) {
 
 func (fd *netFD) readFrom(p []byte) (n int, sa syscall.Sockaddr, err error) {
 	return 0, nil, syscall.ENOSYS
+
+}
+func (fd *netFD) readFromInet4(p []byte, sa *syscall.SockaddrInet4) (n int, err error) {
+	return 0, syscall.ENOSYS
 }
 
-func (fd *netFD) readMsg(p []byte, oob []byte) (n, oobn, flags int, sa syscall.Sockaddr, err error) {
+func (fd *netFD) readFromInet6(p []byte, sa *syscall.SockaddrInet6) (n int, err error) {
+	return 0, syscall.ENOSYS
+}
+
+func (fd *netFD) readMsg(p []byte, oob []byte, flags int) (n, oobn, retflags int, sa syscall.Sockaddr, err error) {
 	return 0, 0, 0, nil, syscall.ENOSYS
 }
 
+func (fd *netFD) readMsgInet4(p []byte, oob []byte, flags int, sa *syscall.SockaddrInet4) (n, oobn, retflags int, err error) {
+	return 0, 0, 0, syscall.ENOSYS
+}
+
+func (fd *netFD) readMsgInet6(p []byte, oob []byte, flags int, sa *syscall.SockaddrInet6) (n, oobn, retflags int, err error) {
+	return 0, 0, 0, syscall.ENOSYS
+}
+
+func (fd *netFD) writeMsgInet4(p []byte, oob []byte, sa *syscall.SockaddrInet4) (n int, oobn int, err error) {
+	return 0, 0, syscall.ENOSYS
+}
+
+func (fd *netFD) writeMsgInet6(p []byte, oob []byte, sa *syscall.SockaddrInet6) (n int, oobn int, err error) {
+	return 0, 0, syscall.ENOSYS
+}
+
 func (fd *netFD) writeTo(p []byte, sa syscall.Sockaddr) (n int, err error) {
+	return 0, syscall.ENOSYS
+}
+
+func (fd *netFD) writeToInet4(p []byte, sa *syscall.SockaddrInet4) (n int, err error) {
+	return 0, syscall.ENOSYS
+}
+
+func (fd *netFD) writeToInet6(p []byte, sa *syscall.SockaddrInet6) (n int, err error) {
 	return 0, syscall.ENOSYS
 }
 
@@ -281,4 +315,8 @@ func (fd *netFD) writeMsg(p []byte, oob []byte, sa syscall.Sockaddr) (n int, oob
 
 func (fd *netFD) dup() (f *os.File, err error) {
 	return nil, syscall.ENOSYS
+}
+
+func (r *Resolver) lookup(ctx context.Context, name string, qtype dnsmessage.Type, conf *dnsConfig) (dnsmessage.Parser, string, error) {
+	panic("unreachable")
 }

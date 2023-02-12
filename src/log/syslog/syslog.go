@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// +build !windows,!plan9
+//go:build !windows && !plan9
 
 package syslog
 
@@ -161,7 +161,10 @@ func (w *Writer) connect() (err error) {
 		var c net.Conn
 		c, err = net.Dial(w.network, w.raddr)
 		if err == nil {
-			w.conn = &netConn{conn: c}
+			w.conn = &netConn{
+				conn:  c,
+				local: w.network == "unixgram" || w.network == "unix",
+			}
 			if w.hostname == "" {
 				w.hostname = c.LocalAddr().String()
 			}
@@ -252,7 +255,7 @@ func (w *Writer) writeAndRetry(p Priority, s string) (int, error) {
 
 	if w.conn != nil {
 		if n, err := w.write(pr, s); err == nil {
-			return n, err
+			return n, nil
 		}
 	}
 	if err := w.connect(); err != nil {

@@ -13,7 +13,6 @@ import (
 	"hash"
 	"internal/testenv"
 	"io"
-	"io/ioutil"
 	"runtime"
 	"sort"
 	"strings"
@@ -25,7 +24,7 @@ func TestOver65kFiles(t *testing.T) {
 	if testing.Short() && testenv.Builder() == "" {
 		t.Skip("skipping in short mode")
 	}
-	buf := new(bytes.Buffer)
+	buf := new(strings.Builder)
 	w := NewWriter(buf)
 	const nFiles = (1 << 16) + 42
 	for i := 0; i < nFiles; i++ {
@@ -620,7 +619,7 @@ func testZip64(t testing.TB, size int64) *rleBuffer {
 			t.Fatal("read:", err)
 		}
 	}
-	gotEnd, err := ioutil.ReadAll(rc)
+	gotEnd, err := io.ReadAll(rc)
 	if err != nil {
 		t.Fatal("read end:", err)
 	}

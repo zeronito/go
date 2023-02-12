@@ -2,14 +2,14 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// Package bug implements the ``go bug'' command.
+// Package bug implements the “go bug” command.
 package bug
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
-	"io/ioutil"
 	urlpkg "net/url"
 	"os"
 	"os/exec"
@@ -20,7 +20,9 @@ import (
 
 	"cmd/go/internal/base"
 	"cmd/go/internal/cfg"
+	"cmd/go/internal/envcmd"
 	"cmd/go/internal/web"
+	"cmd/go/internal/work"
 )
 
 var CmdBug = &base.Command{
@@ -35,13 +37,16 @@ The report includes useful system information.
 
 func init() {
 	CmdBug.Flag.BoolVar(&cfg.BuildV, "v", false, "")
+	base.AddChdirFlag(&CmdBug.Flag)
 }
 
-func runBug(cmd *base.Command, args []string) {
+func runBug(ctx context.Context, cmd *base.Command, args []string) {
 	if len(args) > 0 {
-		base.Fatalf("go bug: bug takes no arguments")
+		base.Fatalf("go: bug takes no arguments")
 	}
-	var buf bytes.Buffer
+	work.BuildInit()
+
+	var buf strings.Builder
 	buf.WriteString(bugHeader)
 	printGoVersion(&buf)
 	buf.WriteString("### Does this issue reproduce with the latest release?\n\n\n")
@@ -81,7 +86,7 @@ func printGoVersion(w io.Writer) {
 	fmt.Fprintf(w, "### What version of Go are you using (`go version`)?\n\n")
 	fmt.Fprintf(w, "<pre>\n")
 	fmt.Fprintf(w, "$ go version\n")
-	printCmdOut(w, "", "go", "version")
+	fmt.Fprintf(w, "go version %s %s/%s\n", runtime.Version(), runtime.GOOS, runtime.GOARCH)
 	fmt.Fprintf(w, "</pre>\n")
 	fmt.Fprintf(w, "\n")
 }
@@ -90,21 +95,29 @@ func printEnvDetails(w io.Writer) {
 	fmt.Fprintf(w, "### What operating system and processor architecture are you using (`go env`)?\n\n")
 	fmt.Fprintf(w, "<details><summary><code>go env</code> Output</summary><br><pre>\n")
 	fmt.Fprintf(w, "$ go env\n")
-	printCmdOut(w, "", "go", "env")
+	printGoEnv(w)
 	printGoDetails(w)
 	printOSDetails(w)
 	printCDetails(w)
 	fmt.Fprintf(w, "</pre></details>\n\n")
 }
 
+func printGoEnv(w io.Writer) {
+	env := envcmd.MkEnv()
+	env = append(env, envcmd.ExtraEnvVars()...)
+	env = append(env, envcmd.ExtraEnvVarsCostly()...)
+	envcmd.PrintEnv(w, env)
+}
+
 func printGoDetails(w io.Writer) {
-	printCmdOut(w, "GOROOT/bin/go version: ", filepath.Join(runtime.GOROOT(), "bin/go"), "version")
-	printCmdOut(w, "GOROOT/bin/go tool compile -V: ", filepath.Join(runtime.GOROOT(), "bin/go"), "tool", "compile", "-V")
+	gocmd := filepath.Join(runtime.GOROOT(), "bin/go")
+	printCmdOut(w, "GOROOT/bin/go version: ", gocmd, "version")
+	printCmdOut(w, "GOROOT/bin/go tool compile -V: ", gocmd, "tool", "compile", "-V")
 }
 
 func printOSDetails(w io.Writer) {
 	switch runtime.GOOS {
-	case "darwin":
+	case "darwin", "ios":
 		printCmdOut(w, "uname -v: ", "uname", "-v")
 		printCmdOut(w, "", "sw_vers")
 	case "linux":
@@ -116,7 +129,7 @@ func printOSDetails(w io.Writer) {
 	case "illumos", "solaris":
 		// Be sure to use the OS-supplied uname, in "/usr/bin":
 		printCmdOut(w, "uname -srv: ", "/usr/bin/uname", "-srv")
-		out, err := ioutil.ReadFile("/etc/release")
+		out, err := os.ReadFile("/etc/release")
 		if err == nil {
 			fmt.Fprintf(w, "/etc/release: %s\n", out)
 		} else {
@@ -176,7 +189,7 @@ func printGlibcVersion(w io.Writer) {
 	src := []byte(`int main() {}`)
 	srcfile := filepath.Join(tempdir, "go-bug.c")
 	outfile := filepath.Join(tempdir, "go-bug")
-	err := ioutil.WriteFile(srcfile, src, 0644)
+	err := os.WriteFile(srcfile, src, 0644)
 	if err != nil {
 		return
 	}
@@ -205,7 +218,7 @@ func printGlibcVersion(w io.Writer) {
 	fmt.Fprintf(w, "%s: %s\n", m[1], firstLine(out))
 
 	// print another line (the one containing version string) in case of musl libc
-	if idx := bytes.IndexByte(out, '\n'); bytes.Index(out, []byte("musl")) != -1 && idx > -1 {
+	if idx := bytes.IndexByte(out, '\n'); bytes.Contains(out, []byte("musl")) && idx > -1 {
 		fmt.Fprintf(w, "%s\n", firstLine(out[idx+1:]))
 	}
 }

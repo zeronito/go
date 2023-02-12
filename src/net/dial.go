@@ -7,7 +7,6 @@ package net
 import (
 	"context"
 	"internal/nettrace"
-	"internal/poll"
 	"syscall"
 	"time"
 )
@@ -96,7 +95,19 @@ type Dialer struct {
 	// Network and address parameters passed to Control method are not
 	// necessarily the ones passed to Dial. For example, passing "tcp" to Dial
 	// will cause the Control function to be called with "tcp4" or "tcp6".
+	//
+	// Control is ignored if ControlContext is not nil.
 	Control func(network, address string, c syscall.RawConn) error
+
+	// If ControlContext is not nil, it is called after creating the network
+	// connection but before actually dialing.
+	//
+	// Network and address parameters passed to Control method are not
+	// necessarily the ones passed to Dial. For example, passing "tcp" to Dial
+	// will cause the Control function to be called with "tcp4" or "tcp6".
+	//
+	// If ControlContext is not nil, Control is ignored.
+	ControlContext func(ctx context.Context, network, address string, c syscall.RawConn) error
 }
 
 func (d *Dialer) dualStack() bool { return d.FallbackDelay >= 0 }
@@ -115,6 +126,7 @@ func minNonzeroTime(a, b time.Time) time.Time {
 //   - now+Timeout
 //   - d.Deadline
 //   - the context's deadline
+//
 // Or zero, if none of Timeout, Deadline, or context's deadline is set.
 func (d *Dialer) deadline(ctx context.Context, now time.Time) (earliest time.Time) {
 	if d.Timeout != 0 { // including negative, for historical reasons
@@ -141,7 +153,7 @@ func partialDeadline(now, deadline time.Time, addrsRemaining int) (time.Time, er
 	}
 	timeRemaining := deadline.Sub(now)
 	if timeRemaining <= 0 {
-		return time.Time{}, poll.ErrTimeout
+		return time.Time{}, errTimeout
 	}
 	// Tentatively allocate equal time to each remaining address.
 	timeout := timeRemaining / time.Duration(addrsRemaining)
@@ -290,6 +302,7 @@ func (r *Resolver) resolveAddrList(ctx context.Context, op, network, addr string
 // Dial will try each IP address in order until one succeeds.
 //
 // Examples:
+//
 //	Dial("tcp", "golang.org:http")
 //	Dial("tcp", "192.0.2.1:http")
 //	Dial("tcp", "198.51.100.1:80")
@@ -305,6 +318,7 @@ func (r *Resolver) resolveAddrList(ctx context.Context, op, network, addr string
 // behaves with a non-well known protocol number such as "0" or "255".
 //
 // Examples:
+//
 //	Dial("ip4:1", "192.0.2.1")
 //	Dial("ip6:ipv6-icmp", "2001:db8::1")
 //	Dial("ip6:58", "fe80::1%lo0")
@@ -339,12 +353,16 @@ func DialTimeout(network, address string, timeout time.Duration) (Conn, error) {
 type sysDialer struct {
 	Dialer
 	network, address string
+	testHookDialTCP  func(ctx context.Context, net string, laddr, raddr *TCPAddr) (*TCPConn, error)
 }
 
 // Dial connects to the address on the named network.
 //
 // See func Dial for a description of the network and address
 // parameters.
+//
+// Dial uses context.Background internally; to specify the context, use
+// DialContext.
 func (d *Dialer) Dial(network, address string) (Conn, error) {
 	return d.DialContext(context.Background(), network, address)
 }
@@ -419,26 +437,7 @@ func (d *Dialer) DialContext(ctx context.Context, network, address string) (Conn
 		primaries = addrs
 	}
 
-	var c Conn
-	if len(fallbacks) > 0 {
-		c, err = sd.dialParallel(ctx, primaries, fallbacks)
-	} else {
-		c, err = sd.dialSerial(ctx, primaries)
-	}
-	if err != nil {
-		return nil, err
-	}
-
-	if tc, ok := c.(*TCPConn); ok && d.KeepAlive >= 0 {
-		setKeepAlive(tc.fd, true)
-		ka := d.KeepAlive
-		if d.KeepAlive == 0 {
-			ka = defaultTCPKeepAlive
-		}
-		setKeepAlivePeriod(tc.fd, ka)
-		testHookSetKeepAlive(ka)
-	}
-	return c, nil
+	return sd.dialParallel(ctx, primaries, fallbacks)
 }
 
 // dialParallel races two copies of dialSerial, giving the first a
@@ -702,6 +701,9 @@ type sysListener struct {
 //
 // See func Dial for a description of the network and address
 // parameters.
+//
+// Listen uses context.Background internally; to specify the context, use
+// ListenConfig.Listen.
 func Listen(network, address string) (Listener, error) {
 	var lc ListenConfig
 	return lc.Listen(context.Background(), network, address)
@@ -729,6 +731,9 @@ func Listen(network, address string) (Listener, error) {
 //
 // See func Dial for a description of the network and address
 // parameters.
+//
+// ListenPacket uses context.Background internally; to specify the context, use
+// ListenConfig.ListenPacket.
 func ListenPacket(network, address string) (PacketConn, error) {
 	var lc ListenConfig
 	return lc.ListenPacket(context.Background(), network, address)

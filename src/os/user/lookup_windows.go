@@ -44,7 +44,7 @@ func lookupFullNameServer(servername, username string) (string, error) {
 	}
 	defer syscall.NetApiBufferFree(p)
 	i := (*syscall.UserInfo10)(unsafe.Pointer(p))
-	return windows.UTF16PtrToString(i.FullName, 1024), nil
+	return windows.UTF16PtrToString(i.FullName), nil
 }
 
 func lookupFullName(domain, username, domainAndUser string) (string, error) {
@@ -167,7 +167,7 @@ func listGroupsForUsernameAndDomain(username, domain string) ([]string, error) {
 		if entry.Name == nil {
 			continue
 		}
-		sid, err := lookupGroupName(windows.UTF16PtrToString(entry.Name, 1024))
+		sid, err := lookupGroupName(windows.UTF16PtrToString(entry.Name))
 		if err != nil {
 			return nil, err
 		}
@@ -191,6 +191,13 @@ func newUser(uid, gid, dir, username, domain string) (*User, error) {
 	}
 	return u, nil
 }
+
+var (
+	// unused variables (in this implementation)
+	// modified during test to exercise code paths in the cgo implementation.
+	userBuffer  = 0
+	groupBuffer = 0
+)
 
 func current() (*User, error) {
 	t, e := syscall.OpenCurrentProcessToken()

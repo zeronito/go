@@ -1,5 +1,5 @@
 // Inferno utils/5l/obj.c
-// https://bitbucket.org/inferno-os/inferno-os/src/default/utils/5l/obj.c
+// https://bitbucket.org/inferno-os/inferno-os/src/master/utils/5l/obj.c
 //
 //	Copyright © 1994-1999 Lucent Technologies Inc.  All rights reserved.
 //	Portions Copyright © 1995-1997 C H Forsyth (forsyth@terzarima.net)
@@ -34,12 +34,16 @@ import (
 	"cmd/internal/objabi"
 	"cmd/internal/sys"
 	"cmd/link/internal/ld"
+	"cmd/link/internal/loader"
+	"internal/buildcfg"
 )
 
 func Init() (*sys.Arch, ld.Arch) {
 	arch := sys.ArchMIPS64
-	if objabi.GOARCH == "mips64le" {
+	musl := "/lib/ld-musl-mips64.so.1"
+	if buildcfg.GOARCH == "mips64le" {
 		arch = sys.ArchMIPS64LE
+		musl = "/lib/ld-musl-mips64el.so.1"
 	}
 
 	theArch := ld.Arch{
@@ -52,19 +56,27 @@ func Init() (*sys.Arch, ld.Arch) {
 		Archinit:         archinit,
 		Archreloc:        archreloc,
 		Archrelocvariant: archrelocvariant,
-		Asmb:             asmb,
-		Asmb2:            asmb2,
-		Elfreloc1:        elfreloc1,
-		Elfsetupplt:      elfsetupplt,
+		Extreloc:         extreloc,
 		Gentext:          gentext,
 		Machoreloc1:      machoreloc1,
 
-		Linuxdynld:     "/lib64/ld64.so.1",
-		Freebsddynld:   "XXX",
-		Openbsddynld:   "XXX",
-		Netbsddynld:    "XXX",
-		Dragonflydynld: "XXX",
-		Solarisdynld:   "XXX",
+		ELF: ld.ELFArch{
+			Linuxdynld:     "/lib64/ld64.so.1",
+			LinuxdynldMusl: musl,
+			Freebsddynld:   "XXX",
+			Openbsddynld:   "/usr/libexec/ld.so",
+			Netbsddynld:    "XXX",
+			Dragonflydynld: "XXX",
+			Solarisdynld:   "XXX",
+
+			Reloc1:    elfreloc1,
+			RelocSize: 24,
+			SetupPLT:  elfsetupplt,
+
+			// Historically GNU ld creates a read-only
+			// .dynamic section.
+			DynamicReadOnly: true,
+		},
 	}
 
 	return arch, theArch
@@ -85,7 +97,8 @@ func archinit(ctxt *ld.Link) {
 			*ld.FlagRound = 16 * 1024
 		}
 
-	case objabi.Hlinux: /* mips64 elf */
+	case objabi.Hlinux, /* mips64 elf */
+		objabi.Hopenbsd:
 		ld.Elfinit(ctxt)
 		ld.HEADR = ld.ELFRESERVE
 		if *ld.FlagTextAddr == -1 {
@@ -95,4 +108,10 @@ func archinit(ctxt *ld.Link) {
 			*ld.FlagRound = 0x10000
 		}
 	}
+}
+
+func adddynrel(target *ld.Target, ldr *loader.Loader, syms *ld.ArchSyms, s loader.Sym, r loader.Reloc, rIdx int) bool {
+	ld.Exitf("adddynrel currently unimplemented for MIPS64")
+	return false
+
 }

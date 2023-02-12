@@ -11,9 +11,12 @@
 package testenv
 
 import (
+	"bytes"
 	"errors"
 	"flag"
+	"fmt"
 	"internal/cfg"
+	"internal/platform"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -32,7 +35,7 @@ func Builder() string {
 	return os.Getenv("GO_BUILDER_NAME")
 }
 
-// HasGoBuild reports whether the current system can build programs with ``go build''
+// HasGoBuild reports whether the current system can build programs with “go build”
 // and then run them with os.StartProcess or exec.Command.
 func HasGoBuild() bool {
 	if os.Getenv("GO_GCFLAGS") != "" {
@@ -43,17 +46,13 @@ func HasGoBuild() bool {
 		return false
 	}
 	switch runtime.GOOS {
-	case "android", "js":
+	case "android", "js", "ios":
 		return false
-	case "darwin":
-		if strings.HasPrefix(runtime.GOARCH, "arm") {
-			return false
-		}
 	}
 	return true
 }
 
-// MustHaveGoBuild checks that the current system can build programs with ``go build''
+// MustHaveGoBuild checks that the current system can build programs with “go build”
 // and then run them with os.StartProcess or exec.Command.
 // If not, MustHaveGoBuild calls t.Skip with an explanation.
 func MustHaveGoBuild(t testing.TB) {
@@ -65,13 +64,13 @@ func MustHaveGoBuild(t testing.TB) {
 	}
 }
 
-// HasGoRun reports whether the current system can run programs with ``go run.''
+// HasGoRun reports whether the current system can run programs with “go run.”
 func HasGoRun() bool {
 	// For now, having go run and having go build are the same.
 	return HasGoBuild()
 }
 
-// MustHaveGoRun checks that the current system can run programs with ``go run.''
+// MustHaveGoRun checks that the current system can run programs with “go run.”
 // If not, MustHaveGoRun calls t.Skip with an explanation.
 func MustHaveGoRun(t testing.TB) {
 	if !HasGoRun() {
@@ -98,6 +97,100 @@ func GoToolPath(t testing.TB) string {
 	return path
 }
 
+var (
+	gorootOnce sync.Once
+	gorootPath string
+	gorootErr  error
+)
+
+func findGOROOT() (string, error) {
+	gorootOnce.Do(func() {
+		gorootPath = runtime.GOROOT()
+		if gorootPath != "" {
+			// If runtime.GOROOT() is non-empty, assume that it is valid.
+			//
+			// (It might not be: for example, the user may have explicitly set GOROOT
+			// to the wrong directory, or explicitly set GOROOT_FINAL but not GOROOT
+			// and hasn't moved the tree to GOROOT_FINAL yet. But those cases are
+			// rare, and if that happens the user can fix what they broke.)
+			return
+		}
+
+		// runtime.GOROOT doesn't know where GOROOT is (perhaps because the test
+		// binary was built with -trimpath, or perhaps because GOROOT_FINAL was set
+		// without GOROOT and the tree hasn't been moved there yet).
+		//
+		// Since this is internal/testenv, we can cheat and assume that the caller
+		// is a test of some package in a subdirectory of GOROOT/src. ('go test'
+		// runs the test in the directory containing the packaged under test.) That
+		// means that if we start walking up the tree, we should eventually find
+		// GOROOT/src/go.mod, and we can report the parent directory of that.
+
+		cwd, err := os.Getwd()
+		if err != nil {
+			gorootErr = fmt.Errorf("finding GOROOT: %w", err)
+			return
+		}
+
+		dir := cwd
+		for {
+			parent := filepath.Dir(dir)
+			if parent == dir {
+				// dir is either "." or only a volume name.
+				gorootErr = fmt.Errorf("failed to locate GOROOT/src in any parent directory")
+				return
+			}
+
+			if base := filepath.Base(dir); base != "src" {
+				dir = parent
+				continue // dir cannot be GOROOT/src if it doesn't end in "src".
+			}
+
+			b, err := os.ReadFile(filepath.Join(dir, "go.mod"))
+			if err != nil {
+				if os.IsNotExist(err) {
+					dir = parent
+					continue
+				}
+				gorootErr = fmt.Errorf("finding GOROOT: %w", err)
+				return
+			}
+			goMod := string(b)
+
+			for goMod != "" {
+				var line string
+				line, goMod, _ = strings.Cut(goMod, "\n")
+				fields := strings.Fields(line)
+				if len(fields) >= 2 && fields[0] == "module" && fields[1] == "std" {
+					// Found "module std", which is the module declaration in GOROOT/src!
+					gorootPath = parent
+					return
+				}
+			}
+		}
+	})
+
+	return gorootPath, gorootErr
+}
+
+// GOROOT reports the path to the directory containing the root of the Go
+// project source tree. This is normally equivalent to runtime.GOROOT, but
+// works even if the test binary was built with -trimpath.
+//
+// If GOROOT cannot be found, GOROOT skips t if t is non-nil,
+// or panics otherwise.
+func GOROOT(t testing.TB) string {
+	path, err := findGOROOT()
+	if err != nil {
+		if t == nil {
+			panic(err)
+		}
+		t.Helper()
+		t.Skip(err)
+	}
+	return path
+}
+
 // GoTool reports the path to the Go tool.
 func GoTool() (string, error) {
 	if !HasGoBuild() {
@@ -107,7 +200,11 @@ func GoTool() (string, error) {
 	if runtime.GOOS == "windows" {
 		exeSuffix = ".exe"
 	}
-	path := filepath.Join(runtime.GOROOT(), "bin", "go"+exeSuffix)
+	goroot, err := findGOROOT()
+	if err != nil {
+		return "", fmt.Errorf("cannot find go tool: %w", err)
+	}
+	path := filepath.Join(goroot, "bin", "go"+exeSuffix)
 	if _, err := os.Stat(path); err == nil {
 		return path, nil
 	}
@@ -118,56 +215,13 @@ func GoTool() (string, error) {
 	return goBin, nil
 }
 
-// HasExec reports whether the current system can start new processes
-// using os.StartProcess or (more commonly) exec.Command.
-func HasExec() bool {
-	switch runtime.GOOS {
-	case "js":
-		return false
-	case "darwin":
-		if strings.HasPrefix(runtime.GOARCH, "arm") {
-			return false
-		}
-	}
-	return true
-}
-
 // HasSrc reports whether the entire source tree is available under GOROOT.
 func HasSrc() bool {
 	switch runtime.GOOS {
-	case "darwin":
-		if strings.HasPrefix(runtime.GOARCH, "arm") {
-			return false
-		}
+	case "ios":
+		return false
 	}
 	return true
-}
-
-// MustHaveExec checks that the current system can start new processes
-// using os.StartProcess or (more commonly) exec.Command.
-// If not, MustHaveExec calls t.Skip with an explanation.
-func MustHaveExec(t testing.TB) {
-	if !HasExec() {
-		t.Skipf("skipping test: cannot exec subprocess on %s/%s", runtime.GOOS, runtime.GOARCH)
-	}
-}
-
-var execPaths sync.Map // path -> error
-
-// MustHaveExecPath checks that the current system can start the named executable
-// using os.StartProcess or (more commonly) exec.Command.
-// If not, MustHaveExecPath calls t.Skip with an explanation.
-func MustHaveExecPath(t testing.TB, path string) {
-	MustHaveExec(t)
-
-	err, found := execPaths.Load(path)
-	if !found {
-		_, err = exec.LookPath(path)
-		err, _ = execPaths.LoadOrStore(path, err)
-	}
-	if err != nil {
-		t.Skipf("skipping test: %s: %s", path, err)
-	}
 }
 
 // HasExternalNetwork reports whether the current system can use
@@ -199,6 +253,21 @@ func HasCGO() bool {
 func MustHaveCGO(t testing.TB) {
 	if !haveCGO {
 		t.Skipf("skipping test: no cgo")
+	}
+}
+
+// CanInternalLink reports whether the current system can link programs with
+// internal linking.
+func CanInternalLink() bool {
+	return !platform.MustLinkExternal(runtime.GOOS, runtime.GOARCH)
+}
+
+// MustInternalLink checks that the current system can link programs with internal
+// linking.
+// If not, MustInternalLink calls t.Skip with an explanation.
+func MustInternalLink(t testing.TB) {
+	if !CanInternalLink() {
+		t.Skipf("skipping test: internal linking on %s/%s is not supported", runtime.GOOS, runtime.GOARCH)
 	}
 }
 
@@ -249,24 +318,74 @@ func SkipFlakyNet(t testing.TB) {
 	}
 }
 
-// CleanCmdEnv will fill cmd.Env with the environment, excluding certain
-// variables that could modify the behavior of the Go tools such as
-// GODEBUG and GOTRACEBACK.
-func CleanCmdEnv(cmd *exec.Cmd) *exec.Cmd {
-	if cmd.Env != nil {
-		panic("environment already set")
+// CPUIsSlow reports whether the CPU running the test is suspected to be slow.
+func CPUIsSlow() bool {
+	switch runtime.GOARCH {
+	case "arm", "mips", "mipsle", "mips64", "mips64le":
+		return true
 	}
-	for _, env := range os.Environ() {
-		// Exclude GODEBUG from the environment to prevent its output
-		// from breaking tests that are trying to parse other command output.
-		if strings.HasPrefix(env, "GODEBUG=") {
-			continue
-		}
-		// Exclude GOTRACEBACK for the same reason.
-		if strings.HasPrefix(env, "GOTRACEBACK=") {
-			continue
-		}
-		cmd.Env = append(cmd.Env, env)
+	return false
+}
+
+// SkipIfShortAndSlow skips t if -short is set and the CPU running the test is
+// suspected to be slow.
+//
+// (This is useful for CPU-intensive tests that otherwise complete quickly.)
+func SkipIfShortAndSlow(t testing.TB) {
+	if testing.Short() && CPUIsSlow() {
+		t.Helper()
+		t.Skipf("skipping test in -short mode on %s", runtime.GOARCH)
 	}
-	return cmd
+}
+
+// SkipIfOptimizationOff skips t if optimization is disabled.
+func SkipIfOptimizationOff(t testing.TB) {
+	if OptimizationOff() {
+		t.Helper()
+		t.Skip("skipping test with optimization disabled")
+	}
+}
+
+// WriteImportcfg writes an importcfg file used by the compiler or linker to
+// dstPath containing entries for the file mappings in packageFiles, as well
+// as for the packages transitively imported by the package(s) in pkgs.
+//
+// pkgs may include any package pattern that is valid to pass to 'go list',
+// so it may also be a list of Go source files all in the same directory.
+func WriteImportcfg(t testing.TB, dstPath string, packageFiles map[string]string, pkgs ...string) {
+	t.Helper()
+
+	icfg := new(bytes.Buffer)
+	icfg.WriteString("# import config\n")
+	for k, v := range packageFiles {
+		fmt.Fprintf(icfg, "packagefile %s=%s\n", k, v)
+	}
+
+	if len(pkgs) > 0 {
+		// Use 'go list' to resolve any missing packages and rewrite the import map.
+		cmd := Command(t, GoToolPath(t), "list", "-export", "-deps", "-f", `{{if ne .ImportPath "command-line-arguments"}}{{if .Export}}{{.ImportPath}}={{.Export}}{{end}}{{end}}`)
+		cmd.Args = append(cmd.Args, pkgs...)
+		cmd.Stderr = new(strings.Builder)
+		out, err := cmd.Output()
+		if err != nil {
+			t.Fatalf("%v: %v\n%s", cmd, err, cmd.Stderr)
+		}
+
+		for _, line := range strings.Split(string(out), "\n") {
+			if line == "" {
+				continue
+			}
+			importPath, export, ok := strings.Cut(line, "=")
+			if !ok {
+				t.Fatalf("invalid line in output from %v:\n%s", cmd, line)
+			}
+			if packageFiles[importPath] == "" {
+				fmt.Fprintf(icfg, "packagefile %s=%s\n", importPath, export)
+			}
+		}
+	}
+
+	if err := os.WriteFile(dstPath, icfg.Bytes(), 0666); err != nil {
+		t.Fatal(err)
+	}
 }

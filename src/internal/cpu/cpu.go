@@ -36,7 +36,8 @@ var X86 struct {
 	HasOSXSAVE   bool
 	HasPCLMULQDQ bool
 	HasPOPCNT    bool
-	HasSSE2      bool
+	HasRDTSCP    bool
+	HasSHA       bool
 	HasSSE3      bool
 	HasSSSE3     bool
 	HasSSE41     bool
@@ -56,32 +57,18 @@ var ARM struct {
 // The booleans in ARM64 contain the correspondingly named cpu feature bit.
 // The struct is padded to avoid false sharing.
 var ARM64 struct {
-	_           CacheLinePad
-	HasFP       bool
-	HasASIMD    bool
-	HasEVTSTRM  bool
-	HasAES      bool
-	HasPMULL    bool
-	HasSHA1     bool
-	HasSHA2     bool
-	HasCRC32    bool
-	HasATOMICS  bool
-	HasFPHP     bool
-	HasASIMDHP  bool
-	HasCPUID    bool
-	HasASIMDRDM bool
-	HasJSCVT    bool
-	HasFCMA     bool
-	HasLRCPC    bool
-	HasDCPOP    bool
-	HasSHA3     bool
-	HasSM3      bool
-	HasSM4      bool
-	HasASIMDDP  bool
-	HasSHA512   bool
-	HasSVE      bool
-	HasASIMDFHM bool
-	_           CacheLinePad
+	_            CacheLinePad
+	HasAES       bool
+	HasPMULL     bool
+	HasSHA1      bool
+	HasSHA2      bool
+	HasSHA512    bool
+	HasCRC32     bool
+	HasATOMICS   bool
+	HasCPUID     bool
+	IsNeoverseN1 bool
+	IsNeoverseV1 bool
+	_            CacheLinePad
 }
 
 var MIPS64X struct {
@@ -96,12 +83,13 @@ var MIPS64X struct {
 // those as well. The minimum processor requirement is POWER8 (ISA 2.07).
 // The struct is padded to avoid false sharing.
 var PPC64 struct {
-	_        CacheLinePad
-	HasDARN  bool // Hardware random number generator (requires kernel enablement)
-	HasSCV   bool // Syscall vectored (requires kernel enablement)
-	IsPOWER8 bool // ISA v2.07 (POWER8)
-	IsPOWER9 bool // ISA v3.00 (POWER9)
-	_        CacheLinePad
+	_         CacheLinePad
+	HasDARN   bool // Hardware random number generator (requires kernel enablement)
+	HasSCV    bool // Syscall vectored (requires kernel enablement)
+	IsPOWER8  bool // ISA v2.07 (POWER8)
+	IsPOWER9  bool // ISA v3.00 (POWER9)
+	IsPOWER10 bool // ISA v3.1  (POWER10)
+	_         CacheLinePad
 }
 
 var S390X struct {
@@ -151,7 +139,6 @@ type option struct {
 	Feature   *bool
 	Specified bool // whether feature value was specified in GODEBUG
 	Enable    bool // whether feature should be enabled
-	Required  bool // whether feature is mandatory and can not be disabled
 }
 
 // processOptions enables or disables CPU feature values based on the parsed env string.
@@ -194,7 +181,7 @@ field:
 		if key == "all" {
 			for i := range options {
 				options[i].Specified = true
-				options[i].Enable = enable || options[i].Required
+				options[i].Enable = enable
 			}
 			continue field
 		}
@@ -217,11 +204,6 @@ field:
 
 		if o.Enable && !*o.Feature {
 			print("GODEBUG: can not enable \"", o.Name, "\", missing CPU support\n")
-			continue
-		}
-
-		if !o.Enable && o.Required {
-			print("GODEBUG: can not disable \"", o.Name, "\", required CPU feature\n")
 			continue
 		}
 

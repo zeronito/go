@@ -5,8 +5,8 @@
 package multipart
 
 import (
-	"bytes"
 	"io"
+	"math"
 	"os"
 	"strings"
 	"testing"
@@ -52,6 +52,19 @@ func TestReadFormWithNamelessFile(t *testing.T) {
 	}
 }
 
+// Issue 40430: Handle ReadForm(math.MaxInt64)
+func TestReadFormMaxMemoryOverflow(t *testing.T) {
+	b := strings.NewReader(strings.ReplaceAll(messageWithTextContentType, "\n", "\r\n"))
+	r := NewReader(b, boundary)
+	f, err := r.ReadForm(math.MaxInt64)
+	if err != nil {
+		t.Fatalf("ReadForm(MaxInt64): %v", err)
+	}
+	if f == nil {
+		t.Fatal("ReadForm(MaxInt64): missing form")
+	}
+}
+
 func TestReadFormWithTextContentType(t *testing.T) {
 	// From https://github.com/golang/go/issues/24041
 	b := strings.NewReader(strings.ReplaceAll(messageWithTextContentType, "\n", "\r\n"))
@@ -78,7 +91,7 @@ func testFile(t *testing.T, fh *FileHeader, efn, econtent string) File {
 	if err != nil {
 		t.Fatal("opening file:", err)
 	}
-	b := new(bytes.Buffer)
+	b := new(strings.Builder)
 	_, err = io.Copy(b, f)
 	if err != nil {
 		t.Fatal("copying contents:", err)

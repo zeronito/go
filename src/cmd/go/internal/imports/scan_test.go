@@ -7,10 +7,9 @@ package imports
 import (
 	"bytes"
 	"internal/testenv"
-	"io/ioutil"
+	"os"
 	"path"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"testing"
 )
@@ -18,7 +17,7 @@ import (
 func TestScan(t *testing.T) {
 	testenv.MustHaveGoBuild(t)
 
-	imports, testImports, err := ScanDir(filepath.Join(runtime.GOROOT(), "src/encoding/json"), Tags())
+	imports, testImports, err := ScanDir(filepath.Join(testenv.GOROOT(t), "src/encoding/json"), Tags())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -33,7 +32,7 @@ func TestScan(t *testing.T) {
 		}
 		if p == "net/http" {
 			// A test import but not an import
-			t.Errorf("json reported as importing encoding/binary but does not")
+			t.Errorf("json reported as importing net/http but does not")
 		}
 	}
 	if !foundBase64 {
@@ -57,7 +56,7 @@ func TestScan(t *testing.T) {
 func TestScanDir(t *testing.T) {
 	testenv.MustHaveGoBuild(t)
 
-	dirs, err := ioutil.ReadDir("testdata")
+	dirs, err := os.ReadDir("testdata")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -66,7 +65,7 @@ func TestScanDir(t *testing.T) {
 			continue
 		}
 		t.Run(dir.Name(), func(t *testing.T) {
-			tagsData, err := ioutil.ReadFile(filepath.Join("testdata", dir.Name(), "tags.txt"))
+			tagsData, err := os.ReadFile(filepath.Join("testdata", dir.Name(), "tags.txt"))
 			if err != nil {
 				t.Fatalf("error reading tags: %v", err)
 			}
@@ -75,7 +74,7 @@ func TestScanDir(t *testing.T) {
 				tags[t] = true
 			}
 
-			wantData, err := ioutil.ReadFile(filepath.Join("testdata", dir.Name(), "want.txt"))
+			wantData, err := os.ReadFile(filepath.Join("testdata", dir.Name(), "want.txt"))
 			if err != nil {
 				t.Fatalf("error reading want: %v", err)
 			}

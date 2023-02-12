@@ -7,8 +7,9 @@
 package src
 
 import (
+	"bytes"
 	"fmt"
-	"strconv"
+	"io"
 )
 
 // A Pos encodes a source position consisting of a (line, column) number pair
@@ -129,13 +130,22 @@ func (p Pos) String() string {
 // shown as well, as in "filename:line[origfile:origline:origcolumn] if
 // showOrig is set.
 func (p Pos) Format(showCol, showOrig bool) string {
+	buf := new(bytes.Buffer)
+	p.WriteTo(buf, showCol, showOrig)
+	return buf.String()
+}
+
+// WriteTo a position to w, formatted as Format does.
+func (p Pos) WriteTo(w io.Writer, showCol, showOrig bool) {
 	if !p.IsKnown() {
-		return "<unknown line number>"
+		io.WriteString(w, "<unknown line number>")
+		return
 	}
 
 	if b := p.base; b == b.Pos().base {
 		// base is file base (incl. nil)
-		return format(p.Filename(), p.Line(), p.Col(), showCol)
+		format(w, p.Filename(), p.Line(), p.Col(), showCol)
+		return
 	}
 
 	// base is relative
@@ -146,22 +156,32 @@ func (p Pos) Format(showCol, showOrig bool) string {
 	// that's provided via a line directive).
 	// TODO(gri) This may not be true if we have an inlining base.
 	// We may want to differentiate at some point.
-	s := format(p.RelFilename(), p.RelLine(), p.RelCol(), showCol)
+	format(w, p.RelFilename(), p.RelLine(), p.RelCol(), showCol)
 	if showOrig {
-		s += "[" + format(p.Filename(), p.Line(), p.Col(), showCol) + "]"
+		io.WriteString(w, "[")
+		format(w, p.Filename(), p.Line(), p.Col(), showCol)
+		io.WriteString(w, "]")
 	}
-	return s
 }
 
 // format formats a (filename, line, col) tuple as "filename:line" (showCol
 // is false or col == 0) or "filename:line:column" (showCol is true and col != 0).
-func format(filename string, line, col uint, showCol bool) string {
-	s := filename + ":" + strconv.FormatUint(uint64(line), 10)
+func format(w io.Writer, filename string, line, col uint, showCol bool) {
+	io.WriteString(w, filename)
+	io.WriteString(w, ":")
+	fmt.Fprint(w, line)
 	// col == 0 and col == colMax are interpreted as unknown column values
 	if showCol && 0 < col && col < colMax {
-		s += ":" + strconv.FormatUint(uint64(col), 10)
+		io.WriteString(w, ":")
+		fmt.Fprint(w, col)
 	}
-	return s
+}
+
+// formatstr wraps format to return a string.
+func formatstr(filename string, line, col uint, showCol bool) string {
+	buf := new(bytes.Buffer)
+	format(buf, filename, line, col, showCol)
+	return buf.String()
 }
 
 // ----------------------------------------------------------------------------
@@ -194,8 +214,10 @@ func NewFileBase(filename, absFilename string) *PosBase {
 }
 
 // NewLinePragmaBase returns a new *PosBase for a line directive of the form
-//      //line filename:line:col
-//      /*line filename:line:col*/
+//
+//	//line filename:line:col
+//	/*line filename:line:col*/
+//
 // at position pos.
 func NewLinePragmaBase(pos Pos, filename, absFilename string, line, col uint) *PosBase {
 	return &PosBase{pos, filename, absFilename, FileSymPrefix + absFilename, line, col, -1}
@@ -369,9 +391,12 @@ func makeBogusLico() lico {
 }
 
 func makeLico(line, col uint) lico {
-	if line > lineMax {
+	if line >= lineMax {
 		// cannot represent line, use max. line so we have some information
 		line = lineMax
+		// Drop column information if line number saturates.
+		// Ensures line+col is monotonic. See issue 51193.
+		col = 0
 	}
 	if col > colMax {
 		// cannot represent column, use max. column so we have some information
@@ -409,7 +434,7 @@ func (x lico) withIsStmt() lico {
 	return x.withStmt(PosIsStmt)
 }
 
-// withLogue attaches a prologue/epilogue attribute to a lico
+// withXlogue attaches a prologue/epilogue attribute to a lico
 func (x lico) withXlogue(xlogue PosXlogue) lico {
 	if x == 0 {
 		if xlogue == 0 {

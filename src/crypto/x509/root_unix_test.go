@@ -2,14 +2,13 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// +build dragonfly freebsd linux netbsd openbsd solaris
+//go:build dragonfly || freebsd || linux || netbsd || openbsd || solaris
 
 package x509
 
 import (
 	"bytes"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -113,15 +112,15 @@ func TestEnvVars(t *testing.T) {
 
 			// Verify that the returned certs match, otherwise report where the mismatch is.
 			for i, cn := range tc.cns {
-				if i >= len(r.certs) {
+				if i >= r.len() {
 					t.Errorf("missing cert %v @ %v", cn, i)
-				} else if r.certs[i].Subject.CommonName != cn {
-					fmt.Printf("%#v\n", r.certs[0].Subject)
-					t.Errorf("unexpected cert common name %q, want %q", r.certs[i].Subject.CommonName, cn)
+				} else if r.mustCert(t, i).Subject.CommonName != cn {
+					fmt.Printf("%#v\n", r.mustCert(t, 0).Subject)
+					t.Errorf("unexpected cert common name %q, want %q", r.mustCert(t, i).Subject.CommonName, cn)
 				}
 			}
-			if len(r.certs) > len(tc.cns) {
-				t.Errorf("got %v certs, which is more than %v wanted", len(r.certs), len(tc.cns))
+			if r.len() > len(tc.cns) {
+				t.Errorf("got %v certs, which is more than %v wanted", r.len(), len(tc.cns))
 			}
 		})
 	}
@@ -147,11 +146,7 @@ func TestLoadSystemCertsLoadColonSeparatedDirs(t *testing.T) {
 		os.Setenv(certFileEnv, origFile)
 	}()
 
-	tmpDir, err := ioutil.TempDir(os.TempDir(), "x509-issue35325")
-	if err != nil {
-		t.Fatalf("Failed to create temporary directory: %v", err)
-	}
-	defer os.RemoveAll(tmpDir)
+	tmpDir := t.TempDir()
 
 	rootPEMs := []string{
 		geoTrustRoot,
@@ -166,7 +161,7 @@ func TestLoadSystemCertsLoadColonSeparatedDirs(t *testing.T) {
 			t.Fatalf("Failed to create certificate dir: %v", err)
 		}
 		certOutFile := filepath.Join(certDir, "cert.crt")
-		if err := ioutil.WriteFile(certOutFile, []byte(certPEM), 0655); err != nil {
+		if err := os.WriteFile(certOutFile, []byte(certPEM), 0655); err != nil {
 			t.Fatalf("Failed to write certificate to file: %v", err)
 		}
 		certDirs = append(certDirs, certDir)
@@ -197,8 +192,37 @@ func TestLoadSystemCertsLoadColonSeparatedDirs(t *testing.T) {
 	strCertPool := func(p *CertPool) string {
 		return string(bytes.Join(p.Subjects(), []byte("\n")))
 	}
-	if !reflect.DeepEqual(gotPool, wantPool) {
+
+	if !certPoolEqual(gotPool, wantPool) {
 		g, w := strCertPool(gotPool), strCertPool(wantPool)
 		t.Fatalf("Mismatched certPools\nGot:\n%s\n\nWant:\n%s", g, w)
+	}
+}
+
+func TestReadUniqueDirectoryEntries(t *testing.T) {
+	tmp := t.TempDir()
+	temp := func(base string) string { return filepath.Join(tmp, base) }
+	if f, err := os.Create(temp("file")); err != nil {
+		t.Fatal(err)
+	} else {
+		f.Close()
+	}
+	if err := os.Symlink("target-in", temp("link-in")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("../target-out", temp("link-out")); err != nil {
+		t.Fatal(err)
+	}
+	got, err := readUniqueDirectoryEntries(tmp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotNames := []string{}
+	for _, fi := range got {
+		gotNames = append(gotNames, fi.Name())
+	}
+	wantNames := []string{"file", "link-out"}
+	if !reflect.DeepEqual(gotNames, wantNames) {
+		t.Errorf("got %q; want %q", gotNames, wantNames)
 	}
 }

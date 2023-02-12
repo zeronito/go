@@ -113,7 +113,7 @@ func TestAuthPlain(t *testing.T) {
 func TestClientAuthTrimSpace(t *testing.T) {
 	server := "220 hello world\r\n" +
 		"200 some more"
-	var wrote bytes.Buffer
+	var wrote strings.Builder
 	var fake faker
 	fake.ReadWriter = struct {
 		io.Reader
@@ -164,7 +164,7 @@ func TestBasic(t *testing.T) {
 	server := strings.Join(strings.Split(basicServer, "\n"), "\r\n")
 	client := strings.Join(strings.Split(basicClient, "\n"), "\r\n")
 
-	var cmdbuf bytes.Buffer
+	var cmdbuf strings.Builder
 	bcmdbuf := bufio.NewWriter(&cmdbuf)
 	var fake faker
 	fake.ReadWriter = bufio.NewReadWriter(bufio.NewReader(strings.NewReader(server)), bcmdbuf)
@@ -288,11 +288,224 @@ Goodbye.
 QUIT
 `
 
+func TestExtensions(t *testing.T) {
+	fake := func(server string) (c *Client, bcmdbuf *bufio.Writer, cmdbuf *strings.Builder) {
+		server = strings.Join(strings.Split(server, "\n"), "\r\n")
+
+		cmdbuf = &strings.Builder{}
+		bcmdbuf = bufio.NewWriter(cmdbuf)
+		var fake faker
+		fake.ReadWriter = bufio.NewReadWriter(bufio.NewReader(strings.NewReader(server)), bcmdbuf)
+		c = &Client{Text: textproto.NewConn(fake), localName: "localhost"}
+
+		return c, bcmdbuf, cmdbuf
+	}
+
+	t.Run("helo", func(t *testing.T) {
+		const (
+			basicServer = `250 mx.google.com at your service
+250 Sender OK
+221 Goodbye
+`
+
+			basicClient = `HELO localhost
+MAIL FROM:<user@gmail.com>
+QUIT
+`
+		)
+
+		c, bcmdbuf, cmdbuf := fake(basicServer)
+
+		if err := c.helo(); err != nil {
+			t.Fatalf("HELO failed: %s", err)
+		}
+		c.didHello = true
+		if err := c.Mail("user@gmail.com"); err != nil {
+			t.Fatalf("MAIL FROM failed: %s", err)
+		}
+		if err := c.Quit(); err != nil {
+			t.Fatalf("QUIT failed: %s", err)
+		}
+
+		bcmdbuf.Flush()
+		actualcmds := cmdbuf.String()
+		client := strings.Join(strings.Split(basicClient, "\n"), "\r\n")
+		if client != actualcmds {
+			t.Fatalf("Got:\n%s\nExpected:\n%s", actualcmds, client)
+		}
+	})
+
+	t.Run("ehlo", func(t *testing.T) {
+		const (
+			basicServer = `250-mx.google.com at your service
+250 SIZE 35651584
+250 Sender OK
+221 Goodbye
+`
+
+			basicClient = `EHLO localhost
+MAIL FROM:<user@gmail.com>
+QUIT
+`
+		)
+
+		c, bcmdbuf, cmdbuf := fake(basicServer)
+
+		if err := c.Hello("localhost"); err != nil {
+			t.Fatalf("EHLO failed: %s", err)
+		}
+		if ok, _ := c.Extension("8BITMIME"); ok {
+			t.Fatalf("Shouldn't support 8BITMIME")
+		}
+		if ok, _ := c.Extension("SMTPUTF8"); ok {
+			t.Fatalf("Shouldn't support SMTPUTF8")
+		}
+		if err := c.Mail("user@gmail.com"); err != nil {
+			t.Fatalf("MAIL FROM failed: %s", err)
+		}
+		if err := c.Quit(); err != nil {
+			t.Fatalf("QUIT failed: %s", err)
+		}
+
+		bcmdbuf.Flush()
+		actualcmds := cmdbuf.String()
+		client := strings.Join(strings.Split(basicClient, "\n"), "\r\n")
+		if client != actualcmds {
+			t.Fatalf("Got:\n%s\nExpected:\n%s", actualcmds, client)
+		}
+	})
+
+	t.Run("ehlo 8bitmime", func(t *testing.T) {
+		const (
+			basicServer = `250-mx.google.com at your service
+250-SIZE 35651584
+250 8BITMIME
+250 Sender OK
+221 Goodbye
+`
+
+			basicClient = `EHLO localhost
+MAIL FROM:<user@gmail.com> BODY=8BITMIME
+QUIT
+`
+		)
+
+		c, bcmdbuf, cmdbuf := fake(basicServer)
+
+		if err := c.Hello("localhost"); err != nil {
+			t.Fatalf("EHLO failed: %s", err)
+		}
+		if ok, _ := c.Extension("8BITMIME"); !ok {
+			t.Fatalf("Should support 8BITMIME")
+		}
+		if ok, _ := c.Extension("SMTPUTF8"); ok {
+			t.Fatalf("Shouldn't support SMTPUTF8")
+		}
+		if err := c.Mail("user@gmail.com"); err != nil {
+			t.Fatalf("MAIL FROM failed: %s", err)
+		}
+		if err := c.Quit(); err != nil {
+			t.Fatalf("QUIT failed: %s", err)
+		}
+
+		bcmdbuf.Flush()
+		actualcmds := cmdbuf.String()
+		client := strings.Join(strings.Split(basicClient, "\n"), "\r\n")
+		if client != actualcmds {
+			t.Fatalf("Got:\n%s\nExpected:\n%s", actualcmds, client)
+		}
+	})
+
+	t.Run("ehlo smtputf8", func(t *testing.T) {
+		const (
+			basicServer = `250-mx.google.com at your service
+250-SIZE 35651584
+250 SMTPUTF8
+250 Sender OK
+221 Goodbye
+`
+
+			basicClient = `EHLO localhost
+MAIL FROM:<user+📧@gmail.com> SMTPUTF8
+QUIT
+`
+		)
+
+		c, bcmdbuf, cmdbuf := fake(basicServer)
+
+		if err := c.Hello("localhost"); err != nil {
+			t.Fatalf("EHLO failed: %s", err)
+		}
+		if ok, _ := c.Extension("8BITMIME"); ok {
+			t.Fatalf("Shouldn't support 8BITMIME")
+		}
+		if ok, _ := c.Extension("SMTPUTF8"); !ok {
+			t.Fatalf("Should support SMTPUTF8")
+		}
+		if err := c.Mail("user+📧@gmail.com"); err != nil {
+			t.Fatalf("MAIL FROM failed: %s", err)
+		}
+		if err := c.Quit(); err != nil {
+			t.Fatalf("QUIT failed: %s", err)
+		}
+
+		bcmdbuf.Flush()
+		actualcmds := cmdbuf.String()
+		client := strings.Join(strings.Split(basicClient, "\n"), "\r\n")
+		if client != actualcmds {
+			t.Fatalf("Got:\n%s\nExpected:\n%s", actualcmds, client)
+		}
+	})
+
+	t.Run("ehlo 8bitmime smtputf8", func(t *testing.T) {
+		const (
+			basicServer = `250-mx.google.com at your service
+250-SIZE 35651584
+250-8BITMIME
+250 SMTPUTF8
+250 Sender OK
+221 Goodbye
+	`
+
+			basicClient = `EHLO localhost
+MAIL FROM:<user+📧@gmail.com> BODY=8BITMIME SMTPUTF8
+QUIT
+`
+		)
+
+		c, bcmdbuf, cmdbuf := fake(basicServer)
+
+		if err := c.Hello("localhost"); err != nil {
+			t.Fatalf("EHLO failed: %s", err)
+		}
+		c.didHello = true
+		if ok, _ := c.Extension("8BITMIME"); !ok {
+			t.Fatalf("Should support 8BITMIME")
+		}
+		if ok, _ := c.Extension("SMTPUTF8"); !ok {
+			t.Fatalf("Should support SMTPUTF8")
+		}
+		if err := c.Mail("user+📧@gmail.com"); err != nil {
+			t.Fatalf("MAIL FROM failed: %s", err)
+		}
+		if err := c.Quit(); err != nil {
+			t.Fatalf("QUIT failed: %s", err)
+		}
+
+		bcmdbuf.Flush()
+		actualcmds := cmdbuf.String()
+		client := strings.Join(strings.Split(basicClient, "\n"), "\r\n")
+		if client != actualcmds {
+			t.Fatalf("Got:\n%s\nExpected:\n%s", actualcmds, client)
+		}
+	})
+}
+
 func TestNewClient(t *testing.T) {
 	server := strings.Join(strings.Split(newClientServer, "\n"), "\r\n")
 	client := strings.Join(strings.Split(newClientClient, "\n"), "\r\n")
 
-	var cmdbuf bytes.Buffer
+	var cmdbuf strings.Builder
 	bcmdbuf := bufio.NewWriter(&cmdbuf)
 	out := func() string {
 		bcmdbuf.Flush()
@@ -337,7 +550,7 @@ func TestNewClient2(t *testing.T) {
 	server := strings.Join(strings.Split(newClient2Server, "\n"), "\r\n")
 	client := strings.Join(strings.Split(newClient2Client, "\n"), "\r\n")
 
-	var cmdbuf bytes.Buffer
+	var cmdbuf strings.Builder
 	bcmdbuf := bufio.NewWriter(&cmdbuf)
 	var fake faker
 	fake.ReadWriter = bufio.NewReadWriter(bufio.NewReader(strings.NewReader(server)), bcmdbuf)
@@ -430,7 +643,7 @@ func TestHello(t *testing.T) {
 	for i := 0; i < len(helloServer); i++ {
 		server := strings.Join(strings.Split(baseHelloServer+helloServer[i], "\n"), "\r\n")
 		client := strings.Join(strings.Split(baseHelloClient+helloClient[i], "\n"), "\r\n")
-		var cmdbuf bytes.Buffer
+		var cmdbuf strings.Builder
 		bcmdbuf := bufio.NewWriter(&cmdbuf)
 		var fake faker
 		fake.ReadWriter = bufio.NewReadWriter(bufio.NewReader(strings.NewReader(server)), bcmdbuf)
@@ -536,7 +749,7 @@ var helloClient = []string{
 func TestSendMail(t *testing.T) {
 	server := strings.Join(strings.Split(sendMailServer, "\n"), "\r\n")
 	client := strings.Join(strings.Split(sendMailClient, "\n"), "\r\n")
-	var cmdbuf bytes.Buffer
+	var cmdbuf strings.Builder
 	bcmdbuf := bufio.NewWriter(&cmdbuf)
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -693,7 +906,7 @@ SendMail is working for me.
 func TestAuthFailed(t *testing.T) {
 	server := strings.Join(strings.Split(authFailedServer, "\n"), "\r\n")
 	client := strings.Join(strings.Split(authFailedClient, "\n"), "\r\n")
-	var cmdbuf bytes.Buffer
+	var cmdbuf strings.Builder
 	bcmdbuf := bufio.NewWriter(&cmdbuf)
 	var fake faker
 	fake.ReadWriter = bufio.NewReadWriter(bufio.NewReader(strings.NewReader(server)), bcmdbuf)
@@ -735,7 +948,7 @@ QUIT
 `
 
 func TestTLSClient(t *testing.T) {
-	if (runtime.GOOS == "freebsd" && runtime.GOARCH == "amd64") || runtime.GOOS == "js" {
+	if runtime.GOOS == "freebsd" || runtime.GOOS == "js" {
 		testenv.SkipFlaky(t, 19229)
 	}
 	ln := newLocalListener(t)
@@ -891,8 +1104,9 @@ func sendMail(hostPort string) error {
 }
 
 // localhostCert is a PEM-encoded TLS cert generated from src/crypto/tls:
-// go run generate_cert.go --rsa-bits 1024 --host 127.0.0.1,::1,example.com \
-// 		--ca --start-date "Jan 1 00:00:00 1970" --duration=1000000h
+//
+//	go run generate_cert.go --rsa-bits 1024 --host 127.0.0.1,::1,example.com \
+//		--ca --start-date "Jan 1 00:00:00 1970" --duration=1000000h
 var localhostCert = []byte(`
 -----BEGIN CERTIFICATE-----
 MIICFDCCAX2gAwIBAgIRAK0xjnaPuNDSreeXb+z+0u4wDQYJKoZIhvcNAQELBQAw

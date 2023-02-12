@@ -7,47 +7,47 @@ package load
 
 import (
 	"bytes"
+	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"go/build"
 	"go/scanner"
 	"go/token"
-	"io/ioutil"
+	"internal/platform"
+	"io/fs"
 	"os"
+	"os/exec"
 	pathpkg "path"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 	"unicode"
 	"unicode/utf8"
 
 	"cmd/go/internal/base"
 	"cmd/go/internal/cfg"
+	"cmd/go/internal/fsys"
+	"cmd/go/internal/imports"
+	"cmd/go/internal/modfetch"
+	"cmd/go/internal/modindex"
 	"cmd/go/internal/modinfo"
+	"cmd/go/internal/modload"
 	"cmd/go/internal/par"
 	"cmd/go/internal/search"
 	"cmd/go/internal/str"
+	"cmd/go/internal/trace"
+	"cmd/go/internal/vcs"
+	"cmd/internal/pkgpattern"
+
+	"golang.org/x/mod/modfile"
+	"golang.org/x/mod/module"
 )
-
-var (
-	// module initialization hook; never nil, no-op if module use is disabled
-	ModInit func()
-
-	// module hooks; nil if module use is disabled
-	ModBinDir            func() string                                                                            // return effective bin directory
-	ModLookup            func(parentPath string, parentIsStd bool, path string) (dir, realPath string, err error) // lookup effective meaning of import
-	ModPackageModuleInfo func(path string) *modinfo.ModulePublic                                                  // return module info for Package struct
-	ModImportPaths       func(args []string) []*search.Match                                                      // expand import paths
-	ModPackageBuildInfo  func(main string, deps []string) string                                                  // return module info to embed in binary
-	ModInfoProg          func(info string, isgccgo bool) []byte                                                   // wrap module info in .go code for binary
-	ModImportFromFiles   func([]string)                                                                           // update go.mod to add modules for imports in these files
-	ModDirImportPath     func(string) string                                                                      // return effective import path for directory
-)
-
-var IgnoreImports bool // control whether we ignore imports in packages
 
 // A Package describes a single package found in a directory.
 type Package struct {
@@ -70,6 +70,7 @@ type PackagePublic struct {
 	ConflictDir   string                `json:",omitempty"` // Dir is hidden by this other directory
 	ForTest       string                `json:",omitempty"` // package is only for use in named test
 	Export        string                `json:",omitempty"` // file containing export data (set by go list -export)
+	BuildID       string                `json:",omitempty"` // build ID of the compiled package (set by go list -export)
 	Module        *modinfo.ModulePublic `json:",omitempty"` // info about package's module, if any
 	Match         []string              `json:",omitempty"` // command-line patterns matching this package
 	Goroot        bool                  `json:",omitempty"` // is this package found in the Go root?
@@ -87,19 +88,25 @@ type PackagePublic struct {
 	// Source files
 	// If you add to this list you MUST add to p.AllFiles (below) too.
 	// Otherwise file name security lists will not apply to any new additions.
-	GoFiles         []string `json:",omitempty"` // .go source files (excluding CgoFiles, TestGoFiles, XTestGoFiles)
-	CgoFiles        []string `json:",omitempty"` // .go source files that import "C"
-	CompiledGoFiles []string `json:",omitempty"` // .go output from running cgo on CgoFiles
-	IgnoredGoFiles  []string `json:",omitempty"` // .go source files ignored due to build constraints
-	CFiles          []string `json:",omitempty"` // .c source files
-	CXXFiles        []string `json:",omitempty"` // .cc, .cpp and .cxx source files
-	MFiles          []string `json:",omitempty"` // .m source files
-	HFiles          []string `json:",omitempty"` // .h, .hh, .hpp and .hxx source files
-	FFiles          []string `json:",omitempty"` // .f, .F, .for and .f90 Fortran source files
-	SFiles          []string `json:",omitempty"` // .s source files
-	SwigFiles       []string `json:",omitempty"` // .swig files
-	SwigCXXFiles    []string `json:",omitempty"` // .swigcxx files
-	SysoFiles       []string `json:",omitempty"` // .syso system object files added to package
+	GoFiles           []string `json:",omitempty"` // .go source files (excluding CgoFiles, TestGoFiles, XTestGoFiles)
+	CgoFiles          []string `json:",omitempty"` // .go source files that import "C"
+	CompiledGoFiles   []string `json:",omitempty"` // .go output from running cgo on CgoFiles
+	IgnoredGoFiles    []string `json:",omitempty"` // .go source files ignored due to build constraints
+	InvalidGoFiles    []string `json:",omitempty"` // .go source files with detected problems (parse error, wrong package name, and so on)
+	IgnoredOtherFiles []string `json:",omitempty"` // non-.go source files ignored due to build constraints
+	CFiles            []string `json:",omitempty"` // .c source files
+	CXXFiles          []string `json:",omitempty"` // .cc, .cpp and .cxx source files
+	MFiles            []string `json:",omitempty"` // .m source files
+	HFiles            []string `json:",omitempty"` // .h, .hh, .hpp and .hxx source files
+	FFiles            []string `json:",omitempty"` // .f, .F, .for and .f90 Fortran source files
+	SFiles            []string `json:",omitempty"` // .s source files
+	SwigFiles         []string `json:",omitempty"` // .swig files
+	SwigCXXFiles      []string `json:",omitempty"` // .swigcxx files
+	SysoFiles         []string `json:",omitempty"` // .syso system object files added to package
+
+	// Embedded files
+	EmbedPatterns []string `json:",omitempty"` // //go:embed patterns
+	EmbedFiles    []string `json:",omitempty"` // files matched by EmbedPatterns
 
 	// Cgo directives
 	CgoCFLAGS    []string `json:",omitempty"` // cgo: flags for C compiler
@@ -122,10 +129,14 @@ type PackagePublic struct {
 	// Test information
 	// If you add to this list you MUST add to p.AllFiles (below) too.
 	// Otherwise file name security lists will not apply to any new additions.
-	TestGoFiles  []string `json:",omitempty"` // _test.go files in package
-	TestImports  []string `json:",omitempty"` // imports from TestGoFiles
-	XTestGoFiles []string `json:",omitempty"` // _test.go files outside package
-	XTestImports []string `json:",omitempty"` // imports from XTestGoFiles
+	TestGoFiles        []string `json:",omitempty"` // _test.go files in package
+	TestImports        []string `json:",omitempty"` // imports from TestGoFiles
+	TestEmbedPatterns  []string `json:",omitempty"` // //go:embed patterns
+	TestEmbedFiles     []string `json:",omitempty"` // files matched by TestEmbedPatterns
+	XTestGoFiles       []string `json:",omitempty"` // _test.go files outside package
+	XTestImports       []string `json:",omitempty"` // imports from XTestGoFiles
+	XTestEmbedPatterns []string `json:",omitempty"` // //go:embed patterns
+	XTestEmbedFiles    []string `json:",omitempty"` // files matched by XTestEmbedPatterns
 }
 
 // AllFiles returns the names of all the files considered for the package.
@@ -134,11 +145,13 @@ type PackagePublic struct {
 // The go/build package filtered others out (like foo_wrongGOARCH.s)
 // and that's OK.
 func (p *Package) AllFiles() []string {
-	return str.StringList(
+	files := str.StringList(
 		p.GoFiles,
 		p.CgoFiles,
 		// no p.CompiledGoFiles, because they are from GoFiles or generated by us
 		p.IgnoredGoFiles,
+		// no p.InvalidGoFiles, because they are from GoFiles
+		p.IgnoredOtherFiles,
 		p.CFiles,
 		p.CXXFiles,
 		p.MFiles,
@@ -151,6 +164,27 @@ func (p *Package) AllFiles() []string {
 		p.TestGoFiles,
 		p.XTestGoFiles,
 	)
+
+	// EmbedFiles may overlap with the other files.
+	// Dedup, but delay building the map as long as possible.
+	// Only files in the current directory (no slash in name)
+	// need to be checked against the files variable above.
+	var have map[string]bool
+	for _, file := range p.EmbedFiles {
+		if !strings.Contains(file, "/") {
+			if have == nil {
+				have = make(map[string]bool)
+				for _, file := range files {
+					have[file] = true
+				}
+			}
+			if have[file] {
+				continue
+			}
+		}
+		files = append(files, file)
+	}
+	return files
 }
 
 // Desc returns the package "description", for use in b.showOutput.
@@ -161,12 +195,24 @@ func (p *Package) Desc() string {
 	return p.ImportPath
 }
 
+// IsTestOnly reports whether p is a test-only package.
+//
+// A “test-only” package is one that:
+//   - is a test-only variant of an ordinary package, or
+//   - is a synthesized "main" package for a test binary, or
+//   - contains only _test.go files.
+func (p *Package) IsTestOnly() bool {
+	return p.ForTest != "" ||
+		p.Internal.TestmainGo != nil ||
+		len(p.TestGoFiles)+len(p.XTestGoFiles) > 0 && len(p.GoFiles)+len(p.CgoFiles) == 0
+}
+
 type PackageInternal struct {
 	// Unexported fields are not part of the public API.
 	Build             *build.Package
 	Imports           []*Package           // this package's direct imports
-	CompiledImports   []string             // additional Imports necessary when using CompiledGoFiles (all from standard library)
-	RawImports        []string             // this package's original imports as they appear in the text of the program
+	CompiledImports   []string             // additional Imports necessary when using CompiledGoFiles (all from standard library); 1:1 with the end of PackagePublic.Imports
+	RawImports        []string             // this package's original imports as they appear in the text of the program; 1:1 with the end of PackagePublic.Imports
 	ForceLibrary      bool                 // this package is a library (even if named "main")
 	CmdlineFiles      bool                 // package built from files listed on command line
 	CmdlinePkg        bool                 // package listed on command line
@@ -174,12 +220,16 @@ type PackageInternal struct {
 	Local             bool                 // imported via local path (./ or ../)
 	LocalPrefix       string               // interpret ./ and ../ imports relative to this prefix
 	ExeName           string               // desired name for temporary executable
+	FuzzInstrument    bool                 // package should be instrumented for fuzzing
 	CoverMode         string               // preprocess Go source files with the coverage tool in this mode
 	CoverVars         map[string]*CoverVar // variables created by coverage analysis
+	CoverageCfg       string               // coverage info config file path (passed to compiler)
 	OmitDebug         bool                 // tell linker not to write debug information
 	GobinSubdir       bool                 // install target would be subdir of GOBIN
 	BuildInfo         string               // add this info to package main
 	TestmainGo        *[]byte              // content for _testmain.go
+	Embed             map[string][]string  // //go:embed comment mapping
+	OrigImportPath    string               // original import path before adding '_test' suffix
 
 	Asmflags   []string // -asmflags for this package
 	Gcflags    []string // -gcflags for this package
@@ -197,7 +247,7 @@ type NoGoError struct {
 }
 
 func (e *NoGoError) Error() string {
-	if len(e.Package.constraintIgnoredGoFiles()) > 0 {
+	if len(e.Package.IgnoredGoFiles) > 0 {
 		// Go files exist, but they were ignored due to build constraints.
 		return "build constraints exclude all Go files in " + e.Package.Dir
 	}
@@ -217,16 +267,9 @@ func (e *NoGoError) Error() string {
 // setLoadPackageDataError returns true if it's safe to load information about
 // imported packages, for example, if there was a parse error loading imports
 // in one file, but other files are okay.
-//
-// TODO(jayconrod): we should probably return nothing and always try to load
-// imported packages.
-func (p *Package) setLoadPackageDataError(err error, path string, stk *ImportStack) (canLoadImports bool) {
-	// Include the path on the import stack unless the error includes it already.
-	errHasPath := false
-	if impErr, ok := err.(ImportPathError); ok && impErr.ImportPath() == path {
-		errHasPath = true
-	} else if matchErr, ok := err.(*search.MatchError); ok && matchErr.Match.Pattern() == path {
-		errHasPath = true
+func (p *Package) setLoadPackageDataError(err error, path string, stk *ImportStack, importPos []token.Position) {
+	matchErr, isMatchErr := err.(*search.MatchError)
+	if isMatchErr && matchErr.Match.Pattern() == path {
 		if matchErr.Match.IsLiteral() {
 			// The error has a pattern has a pattern similar to the import path.
 			// It may be slightly different (./foo matching example.com/foo),
@@ -234,14 +277,6 @@ func (p *Package) setLoadPackageDataError(err error, path string, stk *ImportSta
 			// Unwrap the error so we don't show the pattern.
 			err = matchErr.Err
 		}
-	}
-	var errStk []string
-	if errHasPath {
-		errStk = stk.Copy()
-	} else {
-		stk.Push(path)
-		errStk = stk.Copy()
-		stk.Pop()
 	}
 
 	// Replace (possibly wrapped) *build.NoGoError with *load.NoGoError.
@@ -258,20 +293,45 @@ func (p *Package) setLoadPackageDataError(err error, path string, stk *ImportSta
 	// has room for one position, so we report the first error with a position
 	// instead of all of the errors without a position.
 	var pos string
+	var isScanErr bool
 	if scanErr, ok := err.(scanner.ErrorList); ok && len(scanErr) > 0 {
+		isScanErr = true // For stack push/pop below.
+
 		scanPos := scanErr[0].Pos
 		scanPos.Filename = base.ShortPath(scanPos.Filename)
 		pos = scanPos.String()
 		err = errors.New(scanErr[0].Msg)
-		canLoadImports = true
+	}
+
+	// Report the error on the importing package if the problem is with the import declaration
+	// for example, if the package doesn't exist or if the import path is malformed.
+	// On the other hand, don't include a position if the problem is with the imported package,
+	// for example there are no Go files (NoGoError), or there's a problem in the imported
+	// package's source files themselves (scanner errors).
+	//
+	// TODO(matloob): Perhaps make each of those the errors in the first group
+	// (including modload.ImportMissingError, ImportMissingSumError, and the
+	// corresponding "cannot find package %q in any of" GOPATH-mode error
+	// produced in build.(*Context).Import; modload.AmbiguousImportError,
+	// and modload.PackageNotInModuleError; and the malformed module path errors
+	// produced in golang.org/x/mod/module.CheckMod) implement an interface
+	// to make it easier to check for them? That would save us from having to
+	// move the modload errors into this package to avoid a package import cycle,
+	// and from having to export an error type for the errors produced in build.
+	if !isMatchErr && (nogoErr != nil || isScanErr) {
+		stk.Push(path)
+		defer stk.Pop()
 	}
 
 	p.Error = &PackageError{
-		ImportStack: errStk,
+		ImportStack: stk.Copy(),
 		Pos:         pos,
 		Err:         err,
 	}
-	return canLoadImports
+
+	if path != stk.Top() {
+		p.Error.setPos(importPos)
+	}
 }
 
 // Resolve returns the resolved version of imports,
@@ -307,14 +367,16 @@ type CoverVar struct {
 	Var  string // name of count struct
 }
 
-func (p *Package) copyBuild(pp *build.Package) {
+func (p *Package) copyBuild(opts PackageOpts, pp *build.Package) {
 	p.Internal.Build = pp
 
 	if pp.PkgTargetRoot != "" && cfg.BuildPkgdir != "" {
 		old := pp.PkgTargetRoot
 		pp.PkgRoot = cfg.BuildPkgdir
 		pp.PkgTargetRoot = cfg.BuildPkgdir
-		pp.PkgObj = filepath.Join(cfg.BuildPkgdir, strings.TrimPrefix(pp.PkgObj, old))
+		if pp.PkgObj != "" {
+			pp.PkgObj = filepath.Join(cfg.BuildPkgdir, strings.TrimPrefix(pp.PkgObj, old))
+		}
 	}
 
 	p.Dir = pp.Dir
@@ -332,6 +394,8 @@ func (p *Package) copyBuild(pp *build.Package) {
 	p.GoFiles = pp.GoFiles
 	p.CgoFiles = pp.CgoFiles
 	p.IgnoredGoFiles = pp.IgnoredGoFiles
+	p.InvalidGoFiles = pp.InvalidGoFiles
+	p.IgnoredOtherFiles = pp.IgnoredOtherFiles
 	p.CFiles = pp.CFiles
 	p.CXXFiles = pp.CXXFiles
 	p.MFiles = pp.MFiles
@@ -341,6 +405,12 @@ func (p *Package) copyBuild(pp *build.Package) {
 	p.SwigFiles = pp.SwigFiles
 	p.SwigCXXFiles = pp.SwigCXXFiles
 	p.SysoFiles = pp.SysoFiles
+	if cfg.BuildMSan {
+		// There's no way for .syso files to be built both with and without
+		// support for memory sanitizer. Assume they are built without,
+		// and drop them.
+		p.SysoFiles = nil
+	}
 	p.CgoCFLAGS = pp.CgoCFLAGS
 	p.CgoCPPFLAGS = pp.CgoCPPFLAGS
 	p.CgoCXXFLAGS = pp.CgoCXXFLAGS
@@ -355,12 +425,16 @@ func (p *Package) copyBuild(pp *build.Package) {
 	p.TestImports = pp.TestImports
 	p.XTestGoFiles = pp.XTestGoFiles
 	p.XTestImports = pp.XTestImports
-	if IgnoreImports {
+	if opts.IgnoreImports {
 		p.Imports = nil
 		p.Internal.RawImports = nil
 		p.TestImports = nil
 		p.XTestImports = nil
 	}
+	p.EmbedPatterns = pp.EmbedPatterns
+	p.TestEmbedPatterns = pp.TestEmbedPatterns
+	p.XTestEmbedPatterns = pp.XTestEmbedPatterns
+	p.Internal.OrigImportPath = pp.ImportPath
 }
 
 // A PackageError describes an error loading information about a package.
@@ -374,6 +448,9 @@ type PackageError struct {
 }
 
 func (p *PackageError) Error() string {
+	// TODO(#43696): decide when to print the stack or the position based on
+	// the error type and whether the package is in the main module.
+	// Document the rationale.
 	if p.Pos != "" && (len(p.ImportStack) == 0 || !p.alwaysPrintStack) {
 		// Omit import stack. The full path to the file where the error
 		// is the most important thing.
@@ -409,6 +486,15 @@ func (p *PackageError) MarshalJSON() ([]byte, error) {
 	return json.Marshal(perr)
 }
 
+func (p *PackageError) setPos(posList []token.Position) {
+	if len(posList) == 0 {
+		return
+	}
+	pos := posList[0]
+	pos.Filename = base.ShortPath(pos.Filename)
+	p.Pos = pos.String()
+}
+
 // ImportPathError is a type of error that prevents a package from being loaded
 // for a given import path. When such a package is loaded, a *Package is
 // returned with Err wrapping an ImportPathError: the error is attached to
@@ -422,14 +508,20 @@ type ImportPathError interface {
 	ImportPath() string
 }
 
+var (
+	_ ImportPathError = (*importError)(nil)
+	_ ImportPathError = (*mainPackageError)(nil)
+	_ ImportPathError = (*modload.ImportMissingError)(nil)
+	_ ImportPathError = (*modload.ImportMissingSumError)(nil)
+	_ ImportPathError = (*modload.DirectImportFromImplicitDependencyError)(nil)
+)
+
 type importError struct {
 	importPath string
 	err        error // created with fmt.Errorf
 }
 
-var _ ImportPathError = (*importError)(nil)
-
-func ImportErrorf(path, format string, args ...interface{}) ImportPathError {
+func ImportErrorf(path, format string, args ...any) ImportPathError {
 	err := &importError{importPath: path, err: fmt.Errorf(format, args...)}
 	if errStr := err.Error(); !strings.Contains(errStr, path) {
 		panic(fmt.Sprintf("path %q not in error %q", path, errStr))
@@ -466,6 +558,13 @@ func (s *ImportStack) Pop() {
 
 func (s *ImportStack) Copy() []string {
 	return append([]string{}, *s...)
+}
+
+func (s *ImportStack) Top() string {
+	if len(*s) == 0 {
+		return ""
+	}
+	return (*s)[len(*s)-1]
 }
 
 // shorterThan reports whether sp is shorter than t.
@@ -513,11 +612,11 @@ func ClearPackageCachePartial(args []string) {
 			delete(packageCache, arg)
 		}
 	}
-	resolvedImportCache.DeleteIf(func(key interface{}) bool {
-		return shouldDelete[key.(importSpec).path]
+	resolvedImportCache.DeleteIf(func(key importSpec) bool {
+		return shouldDelete[key.path]
 	})
-	packageDataCache.DeleteIf(func(key interface{}) bool {
-		return shouldDelete[key.(string)]
+	packageDataCache.DeleteIf(func(key string) bool {
+		return shouldDelete[key]
 	})
 }
 
@@ -529,12 +628,12 @@ func ReloadPackageNoFlags(arg string, stk *ImportStack) *Package {
 	p := packageCache[arg]
 	if p != nil {
 		delete(packageCache, arg)
-		resolvedImportCache.DeleteIf(func(key interface{}) bool {
-			return key.(importSpec).path == p.ImportPath
+		resolvedImportCache.DeleteIf(func(key importSpec) bool {
+			return key.path == p.ImportPath
 		})
 		packageDataCache.Delete(p.ImportPath)
 	}
-	return LoadImport(arg, base.Cwd, nil, stk, nil, 0)
+	return LoadImport(context.TODO(), PackageOpts{}, arg, base.Cwd(), nil, stk, nil, 0)
 }
 
 // dirToImportPath returns the pseudo-import path we use for a package
@@ -586,11 +685,14 @@ const (
 // LoadImport does not set tool flags and should only be used by
 // this package, as part of a bigger load operation, and by GOPATH-based "go get".
 // TODO(rsc): When GOPATH-based "go get" is removed, unexport this function.
-func LoadImport(path, srcDir string, parent *Package, stk *ImportStack, importPos []token.Position, mode int) *Package {
-	return loadImport(nil, path, srcDir, parent, stk, importPos, mode)
+func LoadImport(ctx context.Context, opts PackageOpts, path, srcDir string, parent *Package, stk *ImportStack, importPos []token.Position, mode int) *Package {
+	return loadImport(ctx, opts, nil, path, srcDir, parent, stk, importPos, mode)
 }
 
-func loadImport(pre *preload, path, srcDir string, parent *Package, stk *ImportStack, importPos []token.Position, mode int) *Package {
+func loadImport(ctx context.Context, opts PackageOpts, pre *preload, path, srcDir string, parent *Package, stk *ImportStack, importPos []token.Position, mode int) *Package {
+	ctx, span := trace.StartSpan(ctx, "modload.loadImport "+path)
+	defer span.Done()
+
 	if path == "" {
 		panic("LoadImport called with empty package path")
 	}
@@ -602,25 +704,30 @@ func loadImport(pre *preload, path, srcDir string, parent *Package, stk *ImportS
 		parentRoot = parent.Root
 		parentIsStd = parent.Standard
 	}
-	bp, loaded, err := loadPackageData(path, parentPath, srcDir, parentRoot, parentIsStd, mode)
-	if loaded && pre != nil && !IgnoreImports {
-		pre.preloadImports(bp.Imports, bp)
+	bp, loaded, err := loadPackageData(ctx, path, parentPath, srcDir, parentRoot, parentIsStd, mode)
+	if loaded && pre != nil && !opts.IgnoreImports {
+		pre.preloadImports(ctx, opts, bp.Imports, bp)
 	}
 	if bp == nil {
+		p := &Package{
+			PackagePublic: PackagePublic{
+				ImportPath: path,
+				Incomplete: true,
+			},
+		}
 		if importErr, ok := err.(ImportPathError); !ok || importErr.ImportPath() != path {
-			// Only add path to the error's import stack if it's not already present on the error.
+			// Only add path to the error's import stack if it's not already present
+			// in the error.
+			//
+			// TODO(bcmills): setLoadPackageDataError itself has a similar Push / Pop
+			// sequence that empirically doesn't trigger for these errors, guarded by
+			// a somewhat complex condition. Figure out how to generalize that
+			// condition and eliminate the explicit calls here.
 			stk.Push(path)
 			defer stk.Pop()
 		}
-		return &Package{
-			PackagePublic: PackagePublic{
-				ImportPath: path,
-				Error: &PackageError{
-					ImportStack: stk.Copy(),
-					Err:         err,
-				},
-			},
-		}
+		p.setLoadPackageDataError(err, path, stk, nil)
+		return p
 	}
 
 	importPath := bp.ImportPath
@@ -638,13 +745,7 @@ func loadImport(pre *preload, path, srcDir string, parent *Package, stk *ImportS
 		// Load package.
 		// loadPackageData may return bp != nil even if an error occurs,
 		// in order to return partial information.
-		p.load(path, stk, bp, err)
-		// Add position information unless this is a NoGoError or an ImportCycle error.
-		// Import cycles deserve special treatment.
-		var g *build.NoGoError
-		if p.Error != nil && p.Error.Pos == "" && !errors.As(err, &g) && !p.Error.IsImportCycle {
-			p = setErrorPos(p, importPos)
-		}
+		p.load(ctx, opts, path, stk, importPos, bp, err)
 
 		if !cfg.ModulesEnabled && path != cleanImport(path) {
 			p.Error = &PackageError{
@@ -652,17 +753,19 @@ func loadImport(pre *preload, path, srcDir string, parent *Package, stk *ImportS
 				Err:         ImportErrorf(path, "non-canonical import path %q: should be %q", path, pathpkg.Clean(path)),
 			}
 			p.Incomplete = true
-			setErrorPos(p, importPos)
+			p.Error.setPos(importPos)
 		}
 	}
 
 	// Checked on every import because the rules depend on the code doing the importing.
-	if perr := disallowInternal(srcDir, parent, parentPath, p, stk); perr != p {
-		return setErrorPos(perr, importPos)
+	if perr := disallowInternal(ctx, srcDir, parent, parentPath, p, stk); perr != p {
+		perr.Error.setPos(importPos)
+		return perr
 	}
 	if mode&ResolveImport != 0 {
 		if perr := disallowVendor(srcDir, path, parentPath, p, stk); perr != p {
-			return setErrorPos(perr, importPos)
+			perr.Error.setPos(importPos)
+			return perr
 		}
 	}
 
@@ -672,7 +775,8 @@ func loadImport(pre *preload, path, srcDir string, parent *Package, stk *ImportS
 			ImportStack: stk.Copy(),
 			Err:         ImportErrorf(path, "import %q is a program, not an importable package", path),
 		}
-		return setErrorPos(&perr, importPos)
+		perr.Error.setPos(importPos)
+		return &perr
 	}
 
 	if p.Internal.Local && parent != nil && !parent.Internal.Local {
@@ -687,18 +791,10 @@ func loadImport(pre *preload, path, srcDir string, parent *Package, stk *ImportS
 			ImportStack: stk.Copy(),
 			Err:         err,
 		}
-		return setErrorPos(&perr, importPos)
+		perr.Error.setPos(importPos)
+		return &perr
 	}
 
-	return p
-}
-
-func setErrorPos(p *Package, importPos []token.Position) *Package {
-	if len(importPos) > 0 {
-		pos := importPos[0]
-		pos.Filename = base.ShortPath(pos.Filename)
-		p.Error.Pos = pos.String()
-	}
 	return p
 }
 
@@ -711,7 +807,10 @@ func setErrorPos(p *Package, importPos []token.Position) *Package {
 //
 // loadPackageData returns a boolean, loaded, which is true if this is the
 // first time the package was loaded. Callers may preload imports in this case.
-func loadPackageData(path, parentPath, parentDir, parentRoot string, parentIsStd bool, mode int) (bp *build.Package, loaded bool, err error) {
+func loadPackageData(ctx context.Context, path, parentPath, parentDir, parentRoot string, parentIsStd bool, mode int) (bp *build.Package, loaded bool, err error) {
+	ctx, span := trace.StartSpan(ctx, "load.loadPackageData "+path)
+	defer span.Done()
+
 	if path == "" {
 		panic("loadPackageData called with empty package path")
 	}
@@ -726,11 +825,7 @@ func loadPackageData(path, parentPath, parentDir, parentRoot string, parentIsStd
 	}
 
 	if strings.Contains(path, "@") {
-		if cfg.ModulesEnabled {
-			return nil, false, errors.New("can only use path@version syntax with 'go get'")
-		} else {
-			return nil, false, errors.New("cannot use path@version syntax in GOPATH mode")
-		}
+		return nil, false, errors.New("can only use path@version syntax with 'go get' and 'go install' in module-aware mode")
 	}
 
 	// Determine canonical package path and directory.
@@ -740,7 +835,7 @@ func loadPackageData(path, parentPath, parentDir, parentRoot string, parentIsStd
 	// For vendored imports, it is the expanded form.
 	//
 	// Note that when modules are enabled, local import paths are normally
-	// canonicalized by modload.ImportPaths before now. However, if there's an
+	// canonicalized by modload.LoadPackages before now. However, if there's an
 	// error resolving a local path, it will be returned untransformed
 	// so that 'go list -e' reports something useful.
 	importKey := importSpec{
@@ -751,13 +846,13 @@ func loadPackageData(path, parentPath, parentDir, parentRoot string, parentIsStd
 		parentIsStd: parentIsStd,
 		mode:        mode,
 	}
-	r := resolvedImportCache.Do(importKey, func() interface{} {
+	r := resolvedImportCache.Do(importKey, func() resolvedImport {
 		var r resolvedImport
-		if build.IsLocalImport(path) {
+		if cfg.ModulesEnabled {
+			r.dir, r.path, r.err = modload.Lookup(parentPath, parentIsStd, path)
+		} else if build.IsLocalImport(path) {
 			r.dir = filepath.Join(parentDir, path)
 			r.path = dirToImportPath(r.dir)
-		} else if cfg.ModulesEnabled {
-			r.dir, r.path, r.err = ModLookup(parentPath, parentIsStd, path)
 		} else if mode&ResolveImport != 0 {
 			// We do our own path resolution, because we want to
 			// find out the key to use in packageCache without the
@@ -771,25 +866,71 @@ func loadPackageData(path, parentPath, parentDir, parentRoot string, parentIsStd
 			r.path = path
 		}
 		return r
-	}).(resolvedImport)
+	})
 	// Invariant: r.path is set to the resolved import path. If the path cannot
 	// be resolved, r.path is set to path, the source import path.
 	// r.path is never empty.
 
 	// Load the package from its directory. If we already found the package's
 	// directory when resolving its import path, use that.
-	data := packageDataCache.Do(r.path, func() interface{} {
+	p, err := packageDataCache.Do(r.path, func() (*build.Package, error) {
 		loaded = true
-		var data packageData
+		var data struct {
+			p   *build.Package
+			err error
+		}
 		if r.dir != "" {
 			var buildMode build.ImportMode
+			buildContext := cfg.BuildContext
 			if !cfg.ModulesEnabled {
 				buildMode = build.ImportComment
+			} else {
+				buildContext.GOPATH = "" // Clear GOPATH so packages are imported as pure module packages
 			}
-			data.p, data.err = cfg.BuildContext.ImportDir(r.dir, buildMode)
-			if data.p.Root == "" && cfg.ModulesEnabled {
-				if info := ModPackageModuleInfo(path); info != nil {
+			modroot := modload.PackageModRoot(ctx, r.path)
+			if modroot == "" && str.HasPathPrefix(r.dir, cfg.GOROOTsrc) {
+				modroot = cfg.GOROOTsrc
+				gorootSrcCmd := filepath.Join(cfg.GOROOTsrc, "cmd")
+				if str.HasPathPrefix(r.dir, gorootSrcCmd) {
+					modroot = gorootSrcCmd
+				}
+			}
+			if modroot != "" {
+				if rp, err := modindex.GetPackage(modroot, r.dir); err == nil {
+					data.p, data.err = rp.Import(cfg.BuildContext, buildMode)
+					goto Happy
+				} else if !errors.Is(err, modindex.ErrNotIndexed) {
+					base.Fatalf("go: %v", err)
+				}
+			}
+			data.p, data.err = buildContext.ImportDir(r.dir, buildMode)
+		Happy:
+			if cfg.ModulesEnabled {
+				// Override data.p.Root, since ImportDir sets it to $GOPATH, if
+				// the module is inside $GOPATH/src.
+				if info := modload.PackageModuleInfo(ctx, path); info != nil {
 					data.p.Root = info.Dir
+				}
+			}
+			if r.err != nil {
+				if data.err != nil {
+					// ImportDir gave us one error, and the module loader gave us another.
+					// We arbitrarily choose to keep the error from ImportDir because
+					// that's what our tests already expect, and it seems to provide a bit
+					// more detail in most cases.
+				} else if errors.Is(r.err, imports.ErrNoGo) {
+					// ImportDir said there were files in the package, but the module
+					// loader said there weren't. Which one is right?
+					// Without this special-case hack, the TestScript/test_vet case fails
+					// on the vetfail/p1 package (added in CL 83955).
+					// Apparently, imports.ShouldBuild biases toward rejecting files
+					// with invalid build constraints, whereas ImportDir biases toward
+					// accepting them.
+					//
+					// TODO(#41410: Figure out how this actually ought to work and fix
+					// this mess.
+				} else {
+					data.err = r.err
 				}
 			}
 		} else if r.err != nil {
@@ -814,7 +955,7 @@ func loadPackageData(path, parentPath, parentDir, parentRoot string, parentIsStd
 			if cfg.GOBIN != "" {
 				data.p.BinDir = cfg.GOBIN
 			} else if cfg.ModulesEnabled {
-				data.p.BinDir = ModBinDir()
+				data.p.BinDir = modload.BinDir()
 			}
 		}
 
@@ -823,10 +964,10 @@ func loadPackageData(path, parentPath, parentDir, parentRoot string, parentIsStd
 			!strings.Contains(path, "/vendor/") && !strings.HasPrefix(path, "vendor/") {
 			data.err = fmt.Errorf("code in directory %s expects import %q", data.p.Dir, data.p.ImportComment)
 		}
-		return data
-	}).(packageData)
+		return data.p, data.err
+	})
 
-	return data.p, loaded, data.err
+	return p, loaded, err
 }
 
 // importSpec describes an import declaration in source code. It is used as a
@@ -846,20 +987,11 @@ type resolvedImport struct {
 	err       error
 }
 
-// packageData holds information loaded from a package. It is the value type
-// in packageDataCache.
-type packageData struct {
-	p   *build.Package
-	err error
-}
+// resolvedImportCache maps import strings to canonical package names.
+var resolvedImportCache par.Cache[importSpec, resolvedImport]
 
-// resolvedImportCache maps import strings (importSpec) to canonical package names
-// (resolvedImport).
-var resolvedImportCache par.Cache
-
-// packageDataCache maps canonical package names (string) to package metadata
-// (packageData).
-var packageDataCache par.Cache
+// packageDataCache maps canonical package names (string) to package metadata.
+var packageDataCache par.ErrCache[string, *build.Package]
 
 // preloadWorkerCount is the number of concurrent goroutines that can load
 // packages. Experimentally, there are diminishing returns with more than
@@ -882,8 +1014,8 @@ var preloadWorkerCount = runtime.GOMAXPROCS(0)
 // to ensure preload goroutines are no longer active. This is necessary
 // because of global mutable state that cannot safely be read and written
 // concurrently. In particular, packageDataCache may be cleared by "go get"
-// in GOPATH mode, and modload.loaded (accessed via ModLookup) may be
-// modified by modload.ImportPaths (ModImportPaths).
+// in GOPATH mode, and modload.loaded (accessed via modload.Lookup) may be
+// modified by modload.LoadPackages.
 type preload struct {
 	cancel chan struct{}
 	sema   chan struct{}
@@ -902,7 +1034,7 @@ func newPreload() *preload {
 // preloadMatches loads data for package paths matched by patterns.
 // When preloadMatches returns, some packages may not be loaded yet, but
 // loadPackageData and loadImport are always safe to call.
-func (pre *preload) preloadMatches(matches []*search.Match) {
+func (pre *preload) preloadMatches(ctx context.Context, opts PackageOpts, matches []*search.Match) {
 	for _, m := range matches {
 		for _, pkg := range m.Pkgs {
 			select {
@@ -911,10 +1043,10 @@ func (pre *preload) preloadMatches(matches []*search.Match) {
 			case pre.sema <- struct{}{}:
 				go func(pkg string) {
 					mode := 0 // don't use vendoring or module import resolution
-					bp, loaded, err := loadPackageData(pkg, "", base.Cwd, "", false, mode)
+					bp, loaded, err := loadPackageData(ctx, pkg, "", base.Cwd(), "", false, mode)
 					<-pre.sema
-					if bp != nil && loaded && err == nil && !IgnoreImports {
-						pre.preloadImports(bp.Imports, bp)
+					if bp != nil && loaded && err == nil && !opts.IgnoreImports {
+						pre.preloadImports(ctx, opts, bp.Imports, bp)
 					}
 				}(pkg)
 			}
@@ -925,7 +1057,7 @@ func (pre *preload) preloadMatches(matches []*search.Match) {
 // preloadImports queues a list of imports for preloading.
 // When preloadImports returns, some packages may not be loaded yet,
 // but loadPackageData and loadImport are always safe to call.
-func (pre *preload) preloadImports(imports []string, parent *build.Package) {
+func (pre *preload) preloadImports(ctx context.Context, opts PackageOpts, imports []string, parent *build.Package) {
 	parentIsStd := parent.Goroot && parent.ImportPath != "" && search.IsStandardImportPath(parent.ImportPath)
 	for _, path := range imports {
 		if path == "C" || path == "unsafe" {
@@ -936,10 +1068,10 @@ func (pre *preload) preloadImports(imports []string, parent *build.Package) {
 			return
 		case pre.sema <- struct{}{}:
 			go func(path string) {
-				bp, loaded, err := loadPackageData(path, parent.ImportPath, parent.Dir, parent.Root, parentIsStd, ResolveImport)
+				bp, loaded, err := loadPackageData(ctx, path, parent.ImportPath, parent.Dir, parent.Root, parentIsStd, ResolveImport)
 				<-pre.sema
-				if bp != nil && loaded && err == nil && !IgnoreImports {
-					pre.preloadImports(bp.Imports, bp)
+				if bp != nil && loaded && err == nil && !opts.IgnoreImports {
+					pre.preloadImports(ctx, opts, bp.Imports, bp)
 				}
 			}(path)
 		}
@@ -950,6 +1082,12 @@ func (pre *preload) preloadImports(imports []string, parent *build.Package) {
 // loadPackageData have completed. The preloader will not make any new calls
 // to loadPackageData.
 func (pre *preload) flush() {
+	// flush is usually deferred.
+	// Don't hang program waiting for workers on panic.
+	if v := recover(); v != nil {
+		panic(v)
+	}
+
 	close(pre.cancel)
 	for i := 0; i < preloadWorkerCount; i++ {
 		pre.sema <- struct{}{}
@@ -965,13 +1103,13 @@ func cleanImport(path string) string {
 	return path
 }
 
-var isDirCache par.Cache
+var isDirCache par.Cache[string, bool]
 
 func isDir(path string) bool {
-	return isDirCache.Do(path, func() interface{} {
-		fi, err := os.Stat(path)
+	return isDirCache.Do(path, func() bool {
+		fi, err := fsys.Stat(path)
 		return err == nil && fi.IsDir()
-	}).(bool)
+	})
 }
 
 // ResolveImportPath returns the true meaning of path when it appears in parent.
@@ -993,7 +1131,7 @@ func ResolveImportPath(parent *Package, path string) (found string) {
 
 func resolveImportPath(path, parentPath, parentDir, parentRoot string, parentIsStd bool) (found string) {
 	if cfg.ModulesEnabled {
-		if _, p, e := ModLookup(parentPath, parentIsStd, path); e == nil {
+		if _, p, e := modload.Lookup(parentPath, parentIsStd, path); e == nil {
 			return p
 		}
 		return path
@@ -1018,6 +1156,7 @@ func dirAndRoot(path string, dir, root string) (string, string) {
 	}
 
 	if !str.HasFilePathPrefix(dir, root) || len(dir) <= len(root) || dir[len(root)] != filepath.Separator || path != "command-line-arguments" && !build.IsLocalImport(path) && filepath.Join(root, path) != dir {
+		debug.PrintStack()
 		base.Fatalf("unexpected directory layout:\n"+
 			"	import path: %s\n"+
 			"	root: %s\n"+
@@ -1091,13 +1230,13 @@ func vendoredImportPath(path, parentPath, parentDir, parentRoot string) (found s
 
 var (
 	modulePrefix   = []byte("\nmodule ")
-	goModPathCache par.Cache
+	goModPathCache par.Cache[string, string]
 )
 
 // goModPath returns the module path in the go.mod in dir, if any.
 func goModPath(dir string) (path string) {
-	return goModPathCache.Do(dir, func() interface{} {
-		data, err := ioutil.ReadFile(filepath.Join(dir, "go.mod"))
+	return goModPathCache.Do(dir, func() string {
+		data, err := os.ReadFile(filepath.Join(dir, "go.mod"))
 		if err != nil {
 			return ""
 		}
@@ -1132,7 +1271,7 @@ func goModPath(dir string) (path string) {
 			path = s
 		}
 		return path
-	}).(string)
+	})
 }
 
 // findVersionElement returns the slice indices of the final version element /vN in path.
@@ -1246,9 +1385,9 @@ HaveGoMod:
 // Otherwise it is not possible to vendor just a/b/c and still import the
 // non-vendored a/b. See golang.org/issue/13832.
 func hasGoFiles(dir string) bool {
-	fis, _ := ioutil.ReadDir(dir)
-	for _, fi := range fis {
-		if !fi.IsDir() && strings.HasSuffix(fi.Name(), ".go") {
+	files, _ := os.ReadDir(dir)
+	for _, f := range files {
+		if !f.IsDir() && strings.HasSuffix(f.Name(), ".go") {
 			return true
 		}
 	}
@@ -1269,6 +1408,11 @@ func reusePackage(p *Package, stk *ImportStack) *Package {
 				Err:           errors.New("import cycle not allowed"),
 				IsImportCycle: true,
 			}
+		} else if !p.Error.IsImportCycle {
+			// If the error is already set, but it does not indicate that
+			// we are in an import cycle, set IsImportCycle so that we don't
+			// end up stuck in a loop down the road.
+			p.Error.IsImportCycle = true
 		}
 		p.Incomplete = true
 	}
@@ -1284,7 +1428,7 @@ func reusePackage(p *Package, stk *ImportStack) *Package {
 // is allowed to import p.
 // If the import is allowed, disallowInternal returns the original package p.
 // If not, it returns a new package containing just an appropriate error.
-func disallowInternal(srcDir string, importer *Package, importerPath string, p *Package, stk *ImportStack) *Package {
+func disallowInternal(ctx context.Context, srcDir string, importer *Package, importerPath string, p *Package, stk *ImportStack) *Package {
 	// golang.org/s/go14internal:
 	// An import of a path containing the element “internal”
 	// is disallowed if the importing code is outside the tree
@@ -1354,9 +1498,9 @@ func disallowInternal(srcDir string, importer *Package, importerPath string, p *
 			// The importer is a list of command-line files.
 			// Pretend that the import path is the import path of the
 			// directory containing them.
-			// If the directory is outside the main module, this will resolve to ".",
+			// If the directory is outside the main modules, this will resolve to ".",
 			// which is not a prefix of any valid module.
-			importerPath = ModDirImportPath(importer.Dir)
+			importerPath, _ = modload.MainModules.DirImportPath(ctx, importer.Dir)
 		}
 		parentOfInternal := p.ImportPath[:i]
 		if str.HasPathPrefix(importerPath, parentOfInternal) {
@@ -1526,6 +1670,7 @@ var cgoSyscallExclude = map[string]bool{
 	"runtime/cgo":  true,
 	"runtime/race": true,
 	"runtime/msan": true,
+	"runtime/asan": true,
 }
 
 var foldPath = make(map[string]string)
@@ -1578,12 +1723,13 @@ func (p *Package) DefaultExecName() string {
 // load populates p using information from bp, err, which should
 // be the result of calling build.Context.Import.
 // stk contains the import stack, not including path itself.
-func (p *Package) load(path string, stk *ImportStack, bp *build.Package, err error) {
-	p.copyBuild(bp)
+func (p *Package) load(ctx context.Context, opts PackageOpts, path string, stk *ImportStack, importPos []token.Position, bp *build.Package, err error) {
+	p.copyBuild(opts, bp)
 
-	// The localPrefix is the path we interpret ./ imports relative to.
+	// The localPrefix is the path we interpret ./ imports relative to,
+	// if we support them at all (not in module mode!).
 	// Synthesized main packages sometimes override this.
-	if p.Internal.Local {
+	if p.Internal.Local && !cfg.ModulesEnabled {
 		p.Internal.LocalPrefix = dirToImportPath(p.Dir)
 	}
 
@@ -1596,15 +1742,22 @@ func (p *Package) load(path string, stk *ImportStack, bp *build.Package, err err
 				ImportStack: stk.Copy(),
 				Err:         err,
 			}
+
+			// Add the importer's position information if the import position exists, and
+			// the current package being examined is the importer.
+			// If we have not yet accepted package p onto the import stack,
+			// then the cause of the error is not within p itself: the error
+			// must be either in an explicit command-line argument,
+			// or on the importer side (indicated by a non-empty importPos).
+			if path != stk.Top() && len(importPos) > 0 {
+				p.Error.setPos(importPos)
+			}
 		}
 	}
 
 	if err != nil {
 		p.Incomplete = true
-		canLoadImports := p.setLoadPackageDataError(err, path, stk)
-		if !canLoadImports {
-			return
-		}
+		p.setLoadPackageDataError(err, path, stk, importPos)
 	}
 
 	useBindir := p.Name == "main"
@@ -1618,24 +1771,26 @@ func (p *Package) load(path string, stk *ImportStack, bp *build.Package, err err
 	if useBindir {
 		// Report an error when the old code.google.com/p/go.tools paths are used.
 		if InstallTargetDir(p) == StalePath {
+			// TODO(matloob): remove this branch, and StalePath itself. code.google.com/p/go is so
+			// old, even this code checking for it is stale now!
 			newPath := strings.Replace(p.ImportPath, "code.google.com/p/go.", "golang.org/x/", 1)
 			e := ImportErrorf(p.ImportPath, "the %v command has moved; use %v instead.", p.ImportPath, newPath)
 			setError(e)
 			return
 		}
-		elem := p.DefaultExecName()
-		full := cfg.BuildContext.GOOS + "_" + cfg.BuildContext.GOARCH + "/" + elem
-		if cfg.BuildContext.GOOS != base.ToolGOOS || cfg.BuildContext.GOARCH != base.ToolGOARCH {
+		elem := p.DefaultExecName() + cfg.ExeSuffix
+		full := filepath.Join(cfg.BuildContext.GOOS+"_"+cfg.BuildContext.GOARCH, elem)
+		if cfg.BuildContext.GOOS != runtime.GOOS || cfg.BuildContext.GOARCH != runtime.GOARCH {
 			// Install cross-compiled binaries to subdirectories of bin.
 			elem = full
 		}
 		if p.Internal.Build.BinDir == "" && cfg.ModulesEnabled {
-			p.Internal.Build.BinDir = ModBinDir()
+			p.Internal.Build.BinDir = modload.BinDir()
 		}
 		if p.Internal.Build.BinDir != "" {
 			// Install to GOBIN or bin of GOPATH entry.
 			p.Target = filepath.Join(p.Internal.Build.BinDir, elem)
-			if !p.Goroot && strings.Contains(elem, "/") && cfg.GOBIN != "" {
+			if !p.Goroot && strings.Contains(elem, string(filepath.Separator)) && cfg.GOBIN != "" {
 				// Do not create $GOBIN/goos_goarch/elem.
 				p.Target = ""
 				p.Internal.GobinSubdir = true
@@ -1645,26 +1800,34 @@ func (p *Package) load(path string, stk *ImportStack, bp *build.Package, err err
 			// This is for 'go tool'.
 			// Override all the usual logic and force it into the tool directory.
 			if cfg.BuildToolchainName == "gccgo" {
-				p.Target = filepath.Join(base.ToolDir, elem)
+				p.Target = filepath.Join(build.ToolDir, elem)
 			} else {
 				p.Target = filepath.Join(cfg.GOROOTpkg, "tool", full)
 			}
-		}
-		if p.Target != "" && cfg.BuildContext.GOOS == "windows" {
-			p.Target += ".exe"
 		}
 	} else if p.Internal.Local {
 		// Local import turned into absolute path.
 		// No permanent install target.
 		p.Target = ""
+	} else if p.Standard && cfg.BuildContext.Compiler == "gccgo" {
+		// gccgo has a preinstalled standard library that cmd/go cannot rebuild.
+		p.Target = ""
 	} else {
 		p.Target = p.Internal.Build.PkgObj
-		if cfg.BuildLinkshared && p.Target != "" {
-			// TODO(bcmills): The reliance on p.Target implies that -linkshared does
-			// not work for any package that lacks a Target — such as a non-main
+		if cfg.BuildBuildmode == "shared" && p.Internal.Build.PkgTargetRoot != "" {
+			// TODO(matloob): This shouldn't be necessary, but the misc/cgo/testshared
+			// test fails without Target set for this condition. Figure out why and
+			// fix it.
+			p.Target = filepath.Join(p.Internal.Build.PkgTargetRoot, p.ImportPath+".a")
+		}
+		if cfg.BuildLinkshared && p.Internal.Build.PkgTargetRoot != "" {
+			// TODO(bcmills): The reliance on PkgTargetRoot implies that -linkshared does
+			// not work for any package that lacks a PkgTargetRoot — such as a non-main
 			// package in module mode. We should probably fix that.
-			shlibnamefile := p.Target[:len(p.Target)-2] + ".shlibname"
-			shlib, err := ioutil.ReadFile(shlibnamefile)
+			targetPrefix := filepath.Join(p.Internal.Build.PkgTargetRoot, p.ImportPath)
+			p.Target = targetPrefix + ".a"
+			shlibnamefile := targetPrefix + ".shlibname"
+			shlib, err := os.ReadFile(shlibnamefile)
 			if err != nil && !os.IsNotExist(err) {
 				base.Fatalf("reading shlibname: %v", err)
 			}
@@ -1694,35 +1857,37 @@ func (p *Package) load(path string, stk *ImportStack, bp *build.Package, err err
 		}
 	}
 
-	// Cgo translation adds imports of "unsafe", "runtime/cgo" and "syscall",
-	// except for certain packages, to avoid circular dependencies.
-	if p.UsesCgo() {
-		addImport("unsafe", true)
-	}
-	if p.UsesCgo() && (!p.Standard || !cgoExclude[p.ImportPath]) && cfg.BuildContext.Compiler != "gccgo" {
-		addImport("runtime/cgo", true)
-	}
-	if p.UsesCgo() && (!p.Standard || !cgoSyscallExclude[p.ImportPath]) {
-		addImport("syscall", true)
-	}
-
-	// SWIG adds imports of some standard packages.
-	if p.UsesSwig() {
-		addImport("unsafe", true)
-		if cfg.BuildContext.Compiler != "gccgo" {
+	if !opts.IgnoreImports {
+		// Cgo translation adds imports of "unsafe", "runtime/cgo" and "syscall",
+		// except for certain packages, to avoid circular dependencies.
+		if p.UsesCgo() {
+			addImport("unsafe", true)
+		}
+		if p.UsesCgo() && (!p.Standard || !cgoExclude[p.ImportPath]) && cfg.BuildContext.Compiler != "gccgo" {
 			addImport("runtime/cgo", true)
 		}
-		addImport("syscall", true)
-		addImport("sync", true)
+		if p.UsesCgo() && (!p.Standard || !cgoSyscallExclude[p.ImportPath]) {
+			addImport("syscall", true)
+		}
 
-		// TODO: The .swig and .swigcxx files can use
-		// %go_import directives to import other packages.
-	}
+		// SWIG adds imports of some standard packages.
+		if p.UsesSwig() {
+			addImport("unsafe", true)
+			if cfg.BuildContext.Compiler != "gccgo" {
+				addImport("runtime/cgo", true)
+			}
+			addImport("syscall", true)
+			addImport("sync", true)
 
-	// The linker loads implicit dependencies.
-	if p.Name == "main" && !p.Internal.ForceLibrary {
-		for _, dep := range LinkerDeps(p) {
-			addImport(dep, false)
+			// TODO: The .swig and .swigcxx files can use
+			// %go_import directives to import other packages.
+		}
+
+		// The linker loads implicit dependencies.
+		if p.Name == "main" && !p.Internal.ForceLibrary {
+			for _, dep := range LinkerDeps(p) {
+				addImport(dep, false)
+			}
 		}
 	}
 
@@ -1740,8 +1905,27 @@ func (p *Package) load(path string, stk *ImportStack, bp *build.Package, err err
 		return
 	}
 
+	// Errors after this point are caused by this package, not the importing
+	// package. Pushing the path here prevents us from reporting the error
+	// with the position of the import declaration.
 	stk.Push(path)
 	defer stk.Pop()
+
+	pkgPath := p.ImportPath
+	if p.Internal.CmdlineFiles {
+		pkgPath = "command-line-arguments"
+	}
+	if cfg.ModulesEnabled {
+		p.Module = modload.PackageModuleInfo(ctx, pkgPath)
+	}
+
+	p.EmbedFiles, p.Internal.Embed, err = resolveEmbed(p.Dir, p.EmbedPatterns)
+	if err != nil {
+		p.Incomplete = true
+		setError(err)
+		embedErr := err.(*EmbedError)
+		p.Error.setPos(p.Internal.Build.EmbedPatternPos[embedErr.Pattern])
+	}
 
 	// Check for case-insensitive collision of input files.
 	// To avoid problems on case-insensitive files, we reject any package
@@ -1778,7 +1962,7 @@ func (p *Package) load(path string, stk *ImportStack, bp *build.Package, err err
 		if path == "C" {
 			continue
 		}
-		p1 := LoadImport(path, p.Dir, p, stk, p.Internal.Build.ImportPos[path], ResolveImport)
+		p1 := LoadImport(ctx, opts, path, p.Dir, p, stk, p.Internal.Build.ImportPos[path], ResolveImport)
 
 		path = p1.ImportPath
 		importPaths[i] = path
@@ -1792,11 +1976,15 @@ func (p *Package) load(path string, stk *ImportStack, bp *build.Package, err err
 		}
 	}
 	p.Internal.Imports = imports
-	p.collectDeps()
-
-	// unsafe is a fake package.
-	if p.Standard && (p.ImportPath == "unsafe" || cfg.BuildContext.Compiler == "gccgo") {
-		p.Target = ""
+	if !opts.SuppressDeps {
+		p.collectDeps()
+	}
+	if p.Error == nil && p.Name == "main" && !p.Internal.ForceLibrary && len(p.DepsErrors) == 0 && !opts.SuppressBuildInfo {
+		// TODO(bcmills): loading VCS metadata can be fairly slow.
+		// Consider starting this as a background goroutine and retrieving the result
+		// asynchronously when we're actually ready to build the package, or when we
+		// actually need to evaluate whether the package's metadata is stale.
+		p.setBuildInfo(opts.AutoVCS)
 	}
 
 	// If cgo is not enabled, ignore cgo supporting sources
@@ -1833,17 +2021,198 @@ func (p *Package) load(path string, stk *ImportStack, bp *build.Package, err err
 		setError(fmt.Errorf("Fortran source files not allowed when not using cgo or SWIG: %s", strings.Join(p.FFiles, " ")))
 		return
 	}
+}
 
-	if cfg.ModulesEnabled && p.Error == nil {
-		mainPath := p.ImportPath
-		if p.Internal.CmdlineFiles {
-			mainPath = "command-line-arguments"
+// An EmbedError indicates a problem with a go:embed directive.
+type EmbedError struct {
+	Pattern string
+	Err     error
+}
+
+func (e *EmbedError) Error() string {
+	return fmt.Sprintf("pattern %s: %v", e.Pattern, e.Err)
+}
+
+func (e *EmbedError) Unwrap() error {
+	return e.Err
+}
+
+// ResolveEmbed resolves //go:embed patterns and returns only the file list.
+// For use by go mod vendor to find embedded files it should copy into the
+// vendor directory.
+// TODO(#42504): Once go mod vendor uses load.PackagesAndErrors, just
+// call (*Package).ResolveEmbed
+func ResolveEmbed(dir string, patterns []string) ([]string, error) {
+	files, _, err := resolveEmbed(dir, patterns)
+	return files, err
+}
+
+// resolveEmbed resolves //go:embed patterns to precise file lists.
+// It sets files to the list of unique files matched (for go list),
+// and it sets pmap to the more precise mapping from
+// patterns to files.
+func resolveEmbed(pkgdir string, patterns []string) (files []string, pmap map[string][]string, err error) {
+	var pattern string
+	defer func() {
+		if err != nil {
+			err = &EmbedError{
+				Pattern: pattern,
+				Err:     err,
+			}
 		}
-		p.Module = ModPackageModuleInfo(mainPath)
-		if p.Name == "main" && len(p.DepsErrors) == 0 {
-			p.Internal.BuildInfo = ModPackageBuildInfo(mainPath, p.Deps)
+	}()
+
+	// TODO(rsc): All these messages need position information for better error reports.
+	pmap = make(map[string][]string)
+	have := make(map[string]int)
+	dirOK := make(map[string]bool)
+	pid := 0 // pattern ID, to allow reuse of have map
+	for _, pattern = range patterns {
+		pid++
+
+		glob := pattern
+		all := strings.HasPrefix(pattern, "all:")
+		if all {
+			glob = pattern[len("all:"):]
 		}
+		// Check pattern is valid for //go:embed.
+		if _, err := pathpkg.Match(glob, ""); err != nil || !validEmbedPattern(glob) {
+			return nil, nil, fmt.Errorf("invalid pattern syntax")
+		}
+
+		// Glob to find matches.
+		match, err := fsys.Glob(str.QuoteGlob(str.WithFilePathSeparator(pkgdir)) + filepath.FromSlash(glob))
+		if err != nil {
+			return nil, nil, err
+		}
+
+		// Filter list of matches down to the ones that will still exist when
+		// the directory is packaged up as a module. (If p.Dir is in the module cache,
+		// only those files exist already, but if p.Dir is in the current module,
+		// then there may be other things lying around, like symbolic links or .git directories.)
+		var list []string
+		for _, file := range match {
+			// relative path to p.Dir which begins without prefix slash
+			rel := filepath.ToSlash(str.TrimFilePathPrefix(file, pkgdir))
+
+			what := "file"
+			info, err := fsys.Lstat(file)
+			if err != nil {
+				return nil, nil, err
+			}
+			if info.IsDir() {
+				what = "directory"
+			}
+
+			// Check that directories along path do not begin a new module
+			// (do not contain a go.mod).
+			for dir := file; len(dir) > len(pkgdir)+1 && !dirOK[dir]; dir = filepath.Dir(dir) {
+				if _, err := fsys.Stat(filepath.Join(dir, "go.mod")); err == nil {
+					return nil, nil, fmt.Errorf("cannot embed %s %s: in different module", what, rel)
+				}
+				if dir != file {
+					if info, err := fsys.Lstat(dir); err == nil && !info.IsDir() {
+						return nil, nil, fmt.Errorf("cannot embed %s %s: in non-directory %s", what, rel, dir[len(pkgdir)+1:])
+					}
+				}
+				dirOK[dir] = true
+				if elem := filepath.Base(dir); isBadEmbedName(elem) {
+					if dir == file {
+						return nil, nil, fmt.Errorf("cannot embed %s %s: invalid name %s", what, rel, elem)
+					} else {
+						return nil, nil, fmt.Errorf("cannot embed %s %s: in invalid directory %s", what, rel, elem)
+					}
+				}
+			}
+
+			switch {
+			default:
+				return nil, nil, fmt.Errorf("cannot embed irregular file %s", rel)
+
+			case info.Mode().IsRegular():
+				if have[rel] != pid {
+					have[rel] = pid
+					list = append(list, rel)
+				}
+
+			case info.IsDir():
+				// Gather all files in the named directory, stopping at module boundaries
+				// and ignoring files that wouldn't be packaged into a module.
+				count := 0
+				err := fsys.Walk(file, func(path string, info os.FileInfo, err error) error {
+					if err != nil {
+						return err
+					}
+					rel := filepath.ToSlash(str.TrimFilePathPrefix(path, pkgdir))
+					name := info.Name()
+					if path != file && (isBadEmbedName(name) || ((name[0] == '.' || name[0] == '_') && !all)) {
+						// Ignore bad names, assuming they won't go into modules.
+						// Also avoid hidden files that user may not know about.
+						// See golang.org/issue/42328.
+						if info.IsDir() {
+							return fs.SkipDir
+						}
+						return nil
+					}
+					if info.IsDir() {
+						if _, err := fsys.Stat(filepath.Join(path, "go.mod")); err == nil {
+							return filepath.SkipDir
+						}
+						return nil
+					}
+					if !info.Mode().IsRegular() {
+						return nil
+					}
+					count++
+					if have[rel] != pid {
+						have[rel] = pid
+						list = append(list, rel)
+					}
+					return nil
+				})
+				if err != nil {
+					return nil, nil, err
+				}
+				if count == 0 {
+					return nil, nil, fmt.Errorf("cannot embed directory %s: contains no embeddable files", rel)
+				}
+			}
+		}
+
+		if len(list) == 0 {
+			return nil, nil, fmt.Errorf("no matching files found")
+		}
+		sort.Strings(list)
+		pmap[pattern] = list
 	}
+
+	for file := range have {
+		files = append(files, file)
+	}
+	sort.Strings(files)
+	return files, pmap, nil
+}
+
+func validEmbedPattern(pattern string) bool {
+	return pattern != "." && fs.ValidPath(pattern)
+}
+
+// isBadEmbedName reports whether name is the base name of a file that
+// can't or won't be included in modules and therefore shouldn't be treated
+// as existing for embedding.
+func isBadEmbedName(name string) bool {
+	if err := module.CheckFilePath(name); err != nil {
+		return true
+	}
+	switch name {
+	// Empty string should be impossible but make it bad.
+	case "":
+		return true
+	// Version control directories won't be present in module.
+	case ".bzr", ".hg", ".git", ".svn":
+		return true
+	}
+	return false
 }
 
 // collectDeps populates p.Deps and p.DepsErrors by iterating over
@@ -1888,6 +2257,283 @@ func (p *Package) collectDeps() {
 	}
 }
 
+// vcsStatusCache maps repository directories (string)
+// to their VCS information.
+var vcsStatusCache par.ErrCache[string, vcs.Status]
+
+// setBuildInfo gathers build information, formats it as a string to be
+// embedded in the binary, then sets p.Internal.BuildInfo to that string.
+// setBuildInfo should only be called on a main package with no errors.
+//
+// This information can be retrieved using debug.ReadBuildInfo.
+//
+// Note that the GoVersion field is not set here to avoid encoding it twice.
+// It is stored separately in the binary, mostly for historical reasons.
+func (p *Package) setBuildInfo(autoVCS bool) {
+	setPkgErrorf := func(format string, args ...any) {
+		if p.Error == nil {
+			p.Error = &PackageError{Err: fmt.Errorf(format, args...)}
+		}
+	}
+
+	var debugModFromModinfo func(*modinfo.ModulePublic) *debug.Module
+	debugModFromModinfo = func(mi *modinfo.ModulePublic) *debug.Module {
+		version := mi.Version
+		if version == "" {
+			version = "(devel)"
+		}
+		dm := &debug.Module{
+			Path:    mi.Path,
+			Version: version,
+		}
+		if mi.Replace != nil {
+			dm.Replace = debugModFromModinfo(mi.Replace)
+		} else if mi.Version != "" {
+			dm.Sum = modfetch.Sum(module.Version{Path: mi.Path, Version: mi.Version})
+		}
+		return dm
+	}
+
+	var main debug.Module
+	if p.Module != nil {
+		main = *debugModFromModinfo(p.Module)
+	}
+
+	visited := make(map[*Package]bool)
+	mdeps := make(map[module.Version]*debug.Module)
+	var q []*Package
+	q = append(q, p.Internal.Imports...)
+	for len(q) > 0 {
+		p1 := q[0]
+		q = q[1:]
+		if visited[p1] {
+			continue
+		}
+		visited[p1] = true
+		if p1.Module != nil {
+			m := module.Version{Path: p1.Module.Path, Version: p1.Module.Version}
+			if p1.Module.Path != main.Path && mdeps[m] == nil {
+				mdeps[m] = debugModFromModinfo(p1.Module)
+			}
+		}
+		q = append(q, p1.Internal.Imports...)
+	}
+	sortedMods := make([]module.Version, 0, len(mdeps))
+	for mod := range mdeps {
+		sortedMods = append(sortedMods, mod)
+	}
+	module.Sort(sortedMods)
+	deps := make([]*debug.Module, len(sortedMods))
+	for i, mod := range sortedMods {
+		deps[i] = mdeps[mod]
+	}
+
+	pkgPath := p.ImportPath
+	if p.Internal.CmdlineFiles {
+		pkgPath = "command-line-arguments"
+	}
+	info := &debug.BuildInfo{
+		Path: pkgPath,
+		Main: main,
+		Deps: deps,
+	}
+	appendSetting := func(key, value string) {
+		value = strings.ReplaceAll(value, "\n", " ") // make value safe
+		info.Settings = append(info.Settings, debug.BuildSetting{Key: key, Value: value})
+	}
+
+	// Add command-line flags relevant to the build.
+	// This is informational, not an exhaustive list.
+	// Please keep the list sorted.
+	if cfg.BuildASan {
+		appendSetting("-asan", "true")
+	}
+	if BuildAsmflags.present {
+		appendSetting("-asmflags", BuildAsmflags.String())
+	}
+	buildmode := cfg.BuildBuildmode
+	if buildmode == "default" {
+		if p.Name == "main" {
+			buildmode = "exe"
+		} else {
+			buildmode = "archive"
+		}
+	}
+	appendSetting("-buildmode", buildmode)
+	appendSetting("-compiler", cfg.BuildContext.Compiler)
+	if gccgoflags := BuildGccgoflags.String(); gccgoflags != "" && cfg.BuildContext.Compiler == "gccgo" {
+		appendSetting("-gccgoflags", gccgoflags)
+	}
+	if gcflags := BuildGcflags.String(); gcflags != "" && cfg.BuildContext.Compiler == "gc" {
+		appendSetting("-gcflags", gcflags)
+	}
+	if ldflags := BuildLdflags.String(); ldflags != "" {
+		// https://go.dev/issue/52372: only include ldflags if -trimpath is not set,
+		// since it can include system paths through various linker flags (notably
+		// -extar, -extld, and -extldflags).
+		//
+		// TODO: since we control cmd/link, in theory we can parse ldflags to
+		// determine whether they may refer to system paths. If we do that, we can
+		// redact only those paths from the recorded -ldflags setting and still
+		// record the system-independent parts of the flags.
+		if !cfg.BuildTrimpath {
+			appendSetting("-ldflags", ldflags)
+		}
+	}
+	if cfg.BuildPGOFile != "" {
+		if cfg.BuildTrimpath {
+			appendSetting("-pgo", filepath.Base(cfg.BuildPGOFile))
+		} else {
+			appendSetting("-pgo", cfg.BuildPGOFile)
+		}
+	}
+	if cfg.BuildMSan {
+		appendSetting("-msan", "true")
+	}
+	if cfg.BuildRace {
+		appendSetting("-race", "true")
+	}
+	if tags := cfg.BuildContext.BuildTags; len(tags) > 0 {
+		appendSetting("-tags", strings.Join(tags, ","))
+	}
+	if cfg.BuildTrimpath {
+		appendSetting("-trimpath", "true")
+	}
+	cgo := "0"
+	if cfg.BuildContext.CgoEnabled {
+		cgo = "1"
+	}
+	appendSetting("CGO_ENABLED", cgo)
+	// https://go.dev/issue/52372: only include CGO flags if -trimpath is not set.
+	// (If -trimpath is set, it is possible that these flags include system paths.)
+	// If cgo is involved, reproducibility is already pretty well ruined anyway,
+	// given that we aren't stamping header or library versions.
+	//
+	// TODO(bcmills): perhaps we could at least parse the flags and stamp the
+	// subset of flags that are known not to be paths?
+	if cfg.BuildContext.CgoEnabled && !cfg.BuildTrimpath {
+		for _, name := range []string{"CGO_CFLAGS", "CGO_CPPFLAGS", "CGO_CXXFLAGS", "CGO_LDFLAGS"} {
+			appendSetting(name, cfg.Getenv(name))
+		}
+	}
+	appendSetting("GOARCH", cfg.BuildContext.GOARCH)
+	if cfg.RawGOEXPERIMENT != "" {
+		appendSetting("GOEXPERIMENT", cfg.RawGOEXPERIMENT)
+	}
+	appendSetting("GOOS", cfg.BuildContext.GOOS)
+	if key, val := cfg.GetArchEnv(); key != "" && val != "" {
+		appendSetting(key, val)
+	}
+
+	// Add VCS status if all conditions are true:
+	//
+	// - -buildvcs is enabled.
+	// - p is a non-test contained within a main module (there may be multiple
+	//   main modules in a workspace, but local replacements don't count).
+	// - Both the current directory and p's module's root directory are contained
+	//   in the same local repository.
+	// - We know the VCS commands needed to get the status.
+	setVCSError := func(err error) {
+		setPkgErrorf("error obtaining VCS status: %v\n\tUse -buildvcs=false to disable VCS stamping.", err)
+	}
+
+	var repoDir string
+	var vcsCmd *vcs.Cmd
+	var err error
+	const allowNesting = true
+
+	wantVCS := false
+	switch cfg.BuildBuildvcs {
+	case "true":
+		wantVCS = true // Include VCS metadata even for tests if requested explicitly; see https://go.dev/issue/52648.
+	case "auto":
+		wantVCS = autoVCS && !p.IsTestOnly()
+	case "false":
+	default:
+		panic(fmt.Sprintf("unexpected value for cfg.BuildBuildvcs: %q", cfg.BuildBuildvcs))
+	}
+
+	if wantVCS && p.Module != nil && p.Module.Version == "" && !p.Standard {
+		if p.Module.Path == "bootstrap" && cfg.GOROOT == os.Getenv("GOROOT_BOOTSTRAP") {
+			// During bootstrapping, the bootstrap toolchain is built in module
+			// "bootstrap" (instead of "std"), with GOROOT set to GOROOT_BOOTSTRAP
+			// (so the bootstrap toolchain packages don't even appear to be in GOROOT).
+			goto omitVCS
+		}
+		repoDir, vcsCmd, err = vcs.FromDir(base.Cwd(), "", allowNesting)
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			setVCSError(err)
+			return
+		}
+		if !str.HasFilePathPrefix(p.Module.Dir, repoDir) &&
+			!str.HasFilePathPrefix(repoDir, p.Module.Dir) {
+			// The module containing the main package does not overlap with the
+			// repository containing the working directory. Don't include VCS info.
+			// If the repo contains the module or vice versa, but they are not
+			// the same directory, it's likely an error (see below).
+			goto omitVCS
+		}
+		if cfg.BuildBuildvcs == "auto" && vcsCmd != nil && vcsCmd.Cmd != "" {
+			if _, err := exec.LookPath(vcsCmd.Cmd); err != nil {
+				// We fould a repository, but the required VCS tool is not present.
+				// "-buildvcs=auto" means that we should silently drop the VCS metadata.
+				goto omitVCS
+			}
+		}
+	}
+	if repoDir != "" && vcsCmd.Status != nil {
+		// Check that the current directory, package, and module are in the same
+		// repository. vcs.FromDir allows nested Git repositories, but nesting
+		// is not allowed for other VCS tools. The current directory may be outside
+		// p.Module.Dir when a workspace is used.
+		pkgRepoDir, _, err := vcs.FromDir(p.Dir, "", allowNesting)
+		if err != nil {
+			setVCSError(err)
+			return
+		}
+		if pkgRepoDir != repoDir {
+			if cfg.BuildBuildvcs != "auto" {
+				setVCSError(fmt.Errorf("main package is in repository %q but current directory is in repository %q", pkgRepoDir, repoDir))
+				return
+			}
+			goto omitVCS
+		}
+		modRepoDir, _, err := vcs.FromDir(p.Module.Dir, "", allowNesting)
+		if err != nil {
+			setVCSError(err)
+			return
+		}
+		if modRepoDir != repoDir {
+			if cfg.BuildBuildvcs != "auto" {
+				setVCSError(fmt.Errorf("main module is in repository %q but current directory is in repository %q", modRepoDir, repoDir))
+				return
+			}
+			goto omitVCS
+		}
+
+		st, err := vcsStatusCache.Do(repoDir, func() (vcs.Status, error) {
+			return vcsCmd.Status(vcsCmd, repoDir)
+		})
+		if err != nil {
+			setVCSError(err)
+			return
+		}
+
+		appendSetting("vcs", vcsCmd.Cmd)
+		if st.Revision != "" {
+			appendSetting("vcs.revision", st.Revision)
+		}
+		if !st.CommitTime.IsZero() {
+			stamp := st.CommitTime.UTC().Format(time.RFC3339Nano)
+			appendSetting("vcs.time", stamp)
+		}
+		appendSetting("vcs.modified", strconv.FormatBool(st.Uncommitted))
+	}
+omitVCS:
+
+	p.Internal.BuildInfo = info.String()
+}
+
 // SafeArg reports whether arg is a "safe" command-line argument,
 // meaning that when it appears in a command-line, it probably
 // doesn't have some special meaning other than its own name.
@@ -1926,6 +2572,14 @@ func LinkerDeps(p *Package) []string {
 	if cfg.BuildMSan {
 		deps = append(deps, "runtime/msan")
 	}
+	// Using address sanitizer forces an import of runtime/asan.
+	if cfg.BuildASan {
+		deps = append(deps, "runtime/asan")
+	}
+	// Building for coverage forces an import of runtime/coverage.
+	if cfg.BuildCover && cfg.Experiment.CoverageRedesign {
+		deps = append(deps, "runtime/coverage")
+	}
 
 	return deps
 }
@@ -1933,38 +2587,40 @@ func LinkerDeps(p *Package) []string {
 // externalLinkingForced reports whether external linking is being
 // forced even for programs that do not use cgo.
 func externalLinkingForced(p *Package) bool {
+	if !cfg.BuildContext.CgoEnabled {
+		return false
+	}
+
 	// Some targets must use external linking even inside GOROOT.
 	switch cfg.BuildContext.GOOS {
 	case "android":
 		if cfg.BuildContext.GOARCH != "arm64" {
 			return true
 		}
-	case "darwin":
-		switch cfg.BuildContext.GOARCH {
-		case "arm", "arm64":
-			return true
-		}
+	case "ios":
+		return true
 	}
 
-	if !cfg.BuildContext.CgoEnabled {
-		return false
-	}
 	// Currently build modes c-shared, pie (on systems that do not
 	// support PIE with internal linking mode (currently all
 	// systems: issue #18968)), plugin, and -linkshared force
 	// external linking mode, as of course does
 	// -ldflags=-linkmode=external. External linking mode forces
 	// an import of runtime/cgo.
-	pieCgo := cfg.BuildBuildmode == "pie"
+	// If there are multiple -linkmode options, the last one wins.
+	pieCgo := cfg.BuildBuildmode == "pie" && !platform.InternalLinkPIESupported(cfg.BuildContext.GOOS, cfg.BuildContext.GOARCH)
 	linkmodeExternal := false
 	if p != nil {
 		ldflags := BuildLdflags.For(p)
-		for i, a := range ldflags {
-			if a == "-linkmode=external" {
+		for i := len(ldflags) - 1; i >= 0; i-- {
+			a := ldflags[i]
+			if a == "-linkmode=external" ||
+				a == "-linkmode" && i+1 < len(ldflags) && ldflags[i+1] == "external" {
 				linkmodeExternal = true
-			}
-			if a == "-linkmode" && i+1 < len(ldflags) && ldflags[i+1] == "external" {
-				linkmodeExternal = true
+				break
+			} else if a == "-linkmode=internal" ||
+				a == "-linkmode" && i+1 < len(ldflags) && ldflags[i+1] == "internal" {
+				break
 			}
 		}
 	}
@@ -1995,34 +2651,19 @@ func (p *Package) InternalXGoFiles() []string {
 	return p.mkAbs(p.XTestGoFiles)
 }
 
-// InternalGoFiles returns the list of all Go files possibly relevant for the package,
+// InternalAllGoFiles returns the list of all Go files possibly relevant for the package,
 // using absolute paths. "Possibly relevant" means that files are not excluded
 // due to build tags, but files with names beginning with . or _ are still excluded.
 func (p *Package) InternalAllGoFiles() []string {
-	return p.mkAbs(str.StringList(p.constraintIgnoredGoFiles(), p.GoFiles, p.CgoFiles, p.TestGoFiles, p.XTestGoFiles))
+	return p.mkAbs(str.StringList(p.IgnoredGoFiles, p.GoFiles, p.CgoFiles, p.TestGoFiles, p.XTestGoFiles))
 }
 
-// constraintIgnoredGoFiles returns the list of Go files ignored for reasons
-// other than having a name beginning with '.' or '_'.
-func (p *Package) constraintIgnoredGoFiles() []string {
-	if len(p.IgnoredGoFiles) == 0 {
-		return nil
-	}
-	files := make([]string, 0, len(p.IgnoredGoFiles))
-	for _, f := range p.IgnoredGoFiles {
-		if f != "" && f[0] != '.' && f[0] != '_' {
-			files = append(files, f)
-		}
-	}
-	return files
-}
-
-// usesSwig reports whether the package needs to run SWIG.
+// UsesSwig reports whether the package needs to run SWIG.
 func (p *Package) UsesSwig() bool {
 	return len(p.SwigFiles) > 0 || len(p.SwigCXXFiles) > 0
 }
 
-// usesCgo reports whether the package needs to run cgo
+// UsesCgo reports whether the package needs to run cgo
 func (p *Package) UsesCgo() bool {
 	return len(p.CgoFiles) > 0
 }
@@ -2052,7 +2693,7 @@ func PackageList(roots []*Package) []*Package {
 // TestPackageList returns the list of packages in the dag rooted at roots
 // as visited in a depth-first post-order traversal, including the test
 // imports of the roots. This ignores errors in test packages.
-func TestPackageList(roots []*Package) []*Package {
+func TestPackageList(ctx context.Context, opts PackageOpts, roots []*Package) []*Package {
 	seen := map[*Package]bool{}
 	all := []*Package{}
 	var walk func(*Package)
@@ -2068,7 +2709,7 @@ func TestPackageList(roots []*Package) []*Package {
 	}
 	walkTest := func(root *Package, path string) {
 		var stk ImportStack
-		p1 := LoadImport(path, root.Dir, root, &stk, root.Internal.Build.TestImportPos[path], ResolveImport)
+		p1 := LoadImport(ctx, opts, path, root.Dir, root, &stk, root.Internal.Build.TestImportPos[path], ResolveImport)
 		if p1.Error == nil {
 			walk(p1)
 		}
@@ -2091,36 +2732,62 @@ func TestPackageList(roots []*Package) []*Package {
 // TODO(jayconrod): delete this function and set flags automatically
 // in LoadImport instead.
 func LoadImportWithFlags(path, srcDir string, parent *Package, stk *ImportStack, importPos []token.Position, mode int) *Package {
-	p := LoadImport(path, srcDir, parent, stk, importPos, mode)
+	p := LoadImport(context.TODO(), PackageOpts{}, path, srcDir, parent, stk, importPos, mode)
 	setToolFlags(p)
 	return p
 }
 
-// Packages returns the packages named by the
-// command line arguments 'args'. If a named package
-// cannot be loaded at all (for example, if the directory does not exist),
-// then packages prints an error and does not include that
-// package in the results. However, if errors occur trying
-// to load dependencies of a named package, the named
-// package is still returned, with p.Incomplete = true
-// and details in p.DepsErrors.
-func Packages(args []string) []*Package {
-	var pkgs []*Package
-	for _, pkg := range PackagesAndErrors(args) {
-		if pkg.Error != nil {
-			base.Errorf("%v", pkg.Error)
-			continue
-		}
-		pkgs = append(pkgs, pkg)
-	}
-	return pkgs
+// PackageOpts control the behavior of PackagesAndErrors and other package
+// loading functions.
+type PackageOpts struct {
+	// IgnoreImports controls whether we ignore explicit and implicit imports
+	// when loading packages.  Implicit imports are added when supporting Cgo
+	// or SWIG and when linking main packages.
+	IgnoreImports bool
+
+	// ModResolveTests indicates whether calls to the module loader should also
+	// resolve test dependencies of the requested packages.
+	//
+	// If ModResolveTests is true, then the module loader needs to resolve test
+	// dependencies at the same time as packages; otherwise, the test dependencies
+	// of those packages could be missing, and resolving those missing dependencies
+	// could change the selected versions of modules that provide other packages.
+	ModResolveTests bool
+
+	// MainOnly is true if the caller only wants to load main packages.
+	// For a literal argument matching a non-main package, a stub may be returned
+	// with an error. For a non-literal argument (with "..."), non-main packages
+	// are not be matched, and their dependencies may not be loaded. A warning
+	// may be printed for non-literal arguments that match no main packages.
+	MainOnly bool
+
+	// AutoVCS controls whether we also load version-control metadata for main packages
+	// when -buildvcs=auto (the default).
+	AutoVCS bool
+
+	// SuppressDeps is true if the caller does not need Deps and DepsErrors to be populated
+	// on the package. TestPackagesAndErrors examines the  Deps field to determine if the test
+	// variant has an import cycle, so SuppressDeps should not be set if TestPackagesAndErrors
+	// will be called on the package.
+	SuppressDeps bool
+
+	// SuppressBuildInfo is true if the caller does not need p.Stale, p.StaleReason, or p.Internal.BuildInfo
+	// to be populated on the package.
+	SuppressBuildInfo bool
 }
 
-// PackagesAndErrors is like 'packages' but returns a
-// *Package for every argument, even the ones that
-// cannot be loaded at all.
-// The packages that fail to load will have p.Error != nil.
-func PackagesAndErrors(patterns []string) []*Package {
+// PackagesAndErrors returns the packages named by the command line arguments
+// 'patterns'. If a named package cannot be loaded, PackagesAndErrors returns
+// a *Package with the Error field describing the failure. If errors are found
+// loading imported packages, the DepsErrors field is set. The Incomplete field
+// may be set as well.
+//
+// To obtain a flat list of packages, use PackageList.
+// To report errors loading packages, use ReportPackageErrors.
+func PackagesAndErrors(ctx context.Context, opts PackageOpts, patterns []string) []*Package {
+	ctx, span := trace.StartSpan(ctx, "load.PackagesAndErrors")
+	defer span.Done()
+
 	for _, p := range patterns {
 		// Listing is only supported with all patterns referring to either:
 		// - Files that are part of the same directory.
@@ -2128,13 +2795,27 @@ func PackagesAndErrors(patterns []string) []*Package {
 		if strings.HasSuffix(p, ".go") {
 			// We need to test whether the path is an actual Go file and not a
 			// package path or pattern ending in '.go' (see golang.org/issue/34653).
-			if fi, err := os.Stat(p); err == nil && !fi.IsDir() {
-				return []*Package{GoFilesPackage(patterns)}
+			if fi, err := fsys.Stat(p); err == nil && !fi.IsDir() {
+				pkgs := []*Package{GoFilesPackage(ctx, opts, patterns)}
+				setPGOProfilePath(pkgs)
+				return pkgs
 			}
 		}
 	}
 
-	matches := ImportPaths(patterns)
+	var matches []*search.Match
+	if modload.Init(); cfg.ModulesEnabled {
+		modOpts := modload.PackageOpts{
+			ResolveMissingImports: true,
+			LoadTests:             opts.ModResolveTests,
+			SilencePackageErrors:  true,
+		}
+		matches, _ = modload.LoadPackages(ctx, modOpts, patterns...)
+	} else {
+		noModRoots := []string{}
+		matches = search.ImportPaths(patterns, noModRoots)
+	}
+
 	var (
 		pkgs    []*Package
 		stk     ImportStack
@@ -2143,14 +2824,14 @@ func PackagesAndErrors(patterns []string) []*Package {
 
 	pre := newPreload()
 	defer pre.flush()
-	pre.preloadMatches(matches)
+	pre.preloadMatches(ctx, opts, matches)
 
 	for _, m := range matches {
 		for _, pkg := range m.Pkgs {
 			if pkg == "" {
 				panic(fmt.Sprintf("ImportPaths returned empty package for pattern %s", m.Pattern()))
 			}
-			p := loadImport(pre, pkg, base.Cwd, nil, &stk, nil, 0)
+			p := loadImport(ctx, opts, pre, pkg, base.Cwd(), nil, &stk, nil, 0)
 			p.Match = append(p.Match, m.Pattern())
 			p.Internal.CmdlinePkg = true
 			if m.IsLiteral() {
@@ -2172,8 +2853,10 @@ func PackagesAndErrors(patterns []string) []*Package {
 			// Report it as a synthetic package.
 			p := new(Package)
 			p.ImportPath = m.Pattern()
-			var stk ImportStack // empty stack, since the error arose from a pattern, not an import
-			p.setLoadPackageDataError(m.Errs[0], m.Pattern(), &stk)
+			// Pass an empty ImportStack and nil importPos: the error arose from a pattern, not an import.
+			var stk ImportStack
+			var importPos []token.Position
+			p.setLoadPackageDataError(m.Errs[0], m.Pattern(), &stk, importPos)
 			p.Incomplete = true
 			p.Match = append(p.Match, m.Pattern())
 			p.Internal.CmdlinePkg = true
@@ -2184,36 +2867,73 @@ func PackagesAndErrors(patterns []string) []*Package {
 		}
 	}
 
+	if opts.MainOnly {
+		pkgs = mainPackagesOnly(pkgs, matches)
+	}
+
 	// Now that CmdlinePkg is set correctly,
 	// compute the effective flags for all loaded packages
 	// (not just the ones matching the patterns but also
 	// their dependencies).
 	setToolFlags(pkgs...)
 
+	setPGOProfilePath(pkgs)
+
 	return pkgs
 }
 
-func setToolFlags(pkgs ...*Package) {
-	for _, p := range PackageList(pkgs) {
-		p.Internal.Asmflags = BuildAsmflags.For(p)
-		p.Internal.Gcflags = BuildGcflags.For(p)
-		p.Internal.Ldflags = BuildLdflags.For(p)
-		p.Internal.Gccgoflags = BuildGccgoflags.For(p)
+// setPGOProfilePath sets cfg.BuildPGOFile to the PGO profile path.
+// In -pgo=auto mode, it finds the default PGO profile.
+func setPGOProfilePath(pkgs []*Package) {
+	switch cfg.BuildPGO {
+	case "":
+		fallthrough // default to "off"
+	case "off":
+		return
+
+	case "auto":
+		// Locate PGO profile from the main package.
+
+		setError := func(p *Package) {
+			if p.Error == nil {
+				p.Error = &PackageError{Err: errors.New("-pgo=auto requires exactly one main package")}
+			}
+		}
+
+		var mainpkg *Package
+		for _, p := range pkgs {
+			if p.Name == "main" {
+				if mainpkg != nil {
+					setError(p)
+					setError(mainpkg)
+					continue
+				}
+				mainpkg = p
+			}
+		}
+		if mainpkg == nil {
+			// No main package, no default.pgo to look for.
+			return
+		}
+		file := filepath.Join(mainpkg.Dir, "default.pgo")
+		if fi, err := os.Stat(file); err == nil && !fi.IsDir() {
+			cfg.BuildPGOFile = file
+		}
+
+	default:
+		// Profile specified from the command line.
+		// Make it absolute path, as the compiler runs on various directories.
+		if p, err := filepath.Abs(cfg.BuildPGO); err != nil {
+			base.Fatalf("fail to get absolute path of PGO file %s: %v", cfg.BuildPGO, err)
+		} else {
+			cfg.BuildPGOFile = p
+		}
 	}
 }
 
-func ImportPaths(args []string) []*search.Match {
-	if ModInit(); cfg.ModulesEnabled {
-		return ModImportPaths(args)
-	}
-	return search.ImportPaths(args)
-}
-
-// PackagesForBuild is like Packages but exits
-// if any of the packages or their dependencies have errors
-// (cannot be built).
-func PackagesForBuild(args []string) []*Package {
-	pkgs := PackagesAndErrors(args)
+// CheckPackageErrors prints errors encountered loading pkgs and their
+// dependencies, then exits with a non-zero status if any errors were found.
+func CheckPackageErrors(pkgs []*Package) {
 	printed := map[*PackageError]bool{}
 	for _, pkg := range pkgs {
 		if pkg.Error != nil {
@@ -2248,15 +2968,96 @@ func PackagesForBuild(args []string) []*Package {
 		seen[pkg.ImportPath] = true
 	}
 	base.ExitIfErrors()
+}
 
-	return pkgs
+// mainPackagesOnly filters out non-main packages matched only by arguments
+// containing "..." and returns the remaining main packages.
+//
+// Packages with missing, invalid, or ambiguous names may be treated as
+// possibly-main packages.
+//
+// mainPackagesOnly sets a non-main package's Error field and returns it if it
+// is named by a literal argument.
+//
+// mainPackagesOnly prints warnings for non-literal arguments that only match
+// non-main packages.
+func mainPackagesOnly(pkgs []*Package, matches []*search.Match) []*Package {
+	treatAsMain := map[string]bool{}
+	for _, m := range matches {
+		if m.IsLiteral() {
+			for _, path := range m.Pkgs {
+				treatAsMain[path] = true
+			}
+		}
+	}
+
+	var mains []*Package
+	for _, pkg := range pkgs {
+		if pkg.Name == "main" || (pkg.Name == "" && pkg.Error != nil) {
+			treatAsMain[pkg.ImportPath] = true
+			mains = append(mains, pkg)
+			continue
+		}
+
+		if len(pkg.InvalidGoFiles) > 0 { // TODO(#45999): && pkg.Name == "", but currently go/build sets pkg.Name arbitrarily if it is ambiguous.
+			// The package has (or may have) conflicting names, and we can't easily
+			// tell whether one of them is "main". So assume that it could be, and
+			// report an error for the package.
+			treatAsMain[pkg.ImportPath] = true
+		}
+		if treatAsMain[pkg.ImportPath] {
+			if pkg.Error == nil {
+				pkg.Error = &PackageError{Err: &mainPackageError{importPath: pkg.ImportPath}}
+			}
+			mains = append(mains, pkg)
+		}
+	}
+
+	for _, m := range matches {
+		if m.IsLiteral() || len(m.Pkgs) == 0 {
+			continue
+		}
+		foundMain := false
+		for _, path := range m.Pkgs {
+			if treatAsMain[path] {
+				foundMain = true
+				break
+			}
+		}
+		if !foundMain {
+			fmt.Fprintf(os.Stderr, "go: warning: %q matched only non-main packages\n", m.Pattern())
+		}
+	}
+
+	return mains
+}
+
+type mainPackageError struct {
+	importPath string
+}
+
+func (e *mainPackageError) Error() string {
+	return fmt.Sprintf("package %s is not a main package", e.importPath)
+}
+
+func (e *mainPackageError) ImportPath() string {
+	return e.importPath
+}
+
+func setToolFlags(pkgs ...*Package) {
+	for _, p := range PackageList(pkgs) {
+		p.Internal.Asmflags = BuildAsmflags.For(p)
+		p.Internal.Gcflags = BuildGcflags.For(p)
+		p.Internal.Ldflags = BuildLdflags.For(p)
+		p.Internal.Gccgoflags = BuildGccgoflags.For(p)
+	}
 }
 
 // GoFilesPackage creates a package for building a collection of Go files
 // (typically named on the command line). The target is named p.a for
 // package p or named after the first Go file for package main.
-func GoFilesPackage(gofiles []string) *Package {
-	ModInit()
+func GoFilesPackage(ctx context.Context, opts PackageOpts, gofiles []string) *Package {
+	modload.Init()
 
 	for _, f := range gofiles {
 		if !strings.HasSuffix(f, ".go") {
@@ -2279,20 +3080,17 @@ func GoFilesPackage(gofiles []string) *Package {
 	// to make it look like this is a standard package or
 	// command directory. So that local imports resolve
 	// consistently, the files must all be in the same directory.
-	var dirent []os.FileInfo
+	var dirent []fs.FileInfo
 	var dir string
 	for _, file := range gofiles {
-		fi, err := os.Stat(file)
+		fi, err := fsys.Stat(file)
 		if err != nil {
 			base.Fatalf("%s", err)
 		}
 		if fi.IsDir() {
 			base.Fatalf("%s is a directory, should be a Go file", file)
 		}
-		dir1, _ := filepath.Split(file)
-		if dir1 == "" {
-			dir1 = "./"
-		}
+		dir1 := filepath.Dir(file)
 		if dir == "" {
 			dir = dir1
 		} else if dir != dir1 {
@@ -2300,15 +3098,15 @@ func GoFilesPackage(gofiles []string) *Package {
 		}
 		dirent = append(dirent, fi)
 	}
-	ctxt.ReadDir = func(string) ([]os.FileInfo, error) { return dirent, nil }
+	ctxt.ReadDir = func(string) ([]fs.FileInfo, error) { return dirent, nil }
 
 	if cfg.ModulesEnabled {
-		ModImportFromFiles(gofiles)
+		modload.ImportFromFiles(ctx, gofiles)
 	}
 
 	var err error
 	if dir == "" {
-		dir = base.Cwd
+		dir = base.Cwd()
 	}
 	dir, err = filepath.Abs(dir)
 	if err != nil {
@@ -2319,8 +3117,10 @@ func GoFilesPackage(gofiles []string) *Package {
 	pkg := new(Package)
 	pkg.Internal.Local = true
 	pkg.Internal.CmdlineFiles = true
-	pkg.load("command-line-arguments", &stk, bp, err)
-	pkg.Internal.LocalPrefix = dirToImportPath(dir)
+	pkg.load(ctx, opts, "command-line-arguments", &stk, nil, bp, err)
+	if !cfg.ModulesEnabled {
+		pkg.Internal.LocalPrefix = dirToImportPath(dir)
+	}
 	pkg.ImportPath = "command-line-arguments"
 	pkg.Target = ""
 	pkg.Match = gofiles
@@ -2331,11 +3131,332 @@ func GoFilesPackage(gofiles []string) *Package {
 		if cfg.GOBIN != "" {
 			pkg.Target = filepath.Join(cfg.GOBIN, exe)
 		} else if cfg.ModulesEnabled {
-			pkg.Target = filepath.Join(ModBinDir(), exe)
+			pkg.Target = filepath.Join(modload.BinDir(), exe)
 		}
 	}
 
+	if opts.MainOnly && pkg.Name != "main" && pkg.Error == nil {
+		pkg.Error = &PackageError{Err: &mainPackageError{importPath: pkg.ImportPath}}
+	}
 	setToolFlags(pkg)
 
 	return pkg
+}
+
+// PackagesAndErrorsOutsideModule is like PackagesAndErrors but runs in
+// module-aware mode and ignores the go.mod file in the current directory or any
+// parent directory, if there is one. This is used in the implementation of 'go
+// install pkg@version' and other commands that support similar forms.
+//
+// modload.ForceUseModules must be true, and modload.RootMode must be NoRoot
+// before calling this function.
+//
+// PackagesAndErrorsOutsideModule imposes several constraints to avoid
+// ambiguity. All arguments must have the same version suffix (not just a suffix
+// that resolves to the same version). They must refer to packages in the same
+// module, which must not be std or cmd. That module is not considered the main
+// module, but its go.mod file (if it has one) must not contain directives that
+// would cause it to be interpreted differently if it were the main module
+// (replace, exclude).
+func PackagesAndErrorsOutsideModule(ctx context.Context, opts PackageOpts, args []string) ([]*Package, error) {
+	if !modload.ForceUseModules {
+		panic("modload.ForceUseModules must be true")
+	}
+	if modload.RootMode != modload.NoRoot {
+		panic("modload.RootMode must be NoRoot")
+	}
+
+	// Check that the arguments satisfy syntactic constraints.
+	var version string
+	for _, arg := range args {
+		if i := strings.Index(arg, "@"); i >= 0 {
+			version = arg[i+1:]
+			if version == "" {
+				return nil, fmt.Errorf("%s: version must not be empty", arg)
+			}
+			break
+		}
+	}
+	patterns := make([]string, len(args))
+	for i, arg := range args {
+		p, found := strings.CutSuffix(arg, "@"+version)
+		if !found {
+			return nil, fmt.Errorf("%s: all arguments must refer to packages in the same module at the same version (@%s)", arg, version)
+		}
+		switch {
+		case build.IsLocalImport(p):
+			return nil, fmt.Errorf("%s: argument must be a package path, not a relative path", arg)
+		case filepath.IsAbs(p):
+			return nil, fmt.Errorf("%s: argument must be a package path, not an absolute path", arg)
+		case search.IsMetaPackage(p):
+			return nil, fmt.Errorf("%s: argument must be a package path, not a meta-package", arg)
+		case pathpkg.Clean(p) != p:
+			return nil, fmt.Errorf("%s: argument must be a clean package path", arg)
+		case !strings.Contains(p, "...") && search.IsStandardImportPath(p) && modindex.IsStandardPackage(cfg.GOROOT, cfg.BuildContext.Compiler, p):
+			return nil, fmt.Errorf("%s: argument must not be a package in the standard library", arg)
+		default:
+			patterns[i] = p
+		}
+	}
+
+	// Query the module providing the first argument, load its go.mod file, and
+	// check that it doesn't contain directives that would cause it to be
+	// interpreted differently if it were the main module.
+	//
+	// If multiple modules match the first argument, accept the longest match
+	// (first result). It's possible this module won't provide packages named by
+	// later arguments, and other modules would. Let's not try to be too
+	// magical though.
+	allowed := modload.CheckAllowed
+	if modload.IsRevisionQuery(version) {
+		// Don't check for retractions if a specific revision is requested.
+		allowed = nil
+	}
+	noneSelected := func(path string) (version string) { return "none" }
+	qrs, err := modload.QueryPackages(ctx, patterns[0], version, noneSelected, allowed)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", args[0], err)
+	}
+	rootMod := qrs[0].Mod
+	data, err := modfetch.GoMod(rootMod.Path, rootMod.Version)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", args[0], err)
+	}
+	f, err := modfile.Parse("go.mod", data, nil)
+	if err != nil {
+		return nil, fmt.Errorf("%s (in %s): %w", args[0], rootMod, err)
+	}
+	directiveFmt := "%s (in %s):\n" +
+		"\tThe go.mod file for the module providing named packages contains one or\n" +
+		"\tmore %s directives. It must not contain directives that would cause\n" +
+		"\tit to be interpreted differently than if it were the main module."
+	if len(f.Replace) > 0 {
+		return nil, fmt.Errorf(directiveFmt, args[0], rootMod, "replace")
+	}
+	if len(f.Exclude) > 0 {
+		return nil, fmt.Errorf(directiveFmt, args[0], rootMod, "exclude")
+	}
+
+	// Since we are in NoRoot mode, the build list initially contains only
+	// the dummy command-line-arguments module. Add a requirement on the
+	// module that provides the packages named on the command line.
+	if _, err := modload.EditBuildList(ctx, nil, []module.Version{rootMod}); err != nil {
+		return nil, fmt.Errorf("%s: %w", args[0], err)
+	}
+
+	// Load packages for all arguments.
+	pkgs := PackagesAndErrors(ctx, opts, patterns)
+
+	// Check that named packages are all provided by the same module.
+	for _, pkg := range pkgs {
+		var pkgErr error
+		if pkg.Module == nil {
+			// Packages in std, cmd, and their vendored dependencies
+			// don't have this field set.
+			pkgErr = fmt.Errorf("package %s not provided by module %s", pkg.ImportPath, rootMod)
+		} else if pkg.Module.Path != rootMod.Path || pkg.Module.Version != rootMod.Version {
+			pkgErr = fmt.Errorf("package %s provided by module %s@%s\n\tAll packages must be provided by the same module (%s).", pkg.ImportPath, pkg.Module.Path, pkg.Module.Version, rootMod)
+		}
+		if pkgErr != nil && pkg.Error == nil {
+			pkg.Error = &PackageError{Err: pkgErr}
+		}
+	}
+
+	matchers := make([]func(string) bool, len(patterns))
+	for i, p := range patterns {
+		if strings.Contains(p, "...") {
+			matchers[i] = pkgpattern.MatchPattern(p)
+		}
+	}
+	return pkgs, nil
+}
+
+// EnsureImport ensures that package p imports the named package.
+func EnsureImport(p *Package, pkg string) {
+	for _, d := range p.Internal.Imports {
+		if d.Name == pkg {
+			return
+		}
+	}
+
+	p1 := LoadImportWithFlags(pkg, p.Dir, p, &ImportStack{}, nil, 0)
+	if p1.Error != nil {
+		base.Fatalf("load %s: %v", pkg, p1.Error)
+	}
+
+	p.Internal.Imports = append(p.Internal.Imports, p1)
+}
+
+// PrepareForCoverageBuild is a helper invoked for "go install
+// -cover", "go run -cover", and "go build -cover" (but not used by
+// "go test -cover"). It walks through the packages being built (and
+// dependencies) and marks them for coverage instrumentation when
+// appropriate, and possibly adding additional deps where needed.
+func PrepareForCoverageBuild(pkgs []*Package) {
+	var match []func(*Package) bool
+
+	matchMainModAndCommandLine := func(p *Package) bool {
+		// note that p.Standard implies p.Module == nil below.
+		return p.Internal.CmdlineFiles || p.Internal.CmdlinePkg || (p.Module != nil && p.Module.Main)
+	}
+
+	if len(cfg.BuildCoverPkg) != 0 {
+		// If -coverpkg has been specified, then we instrument only
+		// the specific packages selected by the user-specified pattern(s).
+		match = make([]func(*Package) bool, len(cfg.BuildCoverPkg))
+		for i := range cfg.BuildCoverPkg {
+			match[i] = MatchPackage(cfg.BuildCoverPkg[i], base.Cwd())
+		}
+	} else {
+		// Without -coverpkg, instrument only packages in the main module
+		// (if any), as well as packages/files specifically named on the
+		// command line.
+		match = []func(*Package) bool{matchMainModAndCommandLine}
+	}
+
+	// Visit the packages being built or installed, along with all of
+	// their dependencies, and mark them to be instrumented, taking
+	// into account the matchers we've set up in the sequence above.
+	SelectCoverPackages(PackageList(pkgs), match, "build")
+}
+
+func SelectCoverPackages(roots []*Package, match []func(*Package) bool, op string) []*Package {
+	var warntag string
+	var includeMain bool
+	switch op {
+	case "build":
+		warntag = "built"
+		includeMain = true
+	case "test":
+		warntag = "tested"
+	default:
+		panic("internal error, bad mode passed to SelectCoverPackages")
+	}
+
+	covered := []*Package{}
+	matched := make([]bool, len(match))
+	for _, p := range roots {
+		haveMatch := false
+		for i := range match {
+			if match[i](p) {
+				matched[i] = true
+				haveMatch = true
+			}
+		}
+		if !haveMatch {
+			continue
+		}
+
+		// There is nothing to cover in package unsafe; it comes from
+		// the compiler.
+		if p.ImportPath == "unsafe" {
+			continue
+		}
+
+		// A package which only has test files can't be imported as a
+		// dependency, and at the moment we don't try to instrument it
+		// for coverage. There isn't any technical reason why
+		// *_test.go files couldn't be instrumented, but it probably
+		// doesn't make much sense to lump together coverage metrics
+		// (ex: percent stmts covered) of *_test.go files with
+		// non-test Go code.
+		if len(p.GoFiles)+len(p.CgoFiles) == 0 {
+			continue
+		}
+
+		// Silently ignore attempts to run coverage on sync/atomic
+		// and/or runtime/internal/atomic when using atomic coverage
+		// mode. Atomic coverage mode uses sync/atomic, so we can't
+		// also do coverage on it.
+		if cfg.BuildCoverMode == "atomic" && p.Standard &&
+			(p.ImportPath == "sync/atomic" || p.ImportPath == "runtime/internal/atomic") {
+			continue
+		}
+
+		// If using the race detector, silently ignore attempts to run
+		// coverage on the runtime packages. It will cause the race
+		// detector to be invoked before it has been initialized. Note
+		// the use of "regonly" instead of just ignoring the package
+		// completely-- we do this due to the requirements of the
+		// package ID numbering scheme. See the comment in
+		// $GOROOT/src/internal/coverage/pkid.go dealing with
+		// hard-coding of runtime package IDs.
+		cmode := cfg.BuildCoverMode
+		if cfg.BuildRace && p.Standard && (p.ImportPath == "runtime" || strings.HasPrefix(p.ImportPath, "runtime/internal")) {
+			cmode = "regonly"
+		}
+
+		// If -coverpkg is in effect and for some reason we don't want
+		// coverage data for the main package, make sure that we at
+		// least process it for registration hooks.
+		if includeMain && p.Name == "main" && !haveMatch {
+			haveMatch = true
+			cmode = "regonly"
+		}
+
+		// Mark package for instrumentation.
+		p.Internal.CoverMode = cmode
+		covered = append(covered, p)
+
+		// Force import of sync/atomic into package if atomic mode.
+		if cfg.BuildCoverMode == "atomic" {
+			EnsureImport(p, "sync/atomic")
+		}
+
+		// Generate covervars if using legacy coverage design.
+		if !cfg.Experiment.CoverageRedesign {
+			var coverFiles []string
+			coverFiles = append(coverFiles, p.GoFiles...)
+			coverFiles = append(coverFiles, p.CgoFiles...)
+			p.Internal.CoverVars = DeclareCoverVars(p, coverFiles...)
+		}
+	}
+
+	// Warn about -coverpkg arguments that are not actually used.
+	for i := range cfg.BuildCoverPkg {
+		if !matched[i] {
+			fmt.Fprintf(os.Stderr, "warning: no packages being %s depend on matches for pattern %s\n", warntag, cfg.BuildCoverPkg[i])
+		}
+	}
+
+	return covered
+}
+
+// DeclareCoverVars attaches the required cover variables names
+// to the files, to be used when annotating the files. This
+// function only called when using legacy coverage test/build
+// (e.g. GOEXPERIMENT=coverageredesign is off).
+func DeclareCoverVars(p *Package, files ...string) map[string]*CoverVar {
+	coverVars := make(map[string]*CoverVar)
+	coverIndex := 0
+	// We create the cover counters as new top-level variables in the package.
+	// We need to avoid collisions with user variables (GoCover_0 is unlikely but still)
+	// and more importantly with dot imports of other covered packages,
+	// so we append 12 hex digits from the SHA-256 of the import path.
+	// The point is only to avoid accidents, not to defeat users determined to
+	// break things.
+	sum := sha256.Sum256([]byte(p.ImportPath))
+	h := fmt.Sprintf("%x", sum[:6])
+	for _, file := range files {
+		if base.IsTestFile(file) {
+			continue
+		}
+		// For a package that is "local" (imported via ./ import or command line, outside GOPATH),
+		// we record the full path to the file name.
+		// Otherwise we record the import path, then a forward slash, then the file name.
+		// This makes profiles within GOPATH file system-independent.
+		// These names appear in the cmd/cover HTML interface.
+		var longFile string
+		if p.Internal.Local {
+			longFile = filepath.Join(p.Dir, file)
+		} else {
+			longFile = pathpkg.Join(p.ImportPath, file)
+		}
+		coverVars[file] = &CoverVar{
+			File: longFile,
+			Var:  fmt.Sprintf("GoCover_%d_%x", coverIndex, h),
+		}
+		coverIndex++
+	}
+	return coverVars
 }

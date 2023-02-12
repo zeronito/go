@@ -53,9 +53,8 @@
 package runtime
 
 import (
-	"runtime/internal/atomic"
-	"runtime/internal/sys"
-	"unsafe"
+	"internal/abi"
+	"internal/goarch"
 )
 
 type suspendGState struct {
@@ -192,7 +191,7 @@ func suspendG(gp *g) suspendGState {
 		case _Grunning:
 			// Optimization: if there is already a pending preemption request
 			// (from the previous loop iteration), don't bother with the atomics.
-			if gp.preemptStop && gp.preempt && gp.stackguard0 == stackPreempt && asyncM == gp.m && atomic.Load(&asyncM.preemptGen) == asyncGen {
+			if gp.preemptStop && gp.preempt && gp.stackguard0 == stackPreempt && asyncM == gp.m && asyncM.preemptGen.Load() == asyncGen {
 				break
 			}
 
@@ -208,7 +207,7 @@ func suspendG(gp *g) suspendGState {
 
 			// Prepare for asynchronous preemption.
 			asyncM2 := gp.m
-			asyncGen2 := atomic.Load(&asyncM2.preemptGen)
+			asyncGen2 := asyncM2.preemptGen.Load()
 			needAsync := asyncM != asyncM2 || asyncGen != asyncGen2
 			asyncM = asyncM2
 			asyncGen = asyncGen2
@@ -315,12 +314,12 @@ func asyncPreempt2() {
 var asyncPreemptStack = ^uintptr(0)
 
 func init() {
-	f := findfunc(funcPC(asyncPreempt))
+	f := findfunc(abi.FuncPCABI0(asyncPreempt))
 	total := funcMaxSPDelta(f)
-	f = findfunc(funcPC(asyncPreempt2))
+	f = findfunc(abi.FuncPCABIInternal(asyncPreempt2))
 	total += funcMaxSPDelta(f)
 	// Add some overhead for return PCs, etc.
-	asyncPreemptStack = uintptr(total) + 8*sys.PtrSize
+	asyncPreemptStack = uintptr(total) + 8*goarch.PtrSize
 	if asyncPreemptStack > _StackLimit {
 		// We need more than the nosplit limit. This isn't
 		// unsafe, but it may limit asynchronous preemption.
@@ -356,31 +355,35 @@ func wantAsyncPreempt(gp *g) bool {
 // 3. It's generally safe to interact with the runtime, even if we're
 // in a signal handler stopped here. For example, there are no runtime
 // locks held, so acquiring a runtime lock won't self-deadlock.
-func isAsyncSafePoint(gp *g, pc, sp, lr uintptr) bool {
+//
+// In some cases the PC is safe for asynchronous preemption but it
+// also needs to adjust the resumption PC. The new PC is returned in
+// the second result.
+func isAsyncSafePoint(gp *g, pc, sp, lr uintptr) (bool, uintptr) {
 	mp := gp.m
 
 	// Only user Gs can have safe-points. We check this first
 	// because it's extremely common that we'll catch mp in the
 	// scheduler processing this G preemption.
 	if mp.curg != gp {
-		return false
+		return false, 0
 	}
 
 	// Check M state.
 	if mp.p == 0 || !canPreemptM(mp) {
-		return false
+		return false, 0
 	}
 
 	// Check stack space.
 	if sp < gp.stack.lo || sp-gp.stack.lo < asyncPreemptStack {
-		return false
+		return false, 0
 	}
 
 	// Check if PC is an unsafe-point.
 	f := findfunc(pc)
 	if !f.valid() {
 		// Not Go code.
-		return false
+		return false, 0
 	}
 	if (GOARCH == "mips" || GOARCH == "mipsle" || GOARCH == "mips64" || GOARCH == "mips64le") && lr == pc+8 && funcspdelta(f, pc, nil) == 0 {
 		// We probably stopped at a half-executed CALL instruction,
@@ -391,32 +394,31 @@ func isAsyncSafePoint(gp *g, pc, sp, lr uintptr) bool {
 		// stack for unwinding, not the LR value. But if this is a
 		// call to morestack, we haven't created the frame, and we'll
 		// use the LR for unwinding, which will be bad.
-		return false
+		return false, 0
 	}
-	smi := pcdatavalue(f, _PCDATA_RegMapIndex, pc, nil)
-	if smi == -2 {
+	up, startpc := pcdatavalue2(f, _PCDATA_UnsafePoint, pc)
+	if up == _PCDATA_UnsafePointUnsafe {
 		// Unsafe-point marked by compiler. This includes
 		// atomic sequences (e.g., write barrier) and nosplit
 		// functions (except at calls).
-		return false
+		return false, 0
 	}
-	if fd := funcdata(f, _FUNCDATA_LocalsPointerMaps); fd == nil || fd == unsafe.Pointer(&no_pointers_stackmap) {
-		// This is assembly code. Don't assume it's
-		// well-formed. We identify assembly code by
-		// checking that it has either no stack map, or
-		// no_pointers_stackmap, which is the stack map
-		// for ones marked as NO_LOCAL_POINTERS.
+	if fd := funcdata(f, _FUNCDATA_LocalsPointerMaps); fd == nil || f.flag&funcFlag_ASM != 0 {
+		// This is assembly code. Don't assume it's well-formed.
+		// TODO: Empirically we still need the fd == nil check. Why?
 		//
 		// TODO: Are there cases that are safe but don't have a
 		// locals pointer map, like empty frame functions?
-		return false
+		// It might be possible to preempt any assembly functions
+		// except the ones that have funcFlag_SPWRITE set in f.flag.
+		return false, 0
 	}
 	name := funcname(f)
 	if inldata := funcdata(f, _FUNCDATA_InlTree); inldata != nil {
 		inltree := (*[1 << 20]inlinedCall)(inldata)
 		ix := pcdatavalue(f, _PCDATA_InlTreeIndex, pc, nil)
 		if ix >= 0 {
-			name = funcnameFromNameoff(f, inltree[ix].func_)
+			name = funcnameFromNameOff(f, inltree[ix].nameOff)
 		}
 	}
 	if hasPrefix(name, "runtime.") ||
@@ -432,10 +434,19 @@ func isAsyncSafePoint(gp *g, pc, sp, lr uintptr) bool {
 		//
 		// TODO(austin): We should improve this, or opt things
 		// in incrementally.
-		return false
+		return false, 0
 	}
-
-	return true
+	switch up {
+	case _PCDATA_Restart1, _PCDATA_Restart2:
+		// Restartable instruction sequence. Back off PC to
+		// the start PC.
+		if startpc == 0 || startpc > pc || pc-startpc > 20 {
+			throw("bad restart PC")
+		}
+		return true, startpc
+	case _PCDATA_RestartAtEntry:
+		// Restart from the function entry at resumption.
+		return true, f.entry()
+	}
+	return true, pc
 }
-
-var no_pointers_stackmap uint64 // defined in assembly, for NO_LOCAL_POINTERS macro

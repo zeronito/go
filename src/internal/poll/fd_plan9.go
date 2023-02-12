@@ -7,15 +7,10 @@ package poll
 import (
 	"errors"
 	"io"
+	"sync"
 	"sync/atomic"
 	"time"
 )
-
-type atomicBool int32
-
-func (b *atomicBool) isSet() bool { return atomic.LoadInt32((*int32)(b)) != 0 }
-func (b *atomicBool) setFalse()   { atomic.StoreInt32((*int32)(b), 0) }
-func (b *atomicBool) setTrue()    { atomic.StoreInt32((*int32)(b), 1) }
 
 type FD struct {
 	// Lock sysfd and serialize access to Read and Write methods.
@@ -24,12 +19,14 @@ type FD struct {
 	Destroy func()
 
 	// deadlines
+	rmu       sync.Mutex
+	wmu       sync.Mutex
 	raio      *asyncIO
 	waio      *asyncIO
 	rtimer    *time.Timer
 	wtimer    *time.Timer
-	rtimedout atomicBool // set true when read deadline has been reached
-	wtimedout atomicBool // set true when write deadline has been reached
+	rtimedout atomic.Bool // set true when read deadline has been reached
+	wtimedout atomic.Bool // set true when write deadline has been reached
 
 	// Whether this is a normal file.
 	// On Plan 9 we do not use this package for ordinary files,
@@ -59,9 +56,6 @@ func (fd *FD) Close() error {
 
 // Read implements io.Reader.
 func (fd *FD) Read(fn func([]byte) (int, error), b []byte) (int, error) {
-	if fd.rtimedout.isSet() {
-		return 0, ErrTimeout
-	}
 	if err := fd.readLock(); err != nil {
 		return 0, err
 	}
@@ -69,32 +63,41 @@ func (fd *FD) Read(fn func([]byte) (int, error), b []byte) (int, error) {
 	if len(b) == 0 {
 		return 0, nil
 	}
+	fd.rmu.Lock()
+	if fd.rtimedout.Load() {
+		fd.rmu.Unlock()
+		return 0, ErrDeadlineExceeded
+	}
 	fd.raio = newAsyncIO(fn, b)
+	fd.rmu.Unlock()
 	n, err := fd.raio.Wait()
 	fd.raio = nil
 	if isHangup(err) {
 		err = io.EOF
 	}
 	if isInterrupted(err) {
-		err = ErrTimeout
+		err = ErrDeadlineExceeded
 	}
 	return n, err
 }
 
 // Write implements io.Writer.
 func (fd *FD) Write(fn func([]byte) (int, error), b []byte) (int, error) {
-	if fd.wtimedout.isSet() {
-		return 0, ErrTimeout
-	}
 	if err := fd.writeLock(); err != nil {
 		return 0, err
 	}
 	defer fd.writeUnlock()
+	fd.wmu.Lock()
+	if fd.wtimedout.Load() {
+		fd.wmu.Unlock()
+		return 0, ErrDeadlineExceeded
+	}
 	fd.waio = newAsyncIO(fn, b)
+	fd.wmu.Unlock()
 	n, err := fd.waio.Wait()
 	fd.waio = nil
 	if isInterrupted(err) {
-		err = ErrTimeout
+		err = ErrDeadlineExceeded
 	}
 	return n, err
 }
@@ -117,10 +120,14 @@ func (fd *FD) SetWriteDeadline(t time.Time) error {
 func setDeadlineImpl(fd *FD, t time.Time, mode int) error {
 	d := t.Sub(time.Now())
 	if mode == 'r' || mode == 'r'+'w' {
-		fd.rtimedout.setFalse()
+		fd.rmu.Lock()
+		defer fd.rmu.Unlock()
+		fd.rtimedout.Store(false)
 	}
 	if mode == 'w' || mode == 'r'+'w' {
-		fd.wtimedout.setFalse()
+		fd.wmu.Lock()
+		defer fd.wmu.Unlock()
+		fd.wtimedout.Store(false)
 	}
 	if t.IsZero() || d < 0 {
 		// Stop timer
@@ -140,31 +147,35 @@ func setDeadlineImpl(fd *FD, t time.Time, mode int) error {
 		// Interrupt I/O operation once timer has expired
 		if mode == 'r' || mode == 'r'+'w' {
 			fd.rtimer = time.AfterFunc(d, func() {
-				fd.rtimedout.setTrue()
+				fd.rmu.Lock()
+				fd.rtimedout.Store(true)
 				if fd.raio != nil {
 					fd.raio.Cancel()
 				}
+				fd.rmu.Unlock()
 			})
 		}
 		if mode == 'w' || mode == 'r'+'w' {
 			fd.wtimer = time.AfterFunc(d, func() {
-				fd.wtimedout.setTrue()
+				fd.wmu.Lock()
+				fd.wtimedout.Store(true)
 				if fd.waio != nil {
 					fd.waio.Cancel()
 				}
+				fd.wmu.Unlock()
 			})
 		}
 	}
 	if !t.IsZero() && d < 0 {
 		// Interrupt current I/O operation
 		if mode == 'r' || mode == 'r'+'w' {
-			fd.rtimedout.setTrue()
+			fd.rtimedout.Store(true)
 			if fd.raio != nil {
 				fd.raio.Cancel()
 			}
 		}
 		if mode == 'w' || mode == 'r'+'w' {
-			fd.wtimedout.setTrue()
+			fd.wtimedout.Store(true)
 			if fd.waio != nil {
 				fd.waio.Cancel()
 			}

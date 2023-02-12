@@ -9,39 +9,31 @@
 #include "go_asm.h"
 #include "go_tls.h"
 #include "textflag.h"
+#include "cgo/abi_amd64.h"
+
+#define CLOCK_REALTIME		0
 
 // Exit the entire program (like C exit)
 TEXT runtime·exit_trampoline(SB),NOSPLIT,$0
-	PUSHQ	BP
-	MOVQ	SP, BP
 	MOVL	0(DI), DI		// arg 1 exit status
 	CALL	libc_exit(SB)
 	MOVL	$0xf1, 0xf1  // crash
-	POPQ	BP
 	RET
 
 TEXT runtime·open_trampoline(SB),NOSPLIT,$0
-	PUSHQ	BP
-	MOVQ	SP, BP
 	MOVL	8(DI), SI		// arg 2 flags
 	MOVL	12(DI), DX		// arg 3 mode
 	MOVQ	0(DI), DI		// arg 1 pathname
 	XORL	AX, AX			// vararg: say "no float args"
 	CALL	libc_open(SB)
-	POPQ	BP
 	RET
 
 TEXT runtime·close_trampoline(SB),NOSPLIT,$0
-	PUSHQ	BP
-	MOVQ	SP, BP
 	MOVL	0(DI), DI		// arg 1 fd
 	CALL	libc_close(SB)
-	POPQ	BP
 	RET
 
 TEXT runtime·read_trampoline(SB),NOSPLIT,$0
-	PUSHQ	BP
-	MOVQ	SP, BP
 	MOVQ	8(DI), SI		// arg 2 buf
 	MOVL	16(DI), DX		// arg 3 count
 	MOVL	0(DI), DI		// arg 1 fd
@@ -52,12 +44,9 @@ TEXT runtime·read_trampoline(SB),NOSPLIT,$0
 	MOVL	(AX), AX
 	NEGL	AX			// caller expects negative errno value
 noerr:
-	POPQ	BP
 	RET
 
 TEXT runtime·write_trampoline(SB),NOSPLIT,$0
-	PUSHQ	BP
-	MOVQ	SP, BP
 	MOVQ	8(DI), SI		// arg 2 buf
 	MOVL	16(DI), DX		// arg 3 count
 	MOVQ	0(DI), DI		// arg 1 fd
@@ -68,46 +57,37 @@ TEXT runtime·write_trampoline(SB),NOSPLIT,$0
 	MOVL	(AX), AX
 	NEGL	AX			// caller expects negative errno value
 noerr:
-	POPQ	BP
 	RET
 
 TEXT runtime·pipe_trampoline(SB),NOSPLIT,$0
-	PUSHQ	BP
-	MOVQ	SP, BP
 	CALL	libc_pipe(SB)		// pointer already in DI
 	TESTL	AX, AX
 	JEQ	3(PC)
 	CALL	libc_error(SB)		// return negative errno value
 	NEGL	AX
-	POPQ	BP
 	RET
 
 TEXT runtime·setitimer_trampoline(SB),NOSPLIT,$0
-	PUSHQ	BP
-	MOVQ	SP, BP
 	MOVQ	8(DI), SI		// arg 2 new
 	MOVQ	16(DI), DX		// arg 3 old
 	MOVL	0(DI), DI		// arg 1 which
 	CALL	libc_setitimer(SB)
-	POPQ	BP
 	RET
 
 TEXT runtime·madvise_trampoline(SB), NOSPLIT, $0
-	PUSHQ	BP
-	MOVQ	SP, BP
 	MOVQ	8(DI), SI	// arg 2 len
 	MOVL	16(DI), DX	// arg 3 advice
 	MOVQ	0(DI), DI	// arg 1 addr
 	CALL	libc_madvise(SB)
 	// ignore failure - maybe pages are locked
-	POPQ	BP
 	RET
+
+TEXT runtime·mlock_trampoline(SB), NOSPLIT, $0
+	UNDEF // unimplemented
 
 GLOBL timebase<>(SB),NOPTR,$(machTimebaseInfo__size)
 
 TEXT runtime·nanotime_trampoline(SB),NOSPLIT,$0
-	PUSHQ	BP
-	MOVQ	SP, BP
 	MOVQ	DI, BX
 	CALL	libc_mach_absolute_time(SB)
 	MOVQ	AX, 0(BX)
@@ -130,22 +110,15 @@ TEXT runtime·nanotime_trampoline(SB),NOSPLIT,$0
 initialized:
 	MOVL	SI, 8(BX)
 	MOVL	DI, 12(BX)
-	MOVQ	BP, SP
-	POPQ	BP
 	RET
 
 TEXT runtime·walltime_trampoline(SB),NOSPLIT,$0
-	PUSHQ	BP			// make a frame; keep stack aligned
-	MOVQ	SP, BP
-	// DI already has *timeval
-	XORL	SI, SI // no timezone needed
-	CALL	libc_gettimeofday(SB)
-	POPQ	BP
+	MOVQ	DI, SI			// arg 2 timespec
+	MOVL	$CLOCK_REALTIME, DI	// arg 1 clock_id
+	CALL	libc_clock_gettime(SB)
 	RET
 
 TEXT runtime·sigaction_trampoline(SB),NOSPLIT,$0
-	PUSHQ	BP
-	MOVQ	SP, BP
 	MOVQ	8(DI), SI		// arg 2 new
 	MOVQ	16(DI), DX		// arg 3 old
 	MOVL	0(DI), DI		// arg 1 sig
@@ -153,12 +126,9 @@ TEXT runtime·sigaction_trampoline(SB),NOSPLIT,$0
 	TESTL	AX, AX
 	JEQ	2(PC)
 	MOVL	$0xf1, 0xf1  // crash
-	POPQ	BP
 	RET
 
 TEXT runtime·sigprocmask_trampoline(SB),NOSPLIT,$0
-	PUSHQ	BP
-	MOVQ	SP, BP
 	MOVQ	8(DI), SI	// arg 2 new
 	MOVQ	16(DI), DX	// arg 3 old
 	MOVL	0(DI), DI	// arg 1 how
@@ -166,30 +136,23 @@ TEXT runtime·sigprocmask_trampoline(SB),NOSPLIT,$0
 	TESTL	AX, AX
 	JEQ	2(PC)
 	MOVL	$0xf1, 0xf1  // crash
-	POPQ	BP
 	RET
 
 TEXT runtime·sigaltstack_trampoline(SB),NOSPLIT,$0
-	PUSHQ	BP
-	MOVQ	SP, BP
 	MOVQ	8(DI), SI		// arg 2 old
 	MOVQ	0(DI), DI		// arg 1 new
 	CALL	libc_sigaltstack(SB)
 	TESTQ	AX, AX
 	JEQ	2(PC)
 	MOVL	$0xf1, 0xf1  // crash
-	POPQ	BP
 	RET
 
 TEXT runtime·raiseproc_trampoline(SB),NOSPLIT,$0
-	PUSHQ	BP
-	MOVQ	SP, BP
 	MOVL	0(DI), BX	// signal
 	CALL	libc_getpid(SB)
 	MOVL	AX, DI		// arg 1 pid
 	MOVL	BX, SI		// arg 2 signal
 	CALL	libc_kill(SB)
-	POPQ	BP
 	RET
 
 TEXT runtime·sigfwd(SB),NOSPLIT,$0-32
@@ -197,46 +160,54 @@ TEXT runtime·sigfwd(SB),NOSPLIT,$0-32
 	MOVL	sig+8(FP),   DI
 	MOVQ	info+16(FP), SI
 	MOVQ	ctx+24(FP),  DX
-	PUSHQ	BP
-	MOVQ	SP, BP
-	ANDQ	$~15, SP     // alignment for x86_64 ABI
+	MOVQ	SP, BX		// callee-saved
+	ANDQ	$~15, SP	// alignment for x86_64 ABI
 	CALL	AX
-	MOVQ	BP, SP
-	POPQ	BP
+	MOVQ	BX, SP
 	RET
 
 // This is the function registered during sigaction and is invoked when
 // a signal is received. It just redirects to the Go function sigtrampgo.
-TEXT runtime·sigtramp(SB),NOSPLIT,$0
-	// This runs on the signal stack, so we have lots of stack available.
-	// We allocate our own stack space, because if we tell the linker
-	// how much we're using, the NOSPLIT check fails.
-	PUSHQ	BP
-	MOVQ	SP, BP
-	SUBQ	$64, SP
+// Called using C ABI.
+TEXT runtime·sigtramp(SB),NOSPLIT|TOPFRAME|NOFRAME,$0
+	// Transition from C ABI to Go ABI.
+	PUSH_REGS_HOST_TO_ABI0()
 
-	// Save callee-save registers.
-	MOVQ	BX, 24(SP)
-	MOVQ	R12, 32(SP)
-	MOVQ	R13, 40(SP)
-	MOVQ	R14, 48(SP)
-	MOVQ	R15, 56(SP)
+	// Set up ABIInternal environment: g in R14, cleared X15.
+	get_tls(R12)
+	MOVQ	g(R12), R14
+	PXOR	X15, X15
+
+	// Reserve space for spill slots.
+	NOP	SP		// disable vet stack checking
+	ADJSP   $24
 
 	// Call into the Go signal handler
-	MOVL	DI, 0(SP)  // sig
-	MOVQ	SI, 8(SP)  // info
-	MOVQ	DX, 16(SP) // ctx
-	CALL runtime·sigtrampgo(SB)
+	MOVQ	DI, AX	// sig
+	MOVQ	SI, BX	// info
+	MOVQ	DX, CX	// ctx
+	CALL	·sigtrampgo<ABIInternal>(SB)
 
-	// Restore callee-save registers.
-	MOVQ	24(SP), BX
-	MOVQ	32(SP), R12
-	MOVQ	40(SP), R13
-	MOVQ	48(SP), R14
-	MOVQ	56(SP), R15
+	ADJSP	$-24
 
-	MOVQ	BP, SP
-	POPQ	BP
+	POP_REGS_HOST_TO_ABI0()
+	RET
+
+// Called using C ABI.
+TEXT runtime·sigprofNonGoWrapper<>(SB),NOSPLIT|NOFRAME,$0
+	// Transition from C ABI to Go ABI.
+	PUSH_REGS_HOST_TO_ABI0()
+
+	// Call into the Go signal handler
+	NOP	SP		// disable vet stack checking
+	ADJSP	$24
+	MOVL	DI, 0(SP)	// sig
+	MOVQ	SI, 8(SP)	// info
+	MOVQ	DX, 16(SP)	// ctx
+	CALL	·sigprofNonGo(SB)
+	ADJSP	$-24
+
+	POP_REGS_HOST_TO_ABI0()
 	RET
 
 // Used instead of sigtramp in programs that use cgo.
@@ -306,18 +277,16 @@ sigtrampnog:
 	JNZ	sigtramp  // Skip stack trace if already locked.
 
 	// Jump to the traceback function in runtime/cgo.
-	// It will call back to sigprofNonGo, which will ignore the
-	// arguments passed in registers.
+	// It will call back to sigprofNonGo, via sigprofNonGoWrapper, to convert
+	// the arguments to the Go calling convention.
 	// First three arguments to traceback function are in registers already.
 	MOVQ	runtime·cgoTraceback(SB), CX
 	MOVQ	$runtime·sigprofCallers(SB), R8
-	MOVQ	$runtime·sigprofNonGo(SB), R9
+	MOVQ	$runtime·sigprofNonGoWrapper<>(SB), R9
 	MOVQ	_cgo_callers(SB), AX
 	JMP	AX
 
 TEXT runtime·mmap_trampoline(SB),NOSPLIT,$0
-	PUSHQ	BP			// make a frame; keep stack aligned
-	MOVQ	SP, BP
 	MOVQ	DI, BX
 	MOVQ	0(BX), DI		// arg 1 addr
 	MOVQ	8(BX), SI		// arg 2 len
@@ -335,27 +304,20 @@ TEXT runtime·mmap_trampoline(SB),NOSPLIT,$0
 ok:
 	MOVQ	AX, 32(BX)
 	MOVQ	DX, 40(BX)
-	POPQ	BP
 	RET
 
 TEXT runtime·munmap_trampoline(SB),NOSPLIT,$0
-	PUSHQ	BP
-	MOVQ	SP, BP
 	MOVQ	8(DI), SI		// arg 2 len
 	MOVQ	0(DI), DI		// arg 1 addr
 	CALL	libc_munmap(SB)
 	TESTQ	AX, AX
 	JEQ	2(PC)
 	MOVL	$0xf1, 0xf1  // crash
-	POPQ	BP
 	RET
 
 TEXT runtime·usleep_trampoline(SB),NOSPLIT,$0
-	PUSHQ	BP
-	MOVQ	SP, BP
 	MOVL	0(DI), DI	// arg 1 usec
 	CALL	libc_usleep(SB)
-	POPQ	BP
 	RET
 
 TEXT runtime·settls(SB),NOSPLIT,$32
@@ -363,28 +325,29 @@ TEXT runtime·settls(SB),NOSPLIT,$32
 	RET
 
 TEXT runtime·sysctl_trampoline(SB),NOSPLIT,$0
-	PUSHQ	BP
-	MOVQ	SP, BP
 	MOVL	8(DI), SI		// arg 2 miblen
-	MOVQ	16(DI), DX		// arg 3 out
-	MOVQ	24(DI), CX		// arg 4 size
-	MOVQ	32(DI), R8		// arg 5 dst
-	MOVQ	40(DI), R9		// arg 6 ndst
+	MOVQ	16(DI), DX		// arg 3 oldp
+	MOVQ	24(DI), CX		// arg 4 oldlenp
+	MOVQ	32(DI), R8		// arg 5 newp
+	MOVQ	40(DI), R9		// arg 6 newlen
 	MOVQ	0(DI), DI		// arg 1 mib
 	CALL	libc_sysctl(SB)
-	POPQ	BP
+	RET
+
+TEXT runtime·sysctlbyname_trampoline(SB),NOSPLIT,$0
+	MOVQ	8(DI), SI		// arg 2 oldp
+	MOVQ	16(DI), DX		// arg 3 oldlenp
+	MOVQ	24(DI), CX		// arg 4 newp
+	MOVQ	32(DI), R8		// arg 5 newlen
+	MOVQ	0(DI), DI		// arg 1 name
+	CALL	libc_sysctlbyname(SB)
 	RET
 
 TEXT runtime·kqueue_trampoline(SB),NOSPLIT,$0
-	PUSHQ	BP
-	MOVQ	SP, BP
 	CALL	libc_kqueue(SB)
-	POPQ	BP
 	RET
 
 TEXT runtime·kevent_trampoline(SB),NOSPLIT,$0
-	PUSHQ	BP
-	MOVQ	SP, BP
 	MOVQ	8(DI), SI		// arg 2 keventt
 	MOVL	16(DI), DX		// arg 3 nch
 	MOVQ	24(DI), CX		// arg 4 ev
@@ -398,34 +361,25 @@ TEXT runtime·kevent_trampoline(SB),NOSPLIT,$0
 	MOVLQSX	(AX), AX		// errno
 	NEGQ	AX			// caller wants it as a negative error code
 ok:
-	POPQ	BP
 	RET
 
 TEXT runtime·fcntl_trampoline(SB),NOSPLIT,$0
-	PUSHQ	BP
-	MOVQ	SP, BP
 	MOVL	4(DI), SI		// arg 2 cmd
 	MOVL	8(DI), DX		// arg 3 arg
 	MOVL	0(DI), DI		// arg 1 fd
 	XORL	AX, AX			// vararg: say "no float args"
 	CALL	libc_fcntl(SB)
-	POPQ	BP
 	RET
 
 // mstart_stub is the first function executed on a new thread started by pthread_create.
 // It just does some low-level setup and then calls mstart.
 // Note: called with the C calling convention.
-TEXT runtime·mstart_stub(SB),NOSPLIT,$0
+TEXT runtime·mstart_stub(SB),NOSPLIT|NOFRAME,$0
 	// DI points to the m.
 	// We are already on m's g0 stack.
 
-	// Save callee-save registers.
-	SUBQ	$40, SP
-	MOVQ	BX, 0(SP)
-	MOVQ	R12, 8(SP)
-	MOVQ	R13, 16(SP)
-	MOVQ	R14, 24(SP)
-	MOVQ	R15, 32(SP)
+	// Transition from C ABI to Go ABI.
+	PUSH_REGS_HOST_TO_ABI0()
 
 	MOVQ	m_g0(DI), DX // g
 
@@ -433,24 +387,14 @@ TEXT runtime·mstart_stub(SB),NOSPLIT,$0
 	// See cmd/link/internal/ld/sym.go:computeTLSOffset.
 	MOVQ	DX, 0x30(GS)
 
-	// Someday the convention will be D is always cleared.
-	CLD
-
 	CALL	runtime·mstart(SB)
 
-	// Restore callee-save registers.
-	MOVQ	0(SP), BX
-	MOVQ	8(SP), R12
-	MOVQ	16(SP), R13
-	MOVQ	24(SP), R14
-	MOVQ	32(SP), R15
+	POP_REGS_HOST_TO_ABI0()
 
 	// Go is all done with this OS thread.
 	// Tell pthread everything is ok (we never join with this thread, so
 	// the value here doesn't really matter).
 	XORL	AX, AX
-
-	ADDQ	$40, SP
 	RET
 
 // These trampolines help convert from Go calling convention to C calling convention.
@@ -459,129 +403,91 @@ TEXT runtime·mstart_stub(SB),NOSPLIT,$0
 // A single int32 result is returned in AX.
 // (For more results, make an args/results structure.)
 TEXT runtime·pthread_attr_init_trampoline(SB),NOSPLIT,$0
-	PUSHQ	BP	// make frame, keep stack 16-byte aligned.
-	MOVQ	SP, BP
 	MOVQ	0(DI), DI // arg 1 attr
 	CALL	libc_pthread_attr_init(SB)
-	POPQ	BP
 	RET
 
 TEXT runtime·pthread_attr_getstacksize_trampoline(SB),NOSPLIT,$0
-	PUSHQ	BP
-	MOVQ	SP, BP
 	MOVQ	8(DI), SI	// arg 2 size
 	MOVQ	0(DI), DI	// arg 1 attr
 	CALL	libc_pthread_attr_getstacksize(SB)
-	POPQ	BP
 	RET
 
 TEXT runtime·pthread_attr_setdetachstate_trampoline(SB),NOSPLIT,$0
-	PUSHQ	BP
-	MOVQ	SP, BP
 	MOVQ	8(DI), SI	// arg 2 state
 	MOVQ	0(DI), DI	// arg 1 attr
 	CALL	libc_pthread_attr_setdetachstate(SB)
-	POPQ	BP
 	RET
 
-TEXT runtime·pthread_create_trampoline(SB),NOSPLIT,$0
-	PUSHQ	BP
-	MOVQ	SP, BP
-	SUBQ	$16, SP
+TEXT runtime·pthread_create_trampoline(SB),NOSPLIT,$16
 	MOVQ	0(DI), SI	// arg 2 attr
 	MOVQ	8(DI), DX	// arg 3 start
 	MOVQ	16(DI), CX	// arg 4 arg
 	MOVQ	SP, DI		// arg 1 &threadid (which we throw away)
 	CALL	libc_pthread_create(SB)
-	MOVQ	BP, SP
-	POPQ	BP
 	RET
 
 TEXT runtime·raise_trampoline(SB),NOSPLIT,$0
-	PUSHQ	BP
-	MOVQ	SP, BP
 	MOVL	0(DI), DI	// arg 1 signal
 	CALL	libc_raise(SB)
-	POPQ	BP
 	RET
 
 TEXT runtime·pthread_mutex_init_trampoline(SB),NOSPLIT,$0
-	PUSHQ	BP
-	MOVQ	SP, BP
 	MOVQ	8(DI), SI	// arg 2 attr
 	MOVQ	0(DI), DI	// arg 1 mutex
 	CALL	libc_pthread_mutex_init(SB)
-	POPQ	BP
 	RET
 
 TEXT runtime·pthread_mutex_lock_trampoline(SB),NOSPLIT,$0
-	PUSHQ	BP
-	MOVQ	SP, BP
 	MOVQ	0(DI), DI	// arg 1 mutex
 	CALL	libc_pthread_mutex_lock(SB)
-	POPQ	BP
 	RET
 
 TEXT runtime·pthread_mutex_unlock_trampoline(SB),NOSPLIT,$0
-	PUSHQ	BP
-	MOVQ	SP, BP
 	MOVQ	0(DI), DI	// arg 1 mutex
 	CALL	libc_pthread_mutex_unlock(SB)
-	POPQ	BP
 	RET
 
 TEXT runtime·pthread_cond_init_trampoline(SB),NOSPLIT,$0
-	PUSHQ	BP
-	MOVQ	SP, BP
 	MOVQ	8(DI), SI	// arg 2 attr
 	MOVQ	0(DI), DI	// arg 1 cond
 	CALL	libc_pthread_cond_init(SB)
-	POPQ	BP
 	RET
 
 TEXT runtime·pthread_cond_wait_trampoline(SB),NOSPLIT,$0
-	PUSHQ	BP
-	MOVQ	SP, BP
 	MOVQ	8(DI), SI	// arg 2 mutex
 	MOVQ	0(DI), DI	// arg 1 cond
 	CALL	libc_pthread_cond_wait(SB)
-	POPQ	BP
 	RET
 
 TEXT runtime·pthread_cond_timedwait_relative_np_trampoline(SB),NOSPLIT,$0
-	PUSHQ	BP
-	MOVQ	SP, BP
 	MOVQ	8(DI), SI	// arg 2 mutex
 	MOVQ	16(DI), DX	// arg 3 timeout
 	MOVQ	0(DI), DI	// arg 1 cond
 	CALL	libc_pthread_cond_timedwait_relative_np(SB)
-	POPQ	BP
 	RET
 
 TEXT runtime·pthread_cond_signal_trampoline(SB),NOSPLIT,$0
-	PUSHQ	BP
-	MOVQ	SP, BP
 	MOVQ	0(DI), DI	// arg 1 cond
 	CALL	libc_pthread_cond_signal(SB)
-	POPQ	BP
 	RET
 
 TEXT runtime·pthread_self_trampoline(SB),NOSPLIT,$0
-	PUSHQ	BP
-	MOVQ	SP, BP
 	MOVQ	DI, BX		// BX is caller-save
 	CALL	libc_pthread_self(SB)
 	MOVQ	AX, 0(BX)	// return value
-	POPQ	BP
 	RET
 
 TEXT runtime·pthread_kill_trampoline(SB),NOSPLIT,$0
-	PUSHQ	BP
-	MOVQ	SP, BP
 	MOVQ	8(DI), SI	// arg 2 sig
 	MOVQ	0(DI), DI	// arg 1 thread
 	CALL	libc_pthread_kill(SB)
-	POPQ	BP
+	RET
+
+TEXT runtime·osinit_hack_trampoline(SB),NOSPLIT,$0
+	MOVQ	$0, DI	// arg 1 val
+	CALL	libc_notify_is_valid_token(SB)
+	CALL	libc_xpc_date_create_from_current(SB)
 	RET
 
 // syscall calls a function in libc on behalf of the syscall package.
@@ -600,10 +506,7 @@ TEXT runtime·pthread_kill_trampoline(SB),NOSPLIT,$0
 //
 // syscall expects a 32-bit result and tests for 32-bit -1
 // to decide there was an error.
-TEXT runtime·syscall(SB),NOSPLIT,$0
-	PUSHQ	BP
-	MOVQ	SP, BP
-	SUBQ	$16, SP
+TEXT runtime·syscall(SB),NOSPLIT,$16
 	MOVQ	(0*8)(DI), CX // fn
 	MOVQ	(2*8)(DI), SI // a2
 	MOVQ	(3*8)(DI), DX // a3
@@ -630,8 +533,6 @@ TEXT runtime·syscall(SB),NOSPLIT,$0
 
 ok:
 	XORL	AX, AX        // no error (it's ignored anyway)
-	MOVQ	BP, SP
-	POPQ	BP
 	RET
 
 // syscallX calls a function in libc on behalf of the syscall package.
@@ -650,10 +551,7 @@ ok:
 //
 // syscallX is like syscall but expects a 64-bit result
 // and tests for 64-bit -1 to decide there was an error.
-TEXT runtime·syscallX(SB),NOSPLIT,$0
-	PUSHQ	BP
-	MOVQ	SP, BP
-	SUBQ	$16, SP
+TEXT runtime·syscallX(SB),NOSPLIT,$16
 	MOVQ	(0*8)(DI), CX // fn
 	MOVQ	(2*8)(DI), SI // a2
 	MOVQ	(3*8)(DI), DX // a3
@@ -680,16 +578,11 @@ TEXT runtime·syscallX(SB),NOSPLIT,$0
 
 ok:
 	XORL	AX, AX        // no error (it's ignored anyway)
-	MOVQ	BP, SP
-	POPQ	BP
 	RET
 
 // syscallPtr is like syscallX except that the libc function reports an
 // error by returning NULL and setting errno.
-TEXT runtime·syscallPtr(SB),NOSPLIT,$0
-	PUSHQ	BP
-	MOVQ	SP, BP
-	SUBQ	$16, SP
+TEXT runtime·syscallPtr(SB),NOSPLIT,$16
 	MOVQ	(0*8)(DI), CX // fn
 	MOVQ	(2*8)(DI), SI // a2
 	MOVQ	(3*8)(DI), DX // a3
@@ -716,8 +609,6 @@ TEXT runtime·syscallPtr(SB),NOSPLIT,$0
 
 ok:
 	XORL	AX, AX        // no error (it's ignored anyway)
-	MOVQ	BP, SP
-	POPQ	BP
 	RET
 
 // syscall6 calls a function in libc on behalf of the syscall package.
@@ -739,10 +630,7 @@ ok:
 //
 // syscall6 expects a 32-bit result and tests for 32-bit -1
 // to decide there was an error.
-TEXT runtime·syscall6(SB),NOSPLIT,$0
-	PUSHQ	BP
-	MOVQ	SP, BP
-	SUBQ	$16, SP
+TEXT runtime·syscall6(SB),NOSPLIT,$16
 	MOVQ	(0*8)(DI), R11// fn
 	MOVQ	(2*8)(DI), SI // a2
 	MOVQ	(3*8)(DI), DX // a3
@@ -769,8 +657,6 @@ TEXT runtime·syscall6(SB),NOSPLIT,$0
 
 ok:
 	XORL	AX, AX        // no error (it's ignored anyway)
-	MOVQ	BP, SP
-	POPQ	BP
 	RET
 
 // syscall6X calls a function in libc on behalf of the syscall package.
@@ -792,10 +678,7 @@ ok:
 //
 // syscall6X is like syscall6 but expects a 64-bit result
 // and tests for 64-bit -1 to decide there was an error.
-TEXT runtime·syscall6X(SB),NOSPLIT,$0
-	PUSHQ	BP
-	MOVQ	SP, BP
-	SUBQ	$16, SP
+TEXT runtime·syscall6X(SB),NOSPLIT,$16
 	MOVQ	(0*8)(DI), R11// fn
 	MOVQ	(2*8)(DI), SI // a2
 	MOVQ	(3*8)(DI), DX // a3
@@ -822,6 +705,80 @@ TEXT runtime·syscall6X(SB),NOSPLIT,$0
 
 ok:
 	XORL	AX, AX        // no error (it's ignored anyway)
-	MOVQ	BP, SP
-	POPQ	BP
+	RET
+
+// syscall9 calls a function in libc on behalf of the syscall package.
+// syscall9 takes a pointer to a struct like:
+// struct {
+//	fn    uintptr
+//	a1    uintptr
+//	a2    uintptr
+//	a3    uintptr
+//	a4    uintptr
+//	a5    uintptr
+//	a6    uintptr
+//	a7    uintptr
+//	a8    uintptr
+//	a9    uintptr
+//	r1    uintptr
+//	r2    uintptr
+//	err   uintptr
+// }
+// syscall9 must be called on the g0 stack with the
+// C calling convention (use libcCall).
+//
+// syscall9 expects a 32-bit result and tests for 32-bit -1
+// to decide there was an error.
+TEXT runtime·syscall9(SB),NOSPLIT,$16
+	MOVQ	(0*8)(DI), R13// fn
+	MOVQ	(2*8)(DI), SI // a2
+	MOVQ	(3*8)(DI), DX // a3
+	MOVQ	(4*8)(DI), CX // a4
+	MOVQ	(5*8)(DI), R8 // a5
+	MOVQ	(6*8)(DI), R9 // a6
+	MOVQ	(7*8)(DI), R10 // a7
+	MOVQ	(8*8)(DI), R11 // a8
+	MOVQ	(9*8)(DI), R12 // a9
+	MOVQ	DI, (SP)
+	MOVQ	(1*8)(DI), DI // a1
+	XORL	AX, AX	      // vararg: say "no float args"
+
+	CALL	R13
+
+	MOVQ	(SP), DI
+	MOVQ	AX, (10*8)(DI) // r1
+	MOVQ	DX, (11*8)(DI) // r2
+
+	CMPL	AX, $-1
+	JNE	ok
+
+	CALL	libc_error(SB)
+	MOVLQSX	(AX), AX
+	MOVQ	(SP), DI
+	MOVQ	AX, (12*8)(DI) // err
+
+ok:
+	XORL	AX, AX        // no error (it's ignored anyway)
+	RET
+
+// syscall_x509 is for crypto/x509. It is like syscall6 but does not check for errors,
+// takes 5 uintptrs and 1 float64, and only returns one value,
+// for use with standard C ABI functions.
+TEXT runtime·syscall_x509(SB),NOSPLIT,$16
+	MOVQ	(0*8)(DI), R11// fn
+	MOVQ	(2*8)(DI), SI // a2
+	MOVQ	(3*8)(DI), DX // a3
+	MOVQ	(4*8)(DI), CX // a4
+	MOVQ	(5*8)(DI), R8 // a5
+	MOVQ	(6*8)(DI), X0 // f1
+	MOVQ	DI, (SP)
+	MOVQ	(1*8)(DI), DI // a1
+	XORL	AX, AX	      // vararg: say "no float args"
+
+	CALL	R11
+
+	MOVQ	(SP), DI
+	MOVQ	AX, (7*8)(DI) // r1
+
+	XORL	AX, AX        // no error (it's ignored anyway)
 	RET

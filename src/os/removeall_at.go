@@ -2,14 +2,13 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// +build aix darwin dragonfly freebsd linux netbsd openbsd solaris
+//go:build unix
 
 package os
 
 import (
 	"internal/syscall/unix"
 	"io"
-	"runtime"
 	"syscall"
 )
 
@@ -23,7 +22,7 @@ func removeAll(path string) error {
 	// The rmdir system call does not permit removing ".",
 	// so we don't permit it either.
 	if endsWithDot(path) {
-		return &PathError{"RemoveAll", path, syscall.EINVAL}
+		return &PathError{Op: "RemoveAll", Path: path, Err: syscall.EINVAL}
 	}
 
 	// Simple case: if Remove works, we're done.
@@ -59,7 +58,9 @@ func removeAll(path string) error {
 func removeAllFrom(parent *File, base string) error {
 	parentFd := int(parent.Fd())
 	// Simple case: if Unlink (aka remove) works, we're done.
-	err := unix.Unlinkat(parentFd, base, 0)
+	err := ignoringEINTR(func() error {
+		return unix.Unlinkat(parentFd, base, 0)
+	})
 	if err == nil || IsNotExist(err) {
 		return nil
 	}
@@ -71,21 +72,23 @@ func removeAllFrom(parent *File, base string) error {
 	// whose contents need to be removed.
 	// Otherwise just return the error.
 	if err != syscall.EISDIR && err != syscall.EPERM && err != syscall.EACCES {
-		return &PathError{"unlinkat", base, err}
+		return &PathError{Op: "unlinkat", Path: base, Err: err}
 	}
 
 	// Is this a directory we need to recurse into?
 	var statInfo syscall.Stat_t
-	statErr := unix.Fstatat(parentFd, base, &statInfo, unix.AT_SYMLINK_NOFOLLOW)
+	statErr := ignoringEINTR(func() error {
+		return unix.Fstatat(parentFd, base, &statInfo, unix.AT_SYMLINK_NOFOLLOW)
+	})
 	if statErr != nil {
 		if IsNotExist(statErr) {
 			return nil
 		}
-		return &PathError{"fstatat", base, statErr}
+		return &PathError{Op: "fstatat", Path: base, Err: statErr}
 	}
 	if statInfo.Mode&syscall.S_IFMT != syscall.S_IFDIR {
 		// Not a directory; return the error from the unix.Unlinkat.
-		return &PathError{"unlinkat", base, err}
+		return &PathError{Op: "unlinkat", Path: base, Err: err}
 	}
 
 	// Remove the directory's entries.
@@ -100,7 +103,7 @@ func removeAllFrom(parent *File, base string) error {
 			if IsNotExist(err) {
 				return nil
 			}
-			recurseErr = &PathError{"openfdat", base, err}
+			recurseErr = &PathError{Op: "openfdat", Path: base, Err: err}
 			break
 		}
 
@@ -114,7 +117,7 @@ func removeAllFrom(parent *File, base string) error {
 				if IsNotExist(readErr) {
 					return nil
 				}
-				return &PathError{"readdirnames", base, readErr}
+				return &PathError{Op: "readdirnames", Path: base, Err: readErr}
 			}
 
 			respSize = len(names)
@@ -152,7 +155,9 @@ func removeAllFrom(parent *File, base string) error {
 	}
 
 	// Remove the directory itself.
-	unlinkError := unix.Unlinkat(parentFd, base, unix.AT_REMOVEDIR)
+	unlinkError := ignoringEINTR(func() error {
+		return unix.Unlinkat(parentFd, base, unix.AT_REMOVEDIR)
+	})
 	if unlinkError == nil || IsNotExist(unlinkError) {
 		return nil
 	}
@@ -160,7 +165,7 @@ func removeAllFrom(parent *File, base string) error {
 	if recurseErr != nil {
 		return recurseErr
 	}
-	return &PathError{"unlinkat", base, unlinkError}
+	return &PathError{Op: "unlinkat", Path: base, Err: unlinkError}
 }
 
 // openFdAt opens path relative to the directory in fd.
@@ -178,7 +183,7 @@ func openFdAt(dirfd int, name string) (*File, error) {
 		}
 
 		// See comment in openFileNolog.
-		if runtime.GOOS == "darwin" && e == syscall.EINTR {
+		if e == syscall.EINTR {
 			continue
 		}
 

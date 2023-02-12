@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// +build gc
+//go:build gc
 
 package goroot
 
@@ -20,8 +20,8 @@ func IsStandardPackage(goroot, compiler, path string) bool {
 	switch compiler {
 	case "gc":
 		dir := filepath.Join(goroot, "src", path)
-		_, err := os.Stat(dir)
-		return err == nil
+		info, err := os.Stat(dir)
+		return err == nil && info.IsDir()
 	case "gccgo":
 		return gccgoSearch.isStandard(path)
 	default:

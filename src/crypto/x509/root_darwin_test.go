@@ -2,128 +2,121 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-package x509
+package x509_test
 
 import (
-	"crypto/rsa"
-	"os"
-	"os/exec"
-	"path/filepath"
-	"runtime"
+	"crypto/tls"
+	"crypto/x509"
+	"internal/testenv"
 	"testing"
 	"time"
 )
 
-func TestSystemRoots(t *testing.T) {
-	switch runtime.GOARCH {
-	case "arm", "arm64":
-		t.Skipf("skipping on %s/%s, no system root", runtime.GOOS, runtime.GOARCH)
+func TestPlatformVerifier(t *testing.T) {
+	if !testenv.HasExternalNetwork() {
+		t.Skip()
 	}
 
-	t0 := time.Now()
-	sysRoots := systemRootsPool() // actual system roots
-	sysRootsDuration := time.Since(t0)
-
-	t1 := time.Now()
-	execRoots, err := execSecurityRoots() // non-cgo roots
-	execSysRootsDuration := time.Since(t1)
-
-	if err != nil {
-		t.Fatalf("failed to read system roots: %v", err)
+	getChain := func(host string) []*x509.Certificate {
+		t.Helper()
+		c, err := tls.Dial("tcp", host+":443", &tls.Config{InsecureSkipVerify: true})
+		if err != nil {
+			t.Fatalf("tls connection failed: %s", err)
+		}
+		return c.ConnectionState().PeerCertificates
 	}
 
-	t.Logf("    cgo sys roots: %v", sysRootsDuration)
-	t.Logf("non-cgo sys roots: %v", execSysRootsDuration)
-
-	// On Mavericks, there are 212 bundled certs, at least there was at
-	// one point in time on one machine. (Maybe it was a corp laptop
-	// with extra certs?) Other OS X users report 135, 142, 145...
-	// Let's try requiring at least 100, since this is just a sanity
-	// check.
-	if want, have := 100, len(sysRoots.certs); have < want {
-		t.Errorf("want at least %d system roots, have %d", want, have)
+	tests := []struct {
+		name        string
+		host        string
+		verifyName  string
+		verifyTime  time.Time
+		verifyEKU   []x509.ExtKeyUsage
+		expectedErr string
+	}{
+		{
+			// whatever google.com serves should, hopefully, be trusted
+			name: "valid chain",
+			host: "google.com",
+		},
+		{
+			name:        "expired leaf",
+			host:        "expired.badssl.com",
+			expectedErr: "x509: certificate has expired or is not yet valid: “*.badssl.com” certificate is expired",
+		},
+		{
+			name:        "wrong host for leaf",
+			host:        "wrong.host.badssl.com",
+			verifyName:  "wrong.host.badssl.com",
+			expectedErr: "x509: certificate is valid for *.badssl.com, badssl.com, not wrong.host.badssl.com",
+		},
+		{
+			name:        "self-signed leaf",
+			host:        "self-signed.badssl.com",
+			expectedErr: "x509: certificate signed by unknown authority",
+		},
+		{
+			name:        "untrusted root",
+			host:        "untrusted-root.badssl.com",
+			expectedErr: "x509: certificate signed by unknown authority",
+		},
+		{
+			name:        "revoked leaf",
+			host:        "revoked.badssl.com",
+			expectedErr: "x509: “revoked.badssl.com” certificate is revoked",
+		},
+		{
+			name:        "leaf missing SCTs",
+			host:        "no-sct.badssl.com",
+			expectedErr: "x509: “no-sct.badssl.com” certificate is not standards compliant",
+		},
+		{
+			name:        "expired leaf (custom time)",
+			host:        "google.com",
+			verifyTime:  time.Time{}.Add(time.Hour),
+			expectedErr: "x509: certificate has expired or is not yet valid: “*.google.com” certificate is expired",
+		},
+		{
+			name:       "valid chain (custom time)",
+			host:       "google.com",
+			verifyTime: time.Now(),
+		},
+		{
+			name:        "leaf doesn't have acceptable ExtKeyUsage",
+			host:        "google.com",
+			expectedErr: "x509: certificate specifies an incompatible key usage",
+			verifyEKU:   []x509.ExtKeyUsage{x509.ExtKeyUsageEmailProtection},
+		},
 	}
 
-	// Fetch any intermediate certificate that verify-cert might be aware of.
-	out, err := exec.Command("/usr/bin/security", "find-certificate", "-a", "-p",
-		"/Library/Keychains/System.keychain",
-		filepath.Join(os.Getenv("HOME"), "/Library/Keychains/login.keychain"),
-		filepath.Join(os.Getenv("HOME"), "/Library/Keychains/login.keychain-db")).Output()
-	if err != nil {
-		t.Fatal(err)
-	}
-	allCerts := NewCertPool()
-	allCerts.AppendCertsFromPEM(out)
-
-	// Check that the two cert pools are the same.
-	sysPool := make(map[string]*Certificate, len(sysRoots.certs))
-	for _, c := range sysRoots.certs {
-		sysPool[string(c.Raw)] = c
-	}
-	for _, c := range execRoots.certs {
-		if _, ok := sysPool[string(c.Raw)]; ok {
-			delete(sysPool, string(c.Raw))
-		} else {
-			// verify-cert lets in certificates that are not trusted roots, but
-			// are signed by trusted roots. This is not great, but unavoidable
-			// until we parse real policies without cgo, so confirm that's the
-			// case and skip them.
-			if _, err := c.Verify(VerifyOptions{
-				Roots:         sysRoots,
-				Intermediates: allCerts,
-				KeyUsages:     []ExtKeyUsage{ExtKeyUsageAny},
-				CurrentTime:   c.NotBefore, // verify-cert does not check expiration
-			}); err != nil {
-				t.Errorf("certificate only present in non-cgo pool: %v (verify error: %v)", c.Subject, err)
-			} else {
-				t.Logf("signed certificate only present in non-cgo pool (acceptable): %v", c.Subject)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			chain := getChain(tc.host)
+			var opts x509.VerifyOptions
+			if len(chain) > 1 {
+				opts.Intermediates = x509.NewCertPool()
+				for _, c := range chain[1:] {
+					opts.Intermediates.AddCert(c)
+				}
 			}
-		}
-	}
-	for _, c := range sysPool {
-		// The nocgo codepath uses verify-cert with the ssl policy, which also
-		// happens to check EKUs, so some certificates will appear only in the
-		// cgo pool. We can't easily make them consistent because the EKU check
-		// is only applied to the certificates passed to verify-cert.
-		var ekuOk bool
-		for _, eku := range c.ExtKeyUsage {
-			if eku == ExtKeyUsageServerAuth || eku == ExtKeyUsageNetscapeServerGatedCrypto ||
-				eku == ExtKeyUsageMicrosoftServerGatedCrypto || eku == ExtKeyUsageAny {
-				ekuOk = true
+			if tc.verifyName != "" {
+				opts.DNSName = tc.verifyName
 			}
-		}
-		if len(c.ExtKeyUsage) == 0 && len(c.UnknownExtKeyUsage) == 0 {
-			ekuOk = true
-		}
-		if !ekuOk {
-			t.Logf("off-EKU certificate only present in cgo pool (acceptable): %v", c.Subject)
-			continue
-		}
+			if !tc.verifyTime.IsZero() {
+				opts.CurrentTime = tc.verifyTime
+			}
+			if len(tc.verifyEKU) > 0 {
+				opts.KeyUsages = tc.verifyEKU
+			}
 
-		// Same for expired certificates. We don't chain to them anyway.
-		now := time.Now()
-		if now.Before(c.NotBefore) || now.After(c.NotAfter) {
-			t.Logf("expired certificate only present in cgo pool (acceptable): %v", c.Subject)
-			continue
-		}
-
-		// On 10.11 there are five unexplained roots that only show up from the
-		// C API. They have in common the fact that they are old, 1024-bit
-		// certificates. It's arguably better to ignore them anyway.
-		if key, ok := c.PublicKey.(*rsa.PublicKey); ok && key.N.BitLen() == 1024 {
-			t.Logf("1024-bit certificate only present in cgo pool (acceptable): %v", c.Subject)
-			continue
-		}
-
-		t.Errorf("certificate only present in cgo pool: %v", c.Subject)
-	}
-
-	if t.Failed() && debugDarwinRoots {
-		cmd := exec.Command("security", "dump-trust-settings")
-		cmd.Stdout, cmd.Stderr = os.Stderr, os.Stderr
-		cmd.Run()
-		cmd = exec.Command("security", "dump-trust-settings", "-d")
-		cmd.Stdout, cmd.Stderr = os.Stderr, os.Stderr
-		cmd.Run()
+			_, err := chain[0].Verify(opts)
+			if err != nil && tc.expectedErr == "" {
+				t.Errorf("unexpected verification error: %s", err)
+			} else if err != nil && err.Error() != tc.expectedErr {
+				t.Errorf("unexpected verification error: got %q, want %q", err.Error(), tc.expectedErr)
+			} else if err == nil && tc.expectedErr != "" {
+				t.Errorf("unexpected verification success: want %q", tc.expectedErr)
+			}
+		})
 	}
 }

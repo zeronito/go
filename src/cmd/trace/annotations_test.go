@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// +build !js
+//go:build !js
 
 package main
 
@@ -12,7 +12,7 @@ import (
 	"flag"
 	"fmt"
 	traceparser "internal/trace"
-	"io/ioutil"
+	"os"
 	"reflect"
 	"runtime/debug"
 	"runtime/trace"
@@ -53,9 +53,9 @@ func TestOverlappingDuration(t *testing.T) {
 
 // prog0 starts three goroutines.
 //
-//   goroutine 1: taskless region
-//   goroutine 2: starts task0, do work in task0.region0, starts task1 which ends immediately.
-//   goroutine 3: do work in task0.region1 and task0.region2, ends task0
+//	goroutine 1: taskless region
+//	goroutine 2: starts task0, do work in task0.region0, starts task1 which ends immediately.
+//	goroutine 3: do work in task0.region1 and task0.region2, ends task0
 func prog0() {
 	ctx := context.Background()
 
@@ -386,7 +386,7 @@ func saveTrace(buf *bytes.Buffer, name string) {
 	if !*saveTraces {
 		return
 	}
-	if err := ioutil.WriteFile(name+".trace", buf.Bytes(), 0600); err != nil {
+	if err := os.WriteFile(name+".trace", buf.Bytes(), 0600); err != nil {
 		panic(fmt.Errorf("failed to write trace file: %v", err))
 	}
 }

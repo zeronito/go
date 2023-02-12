@@ -4,17 +4,23 @@
 
 package imports
 
-import "cmd/go/internal/cfg"
+import (
+	"cmd/go/internal/cfg"
+	"sync"
+)
 
-var tags map[string]bool
+var (
+	tags     map[string]bool
+	tagsOnce sync.Once
+)
 
 // Tags returns a set of build tags that are true for the target platform.
 // It includes GOOS, GOARCH, the compiler, possibly "cgo",
 // release tags like "go1.13", and user-specified build tags.
 func Tags() map[string]bool {
-	if tags == nil {
+	tagsOnce.Do(func() {
 		tags = loadTags()
-	}
+	})
 	return tags
 }
 
@@ -30,20 +36,26 @@ func loadTags() map[string]bool {
 	for _, tag := range cfg.BuildContext.BuildTags {
 		tags[tag] = true
 	}
+	for _, tag := range cfg.BuildContext.ToolTags {
+		tags[tag] = true
+	}
 	for _, tag := range cfg.BuildContext.ReleaseTags {
 		tags[tag] = true
 	}
 	return tags
 }
 
-var anyTags map[string]bool
+var (
+	anyTags     map[string]bool
+	anyTagsOnce sync.Once
+)
 
 // AnyTags returns a special set of build tags that satisfy nearly all
 // build tag expressions. Only "ignore" and malformed build tag requirements
 // are considered false.
 func AnyTags() map[string]bool {
-	if anyTags == nil {
+	anyTagsOnce.Do(func() {
 		anyTags = map[string]bool{"*": true}
-	}
+	})
 	return anyTags
 }

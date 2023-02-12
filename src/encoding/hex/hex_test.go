@@ -8,7 +8,6 @@ import (
 	"bytes"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"strings"
 	"testing"
 )
@@ -53,6 +52,18 @@ func TestDecode(t *testing.T) {
 		} else if !bytes.Equal(dst, test.dec) {
 			t.Errorf("#%d: got: %#v want: %#v", i, dst, test.dec)
 		}
+	}
+}
+
+func TestDecodeDstTooSmall(t *testing.T) {
+	dst := make([]byte, 1)
+	src := []byte{'0', '1', '2', '3'}
+	n, err := Decode(dst, src)
+	if err == nil {
+		t.Errorf("expected Decode to return an error, but it returned none")
+	}
+	if !bytes.Equal(dst[:n], []byte{0x01}) {
+		t.Errorf("output mismatch: got %x, want 01", dst[:n])
 	}
 }
 
@@ -150,7 +161,7 @@ func TestEncoderDecoder(t *testing.T) {
 func TestDecoderErr(t *testing.T) {
 	for _, tt := range errTests {
 		dec := NewDecoder(strings.NewReader(tt.in))
-		out, err := ioutil.ReadAll(dec)
+		out, err := io.ReadAll(dec)
 		wantErr := tt.err
 		// Decoder is reading from stream, so it reports io.ErrUnexpectedEOF instead of ErrLength.
 		if wantErr == ErrLength {
@@ -189,7 +200,7 @@ func TestDumper(t *testing.T) {
 }
 
 func TestDumper_doubleclose(t *testing.T) {
-	var out bytes.Buffer
+	var out strings.Builder
 	dumper := Dumper(&out)
 
 	dumper.Write([]byte(`gopher`))
@@ -205,7 +216,7 @@ func TestDumper_doubleclose(t *testing.T) {
 }
 
 func TestDumper_earlyclose(t *testing.T) {
-	var out bytes.Buffer
+	var out strings.Builder
 	dumper := Dumper(&out)
 
 	dumper.Close()

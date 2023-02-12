@@ -13,7 +13,6 @@ import (
 	"go/scanner"
 	"go/token"
 	"os"
-	"path/filepath"
 	"strings"
 )
 
@@ -44,14 +43,7 @@ func sourceLine(n ast.Node) int {
 // attached to the import "C" comment, a list of references to C.xxx,
 // a list of exported functions, and the actual AST, to be rewritten and
 // printed.
-func (f *File) ParseGo(name string, src []byte) {
-	// Create absolute path for file, so that it will be used in error
-	// messages and recorded in debug line number information.
-	// This matches the rest of the toolchain. See golang.org/issue/5122.
-	if aname, err := filepath.Abs(name); err == nil {
-		name = aname
-	}
-
+func (f *File) ParseGo(abspath string, src []byte) {
 	// Two different parses: once with comments, once without.
 	// The printer is not good enough at printing comments in the
 	// right place when we start editing the AST behind its back,
@@ -60,8 +52,8 @@ func (f *File) ParseGo(name string, src []byte) {
 	// and reprinting.
 	// In cgo mode, we ignore ast2 and just apply edits directly
 	// the text behind ast1. In godefs mode we modify and print ast2.
-	ast1 := parse(name, src, parser.ParseComments)
-	ast2 := parse(name, src, 0)
+	ast1 := parse(abspath, src, parser.SkipObjectResolution|parser.ParseComments)
+	ast2 := parse(abspath, src, parser.SkipObjectResolution)
 
 	f.Package = ast1.Name.Name
 	f.Name = make(map[string]*Name)
@@ -88,7 +80,7 @@ func (f *File) ParseGo(name string, src []byte) {
 				cg = d.Doc
 			}
 			if cg != nil {
-				f.Preamble += fmt.Sprintf("#line %d %q\n", sourceLine(cg), name)
+				f.Preamble += fmt.Sprintf("#line %d %q\n", sourceLine(cg), abspath)
 				f.Preamble += commentText(cg) + "\n"
 				f.Preamble += "#line 1 \"cgo-generated-wrapper\"\n"
 			}
@@ -346,8 +338,7 @@ func (f *File) walk(x interface{}, context astContext, visit func(*File, interfa
 
 	// everything else just recurs
 	default:
-		error_(token.NoPos, "unexpected type %T in walk", x)
-		panic("unexpected type")
+		f.walkUnexpected(x, context, visit)
 
 	case nil:
 
@@ -418,6 +409,9 @@ func (f *File) walk(x interface{}, context astContext, visit func(*File, interfa
 	case *ast.StructType:
 		f.walk(n.Fields, ctxField, visit)
 	case *ast.FuncType:
+		if tparams := funcTypeTypeParams(n); tparams != nil {
+			f.walk(tparams, ctxParam, visit)
+		}
 		f.walk(n.Params, ctxParam, visit)
 		if n.Results != nil {
 			f.walk(n.Results, ctxParam, visit)
@@ -505,6 +499,9 @@ func (f *File) walk(x interface{}, context astContext, visit func(*File, interfa
 			f.walk(n.Values, ctxExpr, visit)
 		}
 	case *ast.TypeSpec:
+		if tparams := typeSpecTypeParams(n); tparams != nil {
+			f.walk(tparams, ctxParam, visit)
+		}
 		f.walk(&n.Type, ctxType, visit)
 
 	case *ast.BadDecl:

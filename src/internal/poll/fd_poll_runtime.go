@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// +build aix darwin dragonfly freebsd linux netbsd openbsd windows solaris
+//go:build unix || windows
 
 package poll
 
@@ -15,6 +15,7 @@ import (
 )
 
 // runtimeNano returns the current value of the runtime clock in nanoseconds.
+//
 //go:linkname runtimeNano runtime.nanotime
 func runtimeNano() int64
 
@@ -22,7 +23,7 @@ func runtime_pollServerInit()
 func runtime_pollOpen(fd uintptr) (uintptr, int)
 func runtime_pollClose(ctx uintptr)
 func runtime_pollWait(ctx uintptr, mode int) int
-func runtime_pollWaitCanceled(ctx uintptr, mode int) int
+func runtime_pollWaitCanceled(ctx uintptr, mode int)
 func runtime_pollReset(ctx uintptr, mode int) int
 func runtime_pollSetDeadline(ctx uintptr, d int64, mode int)
 func runtime_pollUnblock(ctx uintptr)
@@ -38,10 +39,6 @@ func (pd *pollDesc) init(fd *FD) error {
 	serverInit.Do(runtime_pollServerInit)
 	ctx, errno := runtime_pollOpen(uintptr(fd.Sysfd))
 	if errno != 0 {
-		if ctx != 0 {
-			runtime_pollUnblock(ctx)
-			runtime_pollClose(ctx)
-		}
 		return errnoErr(syscall.Errno(errno))
 	}
 	pd.runtimeCtx = ctx
@@ -123,7 +120,7 @@ func convertErr(res int, isFile bool) error {
 	case pollErrClosing:
 		return errClosing(isFile)
 	case pollErrTimeout:
-		return ErrTimeout
+		return ErrDeadlineExceeded
 	case pollErrNotPollable:
 		return ErrNotPollable
 	}

@@ -6,16 +6,18 @@ package work
 
 import (
 	"fmt"
-	"io/ioutil"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"cmd/go/internal/base"
 	"cmd/go/internal/cfg"
+	"cmd/go/internal/fsys"
 	"cmd/go/internal/load"
 	"cmd/go/internal/str"
+	"cmd/internal/pkgpath"
 )
 
 // The Gccgo toolchain.
@@ -60,7 +62,7 @@ func checkGccgoBin() {
 	base.Exit()
 }
 
-func (tools gccgoToolchain) gc(b *Builder, a *Action, archive string, importcfg []byte, symabis string, asmhdr bool, gofiles []string) (ofile string, output []byte, err error) {
+func (tools gccgoToolchain) gc(b *Builder, a *Action, archive string, importcfg, embedcfg []byte, symabis string, asmhdr bool, gofiles []string) (ofile string, output []byte, err error) {
 	p := a.Package
 	objdir := a.Objdir
 	out := "_go_.o"
@@ -91,13 +93,43 @@ func (tools gccgoToolchain) gc(b *Builder, a *Action, archive string, importcfg 
 			args = append(args, "-I", root)
 		}
 	}
-	if cfg.BuildTrimpath && b.gccSupportsFlag(args[:1], "-ffile-prefix-map=a=b") {
-		args = append(args, "-ffile-prefix-map="+base.Cwd+"=.")
-		args = append(args, "-ffile-prefix-map="+b.WorkDir+"=/tmp/go-build")
+	if embedcfg != nil && b.gccSupportsFlag(args[:1], "-fgo-embedcfg=/dev/null") {
+		if err := b.writeFile(objdir+"embedcfg", embedcfg); err != nil {
+			return "", nil, err
+		}
+		args = append(args, "-fgo-embedcfg="+objdir+"embedcfg")
 	}
+
+	if b.gccSupportsFlag(args[:1], "-ffile-prefix-map=a=b") {
+		if cfg.BuildTrimpath {
+			args = append(args, "-ffile-prefix-map="+base.Cwd()+"=.")
+			args = append(args, "-ffile-prefix-map="+b.WorkDir+"=/tmp/go-build")
+		}
+		if fsys.OverlayFile != "" {
+			for _, name := range gofiles {
+				absPath := mkAbs(p.Dir, name)
+				overlayPath, ok := fsys.OverlayPath(absPath)
+				if !ok {
+					continue
+				}
+				toPath := absPath
+				// gccgo only applies the last matching rule, so also handle the case where
+				// BuildTrimpath is true and the path is relative to base.Cwd().
+				if cfg.BuildTrimpath && str.HasFilePathPrefix(toPath, base.Cwd()) {
+					toPath = "." + toPath[len(base.Cwd()):]
+				}
+				args = append(args, "-ffile-prefix-map="+overlayPath+"="+toPath)
+			}
+		}
+	}
+
 	args = append(args, a.Package.Internal.Gccgoflags...)
 	for _, f := range gofiles {
-		args = append(args, mkAbs(p.Dir, f))
+		f := mkAbs(p.Dir, f)
+		// Overlay files if necessary.
+		// See comment on gctoolchain.gc about overlay TODOs
+		f, _ = fsys.OverlayPath(f)
+		args = append(args, f)
 	}
 
 	output, err = b.runOut(a, p.Dir, nil, args)
@@ -125,10 +157,7 @@ func buildImportcfgSymlinks(b *Builder, root string, importcfg []byte) error {
 		} else {
 			verb, args = line[:i], strings.TrimSpace(line[i+1:])
 		}
-		var before, after string
-		if i := strings.Index(args, "="); i >= 0 {
-			before, after = args[:i], args[i+1:]
-		}
+		before, after, _ := strings.Cut(args, "=")
 		switch verb {
 		default:
 			base.Fatalf("importcfg:%d: unknown directive %q", lineNum, verb)
@@ -172,9 +201,9 @@ func (tools gccgoToolchain) asm(b *Builder, a *Action, sfiles []string) ([]strin
 		base := filepath.Base(sfile)
 		ofile := a.Objdir + base[:len(base)-len(".s")] + ".o"
 		ofiles = append(ofiles, ofile)
-		sfile = mkAbs(p.Dir, sfile)
+		sfile, _ = fsys.OverlayPath(mkAbs(p.Dir, sfile))
 		defs := []string{"-D", "GOOS_" + cfg.Goos, "-D", "GOARCH_" + cfg.Goarch}
-		if pkgpath := gccgoCleanPkgpath(p); pkgpath != "" {
+		if pkgpath := tools.gccgoCleanPkgpath(b, p); pkgpath != "" {
 			defs = append(defs, `-D`, `GOPKGPATH=`+pkgpath)
 		}
 		defs = tools.maybePIC(defs)
@@ -244,7 +273,7 @@ func (tools gccgoToolchain) link(b *Builder, root *Action, out, importcfg string
 	}
 
 	readCgoFlags := func(flagsFile string) error {
-		flags, err := ioutil.ReadFile(flagsFile)
+		flags, err := os.ReadFile(flagsFile)
 		if err != nil {
 			return err
 		}
@@ -531,7 +560,7 @@ func (tools gccgoToolchain) cc(b *Builder, a *Action, ofile, cfile string) error
 	cfile = mkAbs(p.Dir, cfile)
 	defs := []string{"-D", "GOOS_" + cfg.Goos, "-D", "GOARCH_" + cfg.Goarch}
 	defs = append(defs, b.gccArchArgs()...)
-	if pkgpath := gccgoCleanPkgpath(p); pkgpath != "" {
+	if pkgpath := tools.gccgoCleanPkgpath(b, p); pkgpath != "" {
 		defs = append(defs, `-D`, `GOPKGPATH="`+pkgpath+`"`)
 	}
 	compiler := envList("CC", cfg.DefaultCC(cfg.Goos, cfg.Goarch))
@@ -540,7 +569,7 @@ func (tools gccgoToolchain) cc(b *Builder, a *Action, ofile, cfile string) error
 	}
 	defs = tools.maybePIC(defs)
 	if b.gccSupportsFlag(compiler, "-ffile-prefix-map=a=b") {
-		defs = append(defs, "-ffile-prefix-map="+base.Cwd+"=.")
+		defs = append(defs, "-ffile-prefix-map="+base.Cwd()+"=.")
 		defs = append(defs, "-ffile-prefix-map="+b.WorkDir+"=/tmp/go-build")
 	} else if b.gccSupportsFlag(compiler, "-fdebug-prefix-map=a=b") {
 		defs = append(defs, "-fdebug-prefix-map="+b.WorkDir+"=/tmp/go-build")
@@ -568,14 +597,83 @@ func gccgoPkgpath(p *load.Package) string {
 	return p.ImportPath
 }
 
-func gccgoCleanPkgpath(p *load.Package) string {
-	clean := func(r rune) rune {
-		switch {
-		case 'A' <= r && r <= 'Z', 'a' <= r && r <= 'z',
-			'0' <= r && r <= '9':
-			return r
+var gccgoToSymbolFuncOnce sync.Once
+var gccgoToSymbolFunc func(string) string
+
+func (tools gccgoToolchain) gccgoCleanPkgpath(b *Builder, p *load.Package) string {
+	gccgoToSymbolFuncOnce.Do(func() {
+		tmpdir := b.WorkDir
+		if cfg.BuildN {
+			tmpdir = os.TempDir()
 		}
-		return '_'
-	}
-	return strings.Map(clean, gccgoPkgpath(p))
+		fn, err := pkgpath.ToSymbolFunc(tools.compiler(), tmpdir)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "cmd/go: %v\n", err)
+			base.SetExitStatus(2)
+			base.Exit()
+		}
+		gccgoToSymbolFunc = fn
+	})
+
+	return gccgoToSymbolFunc(gccgoPkgpath(p))
+}
+
+var (
+	gccgoSupportsCgoIncompleteOnce sync.Once
+	gccgoSupportsCgoIncomplete     bool
+)
+
+const gccgoSupportsCgoIncompleteCode = `
+package p
+
+import "runtime/cgo"
+
+type I cgo.Incomplete
+`
+
+// supportsCgoIncomplete reports whether the gccgo/GoLLVM compiler
+// being used supports cgo.Incomplete, which was added in GCC 13.
+func (tools gccgoToolchain) supportsCgoIncomplete(b *Builder) bool {
+	gccgoSupportsCgoIncompleteOnce.Do(func() {
+		fail := func(err error) {
+			fmt.Fprintf(os.Stderr, "cmd/go: %v\n", err)
+			base.SetExitStatus(2)
+			base.Exit()
+		}
+
+		tmpdir := b.WorkDir
+		if cfg.BuildN {
+			tmpdir = os.TempDir()
+		}
+		f, err := os.CreateTemp(tmpdir, "*_gccgo_cgoincomplete.go")
+		if err != nil {
+			fail(err)
+		}
+		fn := f.Name()
+		f.Close()
+		defer os.Remove(fn)
+
+		if err := os.WriteFile(fn, []byte(gccgoSupportsCgoIncompleteCode), 0644); err != nil {
+			fail(err)
+		}
+
+		on := strings.TrimSuffix(fn, ".go") + ".o"
+		if cfg.BuildN || cfg.BuildX {
+			b.Showcmd(tmpdir, "%s -c -o %s %s || true", tools.compiler(), on, fn)
+			// Since this function affects later builds,
+			// and only generates temporary files,
+			// we run the command even with -n.
+		}
+		cmd := exec.Command(tools.compiler(), "-c", "-o", on, fn)
+		cmd.Dir = tmpdir
+		var buf strings.Builder
+		cmd.Stdout = &buf
+		cmd.Stderr = &buf
+		err = cmd.Run()
+		if out := buf.String(); len(out) > 0 {
+			b.showOutput(nil, tmpdir, b.fmtcmd(tmpdir, "%s -c -o %s %s", tools.compiler(), on, fn), buf.String())
+		}
+		gccgoSupportsCgoIncomplete = err == nil
+	})
+	return gccgoSupportsCgoIncomplete
 }

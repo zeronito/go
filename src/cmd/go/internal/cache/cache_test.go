@@ -8,9 +8,10 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
-	"io/ioutil"
+	"internal/testenv"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 )
@@ -20,7 +21,7 @@ func init() {
 }
 
 func TestBasic(t *testing.T) {
-	dir, err := ioutil.TempDir("", "cachetest-")
+	dir, err := os.MkdirTemp("", "cachetest-")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -65,7 +66,7 @@ func TestBasic(t *testing.T) {
 }
 
 func TestGrowth(t *testing.T) {
-	dir, err := ioutil.TempDir("", "cachetest-")
+	dir, err := os.MkdirTemp("", "cachetest-")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -118,7 +119,7 @@ func TestVerifyPanic(t *testing.T) {
 		t.Fatal("initEnv did not set verify")
 	}
 
-	dir, err := ioutil.TempDir("", "cachetest-")
+	dir, err := os.MkdirTemp("", "cachetest-")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -151,7 +152,11 @@ func dummyID(x int) [HashSize]byte {
 }
 
 func TestCacheTrim(t *testing.T) {
-	dir, err := ioutil.TempDir("", "cachetest-")
+	if runtime.GOOS == "js" {
+		testenv.SkipFlaky(t, 35220)
+	}
+
+	dir, err := os.MkdirTemp("", "cachetest-")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -207,7 +212,7 @@ func TestCacheTrim(t *testing.T) {
 		t.Fatal(err)
 	}
 	c.OutputFile(entry.OutputID)
-	data, err := ioutil.ReadFile(filepath.Join(dir, "trim.txt"))
+	data, err := os.ReadFile(filepath.Join(dir, "trim.txt"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -220,7 +225,7 @@ func TestCacheTrim(t *testing.T) {
 		t.Fatal(err)
 	}
 	c.OutputFile(entry.OutputID)
-	data2, err := ioutil.ReadFile(filepath.Join(dir, "trim.txt"))
+	data2, err := os.ReadFile(filepath.Join(dir, "trim.txt"))
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -64,6 +64,11 @@ func httpGoroutines(w http.ResponseWriter, r *http.Request) {
 	var glist []gtype
 	for k, v := range gss {
 		v.ID = k
+		// If goroutine didn't run during the trace (no sampled PC),
+		// the v.ID and v.Name will be zero value.
+		if v.ID == 0 && v.Name == "" {
+			v.Name = "(Inactive, no stack trace sampled)"
+		}
 		glist = append(glist, v)
 	}
 	sort.Slice(glist, func(i, j int) bool { return glist[i].ExecTime > glist[j].ExecTime })
@@ -193,6 +198,16 @@ th {
   background-color: #050505;
   color: #fff;
 }
+th.total-time,
+th.exec-time,
+th.io-time,
+th.block-time,
+th.syscall-time,
+th.sched-time,
+th.sweep-time,
+th.pause-time {
+  cursor: pointer;
+}
 table {
   border-collapse: collapse;
 }
@@ -250,15 +265,15 @@ function reloadTable(key, value) {
 <table class="details">
 <tr>
 <th> Goroutine</th>
-<th onclick="reloadTable('sortby', 'TotalTime')"> Total</th>
+<th onclick="reloadTable('sortby', 'TotalTime')" class="total-time"> Total</th>
 <th></th>
 <th onclick="reloadTable('sortby', 'ExecTime')" class="exec-time"> Execution</th>
 <th onclick="reloadTable('sortby', 'IOTime')" class="io-time"> Network wait</th>
 <th onclick="reloadTable('sortby', 'BlockTime')" class="block-time"> Sync block </th>
 <th onclick="reloadTable('sortby', 'SyscallTime')" class="syscall-time"> Blocking syscall</th>
 <th onclick="reloadTable('sortby', 'SchedWaitTime')" class="sched-time"> Scheduler wait</th>
-<th onclick="reloadTable('sortby', 'SweepTime')"> GC sweeping</th>
-<th onclick="reloadTable('sortby', 'GCTime')"> GC pause</th>
+<th onclick="reloadTable('sortby', 'SweepTime')" class="sweep-time"> GC sweeping</th>
+<th onclick="reloadTable('sortby', 'GCTime')" class="pause-time"> GC pause</th>
 </tr>
 {{range .GList}}
   <tr>
