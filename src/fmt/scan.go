@@ -737,28 +737,53 @@ func (s *ss) floatToken() string {
 	return string(s.buf)
 }
 
-// complexTokens returns the real and imaginary parts of the complex number starting here.
-// The number might be parenthesized and has the format (N+Ni) where N is a floating-point
-// number and there are no spaces within.
+// complexTokens returns the real and imaginary parts of the complex number
+// starting here.  The number may or may not parenthesized with the format:
+// (N+Ni) where N is a floating-point number and there are no spaces within,
+// (N) or (Ni) where N is a single number.
 func (s *ss) complexTokens() (real, imag string) {
-	// TODO: accept N and Ni independently?
+	have_imag := false
+	have_real := false
 	parens := s.accept("(")
-	real = s.floatToken()
-	s.buf = s.buf[:0]
-	// Must now have a sign.
-	if !s.accept("+-") {
-		s.error(complexError)
+	// Read in the first value.
+	val := s.floatToken()
+
+	if s.peek("i") {
+		// First number is imag.
+		s.getRune()
+		imag = val
+		real = "0"
+		have_imag = true
+	} else {
+		// First number is real.
+		imag = "0"
+		real = val
+		have_real = true
 	}
-	// Sign is now in buffer
-	imagSign := string(s.buf)
-	imag = s.floatToken()
-	if !s.accept("i") {
-		s.error(complexError)
+
+	// Test if we have a second number.
+	if s.peek("+-") {
+		// Read in the next value.
+		val = s.floatToken()
+		if s.peek("i") {
+			// The second number is imag.
+			s.getRune()
+			if have_imag {
+				s.error(complexError)
+			}
+			imag = val
+		} else {
+			// The second number is real.
+			if have_real {
+				s.error(complexError)
+			}
+			real = val
+		}
 	}
 	if parens && !s.accept(")") {
 		s.error(complexError)
 	}
-	return real, imagSign + imag
+	return
 }
 
 func hasX(s string) bool {
