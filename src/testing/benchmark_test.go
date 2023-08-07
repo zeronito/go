@@ -6,6 +6,7 @@ package testing_test
 
 import (
 	"bytes"
+	"flag"
 	"runtime"
 	"sort"
 	"strings"
@@ -209,5 +210,24 @@ func ExampleB_ReportMetric_parallel() {
 		// This metric is per-time, so divide by b.Elapsed and
 		// report it as a "/ns" unit.
 		b.ReportMetric(float64(compares.Load())/float64(b.Elapsed().Nanoseconds()), "compares/ns")
+	})
+}
+
+func TestBenchmarkLaunch(t *testing.T) {
+	// Will not really run for 150s, executing the test function up to 1e9 times.
+	err := flag.Lookup("test.benchtime").Value.Set("150s")
+	if err != nil {
+		t.Fatalf("set benchtime occured an error %q", err.Error())
+	}
+
+	t.Cleanup(func() {
+		err = flag.Lookup("test.benchtime").Value.Set("1s")
+		t.Fatalf("clear benchtime occured an error %q", err.Error())
+	})
+
+	var try int32 = 0
+	testing.Benchmark(func(b *testing.B) {
+		c := atomic.AddInt32(&try, 1)
+		t.Logf("try = %d,b.N = %d\n", c, b.N)
 	})
 }
