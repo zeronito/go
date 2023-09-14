@@ -30,7 +30,7 @@ import (
 
 const usageMessage = "" +
 	`Usage of 'go tool cover':
-Given a coverage profile produced by 'go test':
+Given a coverage profile 'c.out' produced by 'go test':
 	go test -coverprofile=c.out
 
 Open a web browser displaying annotated source code:
@@ -40,7 +40,7 @@ Write out an HTML file instead of launching a web browser:
 	go tool cover -html=c.out -o coverage.html
 
 Display coverage percentages to stdout for each function:
-	go tool cover -func=c.out
+	go tool cover -func c.out
 
 Finally, to generate modified source code with coverage annotations
 for a package (what go test -cover does):
@@ -69,7 +69,7 @@ var (
 	output      = flag.String("o", "", "file for output")
 	outfilelist = flag.String("outfilelist", "", "file containing list of output files (one per line) if -pkgcfg is in use")
 	htmlOut     = flag.String("html", "", "generate HTML representation of coverage profile")
-	funcOut     = flag.String("func", "", "output coverage profile information for each function")
+	funcOut     = flag.String("func", "", "for the given profile, output coverage info for each function")
 	pkgcfg      = flag.String("pkgcfg", "", "enable full-package instrumentation mode using params from specified config file")
 )
 
