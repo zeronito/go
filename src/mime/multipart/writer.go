@@ -148,7 +148,8 @@ func (w *Writer) CreateFormFile(fieldname, filename string) (io.Writer, error) {
 // given field name.
 func (w *Writer) CreateFormField(fieldname string) (io.Writer, error) {
 	h := make(textproto.MIMEHeader)
-	h.Set("Content-Disposition", FieldContentDisposition(fieldname))
+	h.Set("Content-Disposition", fmt.Sprintf(`form-data; name="%s"`,
+		escapeQuotes(fieldname)))
 	return w.CreatePart(h)
 }
 
@@ -157,13 +158,6 @@ func (w *Writer) CreateFormField(fieldname string) (io.Writer, error) {
 func FileContentDisposition(fieldname, filename string) string {
 	return fmt.Sprintf(`form-data; name="%s"; filename="%s"`,
 		escapeQuotes(fieldname), escapeQuotes(filename))
-}
-
-// FieldContentDisposition returns the value of a Content-Disposition header
-// with the provided field name.
-func FieldContentDisposition(fieldname string) string {
-	return fmt.Sprintf(`form-data; name="%s"`,
-		escapeQuotes(fieldname))
 }
 
 // WriteField calls CreateFormField and then writes the given value.
