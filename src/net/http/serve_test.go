@@ -5096,13 +5096,13 @@ func getNoBody(urlStr string) (*Response, error) {
 // For use like:
 //
 //	$ go test -c
-//	$ ./http.test -test.run=XX -test.bench=BenchmarkClient$ -test.benchtime=15s -test.cpuprofile=http.prof
+//	$ ./http.test -test.run='^$' -test.bench='^BenchmarkClient$' -test.benchtime=15s -test.cpuprofile=http.prof
 //	$ go tool pprof http.test http.prof
 //	(pprof) web
 func BenchmarkClient(b *testing.B) {
 	var data = []byte("Hello world.\n")
 
-	url := startBenchmarkServer(b, func(w ResponseWriter, r *Request) {
+	url := startClientBenchmarkServer(b, func(w ResponseWriter, _ *Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.Write(data)
 	})
@@ -5126,7 +5126,7 @@ func BenchmarkClient(b *testing.B) {
 	b.StopTimer()
 }
 
-func startBenchmarkServer(b *testing.B, handler func(ResponseWriter, *Request)) string {
+func startClientBenchmarkServer(b *testing.B, handler func(ResponseWriter, *Request)) string {
 	b.ReportAllocs()
 	b.StopTimer()
 
@@ -5213,19 +5213,18 @@ func startBenchmarkServer(b *testing.B, handler func(ResponseWriter, *Request)) 
 }
 
 func BenchmarkClientGzip(b *testing.B) {
-	const nRandBytes = 1024 * 1024
+	const responseSize = 1024 * 1024
 
 	var buf bytes.Buffer
 	gz := gzip.NewWriter(&buf)
-	if _, err := io.CopyN(gz, crand.Reader, nRandBytes); err != nil {
-		fmt.Fprintln(os.Stderr, err.Error())
-		os.Exit(1)
+	if _, err := io.CopyN(gz, crand.Reader, responseSize); err != nil {
+		b.Fatal(err)
 	}
 	gz.Close()
 
 	data := buf.Bytes()
 
-	url := startBenchmarkServer(b, func(w ResponseWriter, r *Request) {
+	url := startClientBenchmarkServer(b, func(w ResponseWriter, _ *Request) {
 		w.Header().Set("Content-Encoding", "gzip")
 		w.Write(data)
 	})
@@ -5242,8 +5241,8 @@ func BenchmarkClientGzip(b *testing.B) {
 		if err != nil {
 			b.Fatalf("ReadAll: %v", err)
 		}
-		if n != nRandBytes {
-			b.Fatalf("ReadAll: expected %d, got %d", nRandBytes, n)
+		if n != responseSize {
+			b.Fatalf("ReadAll: expected %d bytes, got %d", responseSize, n)
 		}
 	}
 	b.StopTimer()
