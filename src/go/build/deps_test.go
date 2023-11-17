@@ -89,7 +89,9 @@ var depsRules = `
 	< container/heap;
 
 	RUNTIME
-	< io;
+	< io
+	< internal/iointernal
+	< IO;
 
 	RUNTIME
 	< arena;
@@ -152,7 +154,7 @@ var depsRules = `
 	# OS is basic OS access, including helpers (path/filepath, os/exec, etc).
 	# OS includes string routines, but those must be layered above package os.
 	# OS does not include reflection.
-	io/fs
+	IO, io/fs
 	< internal/testlog
 	< internal/poll
 	< internal/safefilepath
@@ -366,6 +368,7 @@ var depsRules = `
 	# This is a long-looking list but most of these
 	# are small with few dependencies.
 	CGO,
+	IO,
 	golang.org/x/net/dns/dnsmessage,
 	golang.org/x/net/lif,
 	golang.org/x/net/route,

@@ -54,6 +54,13 @@ func (c *TCPConn) readFrom(r io.Reader) (int64, error) {
 	return genericReadFrom(c, r)
 }
 
+func (c *TCPConn) writeTo(w io.Writer) (int64, error) {
+	if n, err, handled := spliceW(c.fd, w); handled {
+		return n, err
+	}
+	return genericWriteTo(w, c)
+}
+
 func (sd *sysDialer) dialTCP(ctx context.Context, laddr, raddr *TCPAddr) (*TCPConn, error) {
 	if h := sd.testHookDialTCP; h != nil {
 		return h(ctx, sd.network, laddr, raddr)
