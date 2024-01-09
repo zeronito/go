@@ -71,6 +71,68 @@ func outgoingLength(req *http.Request) int64 {
 	return -1
 }
 
+// noBodyWriter writes to an underlying writer until it reads
+// the start of the http body. After which the body content will
+// not be written to the underlying writer to avoid any potential
+// memory allocations.
+type noBodyWriter struct {
+	io.Writer
+	state noBodyWriterState
+}
+
+type noBodyWriterState int
+
+const (
+	noBodyWriterStart noBodyWriterState = iota
+	noBodyWriterCR
+	noBodyWriterNL
+	noBodyWriterEndCR
+	noBodyWriterEndNL
+)
+
+func (b *noBodyWriter) Write(p []byte) (n int, err error) {
+	if b.state == noBodyWriterEndNL {
+		return len(p), nil
+	}
+
+	var end int
+
+loop:
+	for i, pb := range p {
+		end = i
+		switch b.state {
+		case noBodyWriterStart:
+			if pb == '\r' {
+				b.state = noBodyWriterCR
+			}
+		case noBodyWriterCR:
+			if pb == '\n' {
+				b.state = noBodyWriterNL
+				continue
+			}
+			b.state = noBodyWriterStart
+		case noBodyWriterNL:
+			if pb == '\r' {
+				b.state = noBodyWriterEndCR
+				continue
+			}
+			b.state = noBodyWriterStart
+		case noBodyWriterEndCR:
+			if pb == '\n' {
+				b.state = noBodyWriterEndNL
+				break loop
+			}
+			b.state = noBodyWriterStart
+		default:
+			return 0, fmt.Errorf("missing state case for noBodyWriterState")
+		}
+	}
+
+	_, err = io.Copy(b.Writer, bytes.NewReader(p[:end+1]))
+
+	return len(p), err
+}
+
 // DumpRequestOut is like DumpRequest but for outgoing client requests. It
 // includes any headers that the standard http.Transport adds, such as
 // User-Agent.
@@ -117,7 +179,11 @@ func DumpRequestOut(req *http.Request, body bool) ([]byte, error) {
 
 	t := &http.Transport{
 		Dial: func(net, addr string) (net.Conn, error) {
-			return &dumpConn{io.MultiWriter(&buf, pw), dr}, nil
+			var out io.Writer = &buf
+			if dummyBody {
+				out = &noBodyWriter{Writer: out}
+			}
+			return &dumpConn{io.MultiWriter(out, pw), dr}, nil
 		},
 	}
 	defer t.CloseIdleConnections()
@@ -152,19 +218,8 @@ func DumpRequestOut(req *http.Request, body bool) ([]byte, error) {
 		close(quitReadCh)
 		return nil, err
 	}
-	dump := buf.Bytes()
 
-	// If we used a dummy body above, remove it now.
-	// TODO: if the req.ContentLength is large, we allocate memory
-	// unnecessarily just to slice it off here. But this is just
-	// a debug function, so this is acceptable for now. We could
-	// discard the body earlier if this matters.
-	if dummyBody {
-		if i := bytes.Index(dump, []byte("\r\n\r\n")); i >= 0 {
-			dump = dump[:i+4]
-		}
-	}
-	return dump, nil
+	return buf.Bytes(), nil
 }
 
 // delegateReader is a reader that delegates to another reader,
