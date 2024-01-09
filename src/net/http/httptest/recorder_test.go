@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"reflect"
 	"testing"
 )
 
@@ -120,6 +121,15 @@ func TestRecorder(t *testing.T) {
 			if got := rec.Result().ContentLength; got != length {
 				return fmt.Errorf("ContentLength = %d; want %d", got, length)
 			}
+			return nil
+		}
+	}
+	hasInformationalResponses := func(ir []InformationalResponse) checkFunc {
+		return func(rec *ResponseRecorder) error {
+			if !reflect.DeepEqual(ir, rec.InformationalResponses) {
+				return fmt.Errorf("InformationalResponses = %v; want %v", rec.InformationalResponses, ir)
+			}
+
 			return nil
 		}
 	}
@@ -293,6 +303,26 @@ func TestRecorder(t *testing.T) {
 			},
 			check(hasResultContents("")), // check we don't crash reading the body
 
+		},
+		{
+			"1xx status code",
+			func(rw http.ResponseWriter, _ *http.Request) {
+				rw.WriteHeader(http.StatusContinue)
+				rw.Header().Add("Foo", "bar")
+
+				rw.WriteHeader(http.StatusEarlyHints)
+				rw.Header().Add("Baz", "bat")
+
+				rw.Header().Del("Foo")
+			},
+			check(
+				hasInformationalResponses([]InformationalResponse{
+					InformationalResponse{100, http.Header{}},
+					InformationalResponse{103, http.Header{"Foo": []string{"bar"}}},
+				}),
+				hasHeader("Baz", "bat"),
+				hasNotHeaders("Foo"),
+			),
 		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {

@@ -16,6 +16,17 @@ import (
 	"golang.org/x/net/http/httpguts"
 )
 
+// InformationalResponse is an HTTP response sent with a [1xx status code].
+//
+// [1xx status code]: https://httpwg.org/specs/rfc9110.html#status.1xx
+type InformationalResponse struct {
+	// Code is the 1xx HTTP response code of this informational response.
+	Code int
+
+	// Header contains the headers of this informational response.
+	Header http.Header
+}
+
 // ResponseRecorder is an implementation of http.ResponseWriter that
 // records its mutations for later inspection in tests.
 type ResponseRecorder struct {
@@ -26,6 +37,9 @@ type ResponseRecorder struct {
 	// http.StatusOK. To get the implicit value, use the Result
 	// method.
 	Code int
+
+	// Informational HTTP responses (1xx status code) sent before the main response.
+	InformationalResponses []InformationalResponse
 
 	// HeaderMap contains the headers explicitly set by the Handler.
 	// It is an internal detail.
@@ -146,11 +160,20 @@ func (rw *ResponseRecorder) WriteHeader(code int) {
 	}
 
 	checkWriteHeaderCode(code)
-	rw.Code = code
-	rw.wroteHeader = true
+
 	if rw.HeaderMap == nil {
 		rw.HeaderMap = make(http.Header)
 	}
+
+	if code >= 100 && code < 200 {
+		ir := InformationalResponse{code, rw.HeaderMap.Clone()}
+		rw.InformationalResponses = append(rw.InformationalResponses, ir)
+
+		return
+	}
+
+	rw.Code = code
+	rw.wroteHeader = true
 	rw.snapHeader = rw.HeaderMap.Clone()
 }
 
