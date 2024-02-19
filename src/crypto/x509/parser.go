@@ -352,7 +352,6 @@ func parseBasicConstraintsExtension(der cryptobyte.String) (bool, int, error) {
 		maxPathLen = int(mpl)
 	}
 
-	// TODO: map out.MaxPathLen to 0 if it has the -1 default value? (Issue 19285)
 	return isCA, maxPathLen, nil
 }
 
