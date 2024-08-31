@@ -197,8 +197,8 @@ func sortSpecs(fset *token.FileSet, f *File, d *GenDecl, specs []Spec) []Spec {
 			deduped = append(deduped, s)
 		} else {
 			p := s.Pos()
-			if endLine != lineAt(fset, d.Rparen) {
-				fset.File(p).MergeLine(lineAt(fset, p))
+			if l := lineAt(fset, p); l != lineAt(fset, d.Rparen) {
+				fset.File(p).MergeLine(l)
 			}
 		}
 	}
