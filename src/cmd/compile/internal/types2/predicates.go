@@ -6,6 +6,8 @@
 
 package types2
 
+import "unicode"
+
 // isValid reports whether t is a valid type.
 func isValid(t Type) bool { return Unalias(t) != Typ[Invalid] }
 
@@ -146,12 +148,12 @@ func isGeneric(t Type) bool {
 
 // Comparable reports whether values of type T are comparable.
 func Comparable(T Type) bool {
-	return comparable(T, true, nil, nil)
+	return comparableType(T, true, nil, nil)
 }
 
 // If dynamic is set, non-type parameter interfaces are always comparable.
 // If reportf != nil, it may be used to report why T is not comparable.
-func comparable(T Type, dynamic bool, seen map[Type]bool, reportf func(string, ...interface{})) bool {
+func comparableType(T Type, dynamic bool, seen map[Type]bool, reportf func(string, ...interface{})) bool {
 	if seen[T] {
 		return true
 	}
@@ -169,7 +171,7 @@ func comparable(T Type, dynamic bool, seen map[Type]bool, reportf func(string, .
 		return true
 	case *Struct:
 		for _, f := range t.fields {
-			if !comparable(f.typ, dynamic, seen, nil) {
+			if !comparableType(f.typ, dynamic, seen, nil) {
 				if reportf != nil {
 					reportf("struct containing %s cannot be compared", f.typ)
 				}
@@ -178,7 +180,7 @@ func comparable(T Type, dynamic bool, seen map[Type]bool, reportf func(string, .
 		}
 		return true
 	case *Array:
-		if !comparable(t.elem, dynamic, seen, nil) {
+		if !comparableType(t.elem, dynamic, seen, nil) {
 			if reportf != nil {
 				reportf("%s cannot be compared", t)
 			}
@@ -566,4 +568,14 @@ func maxType(x, y Type) Type {
 func clone[P *T, T any](p P) P {
 	c := *p
 	return &c
+}
+
+// isValidName reports whether s is a valid Go identifier.
+func isValidName(s string) bool {
+	for i, ch := range s {
+		if !(unicode.IsLetter(ch) || ch == '_' || i > 0 && unicode.IsDigit(ch)) {
+			return false
+		}
+	}
+	return true
 }

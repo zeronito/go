@@ -9,9 +9,10 @@ package runtime
 
 import (
 	"internal/abi"
+	"internal/goarch"
 	"internal/profilerecord"
 	"internal/runtime/atomic"
-	"runtime/internal/sys"
+	"internal/runtime/sys"
 	"unsafe"
 )
 
@@ -241,7 +242,7 @@ func newBucket(typ bucketType, nstk int) *bucket {
 	return b
 }
 
-// stk returns the slice in b holding the stack. The caller can asssume that the
+// stk returns the slice in b holding the stack. The caller can assume that the
 // backing array is immutable.
 func (b *bucket) stk() []uintptr {
 	stk := (*[maxProfStackDepth]uintptr)(add(unsafe.Pointer(b), unsafe.Sizeof(*b)))
@@ -542,16 +543,14 @@ func saveblockevent(cycles, rate int64, skip int, which bucketType) {
 	gp := getg()
 	mp := acquirem() // we must not be preempted while accessing profstack
 
-	nstk := 1
+	var nstk int
 	if tracefpunwindoff() || gp.m.hasCgoOnStack() {
-		mp.profStack[0] = logicalStackSentinel
 		if gp.m.curg == nil || gp.m.curg == gp {
-			nstk = callers(skip, mp.profStack[1:])
+			nstk = callers(skip, mp.profStack)
 		} else {
-			nstk = gcallers(gp.m.curg, skip, mp.profStack[1:])
+			nstk = gcallers(gp.m.curg, skip, mp.profStack)
 		}
 	} else {
-		mp.profStack[0] = uintptr(skip)
 		if gp.m.curg == nil || gp.m.curg == gp {
 			if skip > 0 {
 				// We skip one fewer frame than the provided value for frame
@@ -559,17 +558,63 @@ func saveblockevent(cycles, rate int64, skip int, which bucketType) {
 				// frame, whereas the saved frame pointer will give us the
 				// caller's return address first (so, not including
 				// saveblockevent)
-				mp.profStack[0] -= 1
+				skip -= 1
 			}
-			nstk += fpTracebackPCs(unsafe.Pointer(getfp()), mp.profStack[1:])
+			nstk = fpTracebackPartialExpand(skip, unsafe.Pointer(getfp()), mp.profStack)
 		} else {
-			mp.profStack[1] = gp.m.curg.sched.pc
-			nstk += 1 + fpTracebackPCs(unsafe.Pointer(gp.m.curg.sched.bp), mp.profStack[2:])
+			mp.profStack[0] = gp.m.curg.sched.pc
+			nstk = 1 + fpTracebackPartialExpand(skip, unsafe.Pointer(gp.m.curg.sched.bp), mp.profStack[1:])
 		}
 	}
 
 	saveBlockEventStack(cycles, rate, mp.profStack[:nstk], which)
 	releasem(mp)
+}
+
+// fpTracebackPartialExpand records a call stack obtained starting from fp.
+// This function will skip the given number of frames, properly accounting for
+// inlining, and save remaining frames as "physical" return addresses. The
+// consumer should later use CallersFrames or similar to expand inline frames.
+func fpTracebackPartialExpand(skip int, fp unsafe.Pointer, pcBuf []uintptr) int {
+	var n int
+	lastFuncID := abi.FuncIDNormal
+	skipOrAdd := func(retPC uintptr) bool {
+		if skip > 0 {
+			skip--
+		} else if n < len(pcBuf) {
+			pcBuf[n] = retPC
+			n++
+		}
+		return n < len(pcBuf)
+	}
+	for n < len(pcBuf) && fp != nil {
+		// return addr sits one word above the frame pointer
+		pc := *(*uintptr)(unsafe.Pointer(uintptr(fp) + goarch.PtrSize))
+
+		if skip > 0 {
+			callPC := pc - 1
+			fi := findfunc(callPC)
+			u, uf := newInlineUnwinder(fi, callPC)
+			for ; uf.valid(); uf = u.next(uf) {
+				sf := u.srcFunc(uf)
+				if sf.funcID == abi.FuncIDWrapper && elideWrapperCalling(lastFuncID) {
+					// ignore wrappers
+				} else if more := skipOrAdd(uf.pc + 1); !more {
+					return n
+				}
+				lastFuncID = sf.funcID
+			}
+		} else {
+			// We've skipped the desired number of frames, so no need
+			// to perform further inline expansion now.
+			pcBuf[n] = pc
+			n++
+		}
+
+		// follow the frame pointer to the next one
+		fp = unsafe.Pointer(*(*uintptr)(fp))
+	}
+	return n
 }
 
 // lockTimer assists with profiling contention on runtime-internal locks.
@@ -673,12 +718,13 @@ type mLockProfile struct {
 	pending    uintptr      // *mutex that experienced contention (to be traceback-ed)
 	cycles     int64        // cycles attributable to "pending" (if set), otherwise to "stack"
 	cyclesLost int64        // contention for which we weren't able to record a call stack
+	haveStack  bool         // stack and cycles are to be added to the mutex profile
 	disabled   bool         // attribute all time to "lost"
 }
 
 func (prof *mLockProfile) recordLock(cycles int64, l *mutex) {
-	if cycles <= 0 {
-		return
+	if cycles < 0 {
+		cycles = 0
 	}
 
 	if prof.disabled {
@@ -700,6 +746,9 @@ func (prof *mLockProfile) recordLock(cycles int64, l *mutex) {
 		// We can only store one call stack for runtime-internal lock contention
 		// on this M, and we've already got one. Decide which should stay, and
 		// add the other to the report for runtime._LostContendedRuntimeLock.
+		if cycles == 0 {
+			return
+		}
 		prevScore := uint64(cheaprand64()) % uint64(prev)
 		thisScore := uint64(cheaprand64()) % uint64(cycles)
 		if prevScore > thisScore {
@@ -724,7 +773,7 @@ func (prof *mLockProfile) recordUnlock(l *mutex) {
 	if uintptr(unsafe.Pointer(l)) == prof.pending {
 		prof.captureStack()
 	}
-	if gp := getg(); gp.m.locks == 1 && gp.m.mLockProfile.cycles != 0 {
+	if gp := getg(); gp.m.locks == 1 && gp.m.mLockProfile.haveStack {
 		prof.store()
 	}
 }
@@ -750,6 +799,7 @@ func (prof *mLockProfile) captureStack() {
 		skip += 1 // runtime.unlockWithRank.func1
 	}
 	prof.pending = 0
+	prof.haveStack = true
 
 	prof.stack[0] = logicalStackSentinel
 	if debug.runtimeContentionStacks.Load() == 0 {
@@ -790,6 +840,7 @@ func (prof *mLockProfile) store() {
 
 	cycles, lost := prof.cycles, prof.cyclesLost
 	prof.cycles, prof.cyclesLost = 0, 0
+	prof.haveStack = false
 
 	rate := int64(atomic.Load64(&mutexprofilerate))
 	saveBlockEventStack(cycles, rate, prof.stack[:nstk], mutexProfile)
@@ -1075,10 +1126,34 @@ type BlockProfileRecord struct {
 // the [testing] package's -test.blockprofile flag instead
 // of calling BlockProfile directly.
 func BlockProfile(p []BlockProfileRecord) (n int, ok bool) {
-	return blockProfileInternal(len(p), func(r profilerecord.BlockProfileRecord) {
-		copyBlockProfileRecord(&p[0], r)
-		p = p[1:]
+	var m int
+	n, ok = blockProfileInternal(len(p), func(r profilerecord.BlockProfileRecord) {
+		copyBlockProfileRecord(&p[m], r)
+		m++
 	})
+	if ok {
+		expandFrames(p[:n])
+	}
+	return
+}
+
+func expandFrames(p []BlockProfileRecord) {
+	expandedStack := makeProfStack()
+	for i := range p {
+		cf := CallersFrames(p[i].Stack())
+		j := 0
+		for ; j < len(expandedStack); j++ {
+			f, more := cf.Next()
+			// f.PC is a "call PC", but later consumers will expect
+			// "return PCs"
+			expandedStack[j] = f.PC + 1
+			if !more {
+				break
+			}
+		}
+		k := copy(p[i].Stack0[:], expandedStack[:j])
+		clear(p[i].Stack0[k:])
+	}
 }
 
 // blockProfileInternal returns the number of records n in the profile. If there
@@ -1111,6 +1186,9 @@ func blockProfileInternal(size int, copyFn func(profilerecord.BlockProfileRecord
 	return
 }
 
+// copyBlockProfileRecord copies the sample values and call stack from src to dst.
+// The call stack is copied as-is. The caller is responsible for handling inline
+// expansion, needed when the call stack was collected with frame pointer unwinding.
 func copyBlockProfileRecord(dst *BlockProfileRecord, src profilerecord.BlockProfileRecord) {
 	dst.Count = src.Count
 	dst.Cycles = src.Cycles
@@ -1123,7 +1201,11 @@ func copyBlockProfileRecord(dst *BlockProfileRecord, src profilerecord.BlockProf
 	if asanenabled {
 		asanwrite(unsafe.Pointer(&dst.Stack0[0]), unsafe.Sizeof(dst.Stack0))
 	}
-	i := fpunwindExpand(dst.Stack0[:], src.Stack)
+	// We just copy the stack here without inline expansion
+	// (needed if frame pointer unwinding is used)
+	// since this function is called under the profile lock,
+	// and doing something that might allocate can violate lock ordering.
+	i := copy(dst.Stack0[:], src.Stack)
 	clear(dst.Stack0[i:])
 }
 
@@ -1142,10 +1224,15 @@ func pprof_blockProfileInternal(p []profilerecord.BlockProfileRecord) (n int, ok
 // Most clients should use the [runtime/pprof] package
 // instead of calling MutexProfile directly.
 func MutexProfile(p []BlockProfileRecord) (n int, ok bool) {
-	return mutexProfileInternal(len(p), func(r profilerecord.BlockProfileRecord) {
-		copyBlockProfileRecord(&p[0], r)
-		p = p[1:]
+	var m int
+	n, ok = mutexProfileInternal(len(p), func(r profilerecord.BlockProfileRecord) {
+		copyBlockProfileRecord(&p[m], r)
+		m++
 	})
+	if ok {
+		expandFrames(p[:n])
+	}
+	return
 }
 
 // mutexProfileInternal returns the number of records n in the profile. If there

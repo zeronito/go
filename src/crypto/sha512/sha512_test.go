@@ -9,6 +9,7 @@ package sha512
 import (
 	"bytes"
 	"crypto/internal/boring"
+	"crypto/internal/cryptotest"
 	"crypto/rand"
 	"encoding"
 	"encoding/hex"
@@ -744,8 +745,20 @@ func TestGoldenMarshal(t *testing.T) {
 					return
 				}
 
+				stateAppend, err := h.(encoding.BinaryAppender).AppendBinary(make([]byte, 4, 32))
+				if err != nil {
+					t.Errorf("could not marshal: %v", err)
+					return
+				}
+				stateAppend = stateAppend[4:]
+
 				if string(state) != test.halfState {
 					t.Errorf("New%s(%q) state = %q, want %q", tt.name, test.in, state, test.halfState)
+					continue
+				}
+
+				if string(stateAppend) != test.halfState {
+					t.Errorf("New%s(%q) stateAppend = %q, want %q", tt.name, test.in, stateAppend, test.halfState)
 					continue
 				}
 
@@ -907,6 +920,21 @@ func TestAllocations(t *testing.T) {
 	if n > 0 {
 		t.Errorf("allocs = %d, want 0", n)
 	}
+}
+
+func TestSHA512Hash(t *testing.T) {
+	t.Run("SHA-384", func(t *testing.T) {
+		cryptotest.TestHash(t, New384)
+	})
+	t.Run("SHA-512/224", func(t *testing.T) {
+		cryptotest.TestHash(t, New512_224)
+	})
+	t.Run("SHA-512/256", func(t *testing.T) {
+		cryptotest.TestHash(t, New512_256)
+	})
+	t.Run("SHA-512", func(t *testing.T) {
+		cryptotest.TestHash(t, New)
+	})
 }
 
 var bench = New()

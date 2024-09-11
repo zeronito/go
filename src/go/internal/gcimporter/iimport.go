@@ -77,6 +77,7 @@ const (
 	typeParamType
 	instanceType
 	unionType
+	aliasType
 )
 
 // iImportData imports a package from the serialized package data
@@ -333,10 +334,13 @@ func (r *importReader) obj(name string) {
 	pos := r.pos()
 
 	switch tag {
-	case 'A':
-		typ := r.typ()
-
-		r.declare(types.NewTypeName(pos, r.currPkg, name, typ))
+	case 'A', 'B':
+		var tparams []*types.TypeParam
+		if tag == 'B' {
+			tparams = r.tparamList()
+		}
+		rhs := r.typ()
+		r.declare(newAliasTypeName(pos, r.currPkg, name, rhs, tparams))
 
 	case 'C':
 		typ, val := r.value()
@@ -616,7 +620,7 @@ func (r *importReader) doType(base *types.Named) types.Type {
 		errorf("unexpected kind tag in %q: %v", r.p.ipath, k)
 		return nil
 
-	case definedType:
+	case aliasType, definedType:
 		pkg, name := r.qualifiedIdent()
 		r.p.doDecl(pkg, name)
 		return pkg.Scope().Lookup(name).(*types.TypeName).Type()

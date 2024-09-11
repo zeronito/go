@@ -7,6 +7,7 @@ package loong64
 import (
 	"cmd/internal/obj"
 	"cmd/internal/objabi"
+	"cmd/internal/src"
 	"cmd/internal/sys"
 	"internal/abi"
 	"log"
@@ -370,6 +371,7 @@ func preprocess(ctxt *obj.Link, cursym *obj.LSym, newprog obj.ProgAlloc) {
 				q = obj.Appendp(q, newprog)
 				q.As = add
 				q.Pos = p.Pos
+				q.Pos = q.Pos.WithXlogue(src.PosPrologueEnd)
 				q.From.Type = obj.TYPE_CONST
 				q.From.Offset = int64(-autosize)
 				q.To.Type = obj.TYPE_REG
@@ -409,7 +411,7 @@ func preprocess(ctxt *obj.Link, cursym *obj.LSym, newprog obj.ProgAlloc) {
 				// The NOP is needed to give the jumps somewhere to land.
 				// It is a liblink NOP, not a hardware NOP: it encodes to 0 instruction bytes.
 				//
-				// We don't generate this for leafs because that means the wrapped
+				// We don't generate this for leaves because that means the wrapped
 				// function was inlined into the wrapper.
 
 				q = obj.Appendp(q, newprog)

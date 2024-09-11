@@ -164,6 +164,7 @@ func ArrayCopy(a [16]byte) (b [16]byte) {
 func Float64Min(a, b float64) float64 {
 	// amd64:"MINSD"
 	// arm64:"FMIND"
+	// loong64:"FMIND"
 	// riscv64:"FMIN"
 	// ppc64/power9:"XSMINJDP"
 	// ppc64/power10:"XSMINJDP"
@@ -173,6 +174,7 @@ func Float64Min(a, b float64) float64 {
 func Float64Max(a, b float64) float64 {
 	// amd64:"MINSD"
 	// arm64:"FMAXD"
+	// loong64:"FMAXD"
 	// riscv64:"FMAX"
 	// ppc64/power9:"XSMAXJDP"
 	// ppc64/power10:"XSMAXJDP"
@@ -182,6 +184,7 @@ func Float64Max(a, b float64) float64 {
 func Float32Min(a, b float32) float32 {
 	// amd64:"MINSS"
 	// arm64:"FMINS"
+	// loong64:"FMINF"
 	// riscv64:"FMINS"
 	// ppc64/power9:"XSMINJDP"
 	// ppc64/power10:"XSMINJDP"
@@ -191,6 +194,7 @@ func Float32Min(a, b float32) float32 {
 func Float32Max(a, b float32) float32 {
 	// amd64:"MINSS"
 	// arm64:"FMAXS"
+	// loong64:"FMAXF"
 	// riscv64:"FMAXS"
 	// ppc64/power9:"XSMAXJDP"
 	// ppc64/power10:"XSMAXJDP"
@@ -226,4 +230,13 @@ func Float32DenormalConstant() float32 {
 func Float64DenormalFloat32Constant() float64 {
 	// ppc64x:"FMOVD\t[$]f64\\.3800000000000000\\(SB\\)"
 	return 0x1p-127
+}
+
+func Float64ConstantStore(p *float64) {
+	// amd64: "MOVQ\t[$]4617801906721357038"
+	*p = 5.432
+}
+func Float32ConstantStore(p *float32) {
+	// amd64: "MOVL\t[$]1085133554"
+	*p = 5.432
 }

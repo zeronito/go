@@ -32,7 +32,7 @@ import (
 //
 // "a < b" means package b can import package a.
 //
-// See `go doc internal/dag' for the full syntax.
+// See `go doc internal/dag` for the full syntax.
 //
 // All-caps names are pseudo-names for specific points
 // in the dependency lattice.
@@ -58,6 +58,7 @@ var depsRules = `
 	  internal/nettrace,
 	  internal/platform,
 	  internal/profilerecord,
+	  internal/syslist,
 	  internal/trace/traceviewer/format,
 	  log/internal,
 	  math/bits,
@@ -83,11 +84,11 @@ var depsRules = `
 	< internal/stringslite
 	< internal/itoa
 	< internal/unsafeheader
-	< runtime/internal/sys
+	< internal/runtime/sys
 	< internal/runtime/syscall
 	< internal/runtime/atomic
 	< internal/runtime/exithook
-	< runtime/internal/math
+	< internal/runtime/math
 	< runtime
 	< sync/atomic
 	< internal/race
@@ -337,7 +338,7 @@ var depsRules = `
 	go/doc/comment, go/parser, internal/lazyregexp, text/template
 	< go/doc;
 
-	go/build/constraint, go/doc, go/parser, internal/buildcfg, internal/goroot, internal/goversion, internal/platform
+	go/build/constraint, go/doc, go/parser, internal/buildcfg, internal/goroot, internal/goversion, internal/platform, internal/syslist
 	< go/build;
 
 	# databases
@@ -641,6 +642,9 @@ var depsRules = `
 
 	FMT
 	< internal/txtar;
+
+	CRYPTO-MATH, testing
+	< crypto/internal/cryptotest;
 
 	# v2 execution trace parser.
 	FMT
