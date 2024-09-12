@@ -104,8 +104,8 @@ import (
 	"internal/goarch"
 	"internal/goos"
 	"internal/runtime/atomic"
-	"runtime/internal/math"
-	"runtime/internal/sys"
+	"internal/runtime/math"
+	"internal/runtime/sys"
 	"unsafe"
 )
 
@@ -227,7 +227,7 @@ const (
 	// --------------  ---------  ----------  ----------  -----------
 	//       */64-bit         48        64MB           1    4M (32MB)
 	// windows/64-bit         48         4MB          64    1M  (8MB)
-	//      ios/arm64         33         4MB           1  2048  (8KB)
+	//      ios/arm64         40         4MB           1  256K  (2MB)
 	//       */32-bit         32         4MB           1  1024  (4KB)
 	//     */mips(le)         31         4MB           1   512  (2KB)
 
@@ -1555,7 +1555,7 @@ var persistentChunks *notInHeap
 // sysStat must be non-nil.
 //
 // Consider marking persistentalloc'd types not in heap by embedding
-// runtime/internal/sys.NotInHeap.
+// internal/runtime/sys.NotInHeap.
 func persistentalloc(size, align uintptr, sysStat *sysMemStat) unsafe.Pointer {
 	var p *notInHeap
 	systemstack(func() {
@@ -1697,7 +1697,7 @@ func (l *linearAlloc) alloc(size, align uintptr, sysStat *sysMemStat) unsafe.Poi
 // like sysAlloc or persistentAlloc.
 //
 // In general, it's better to use real types which embed
-// runtime/internal/sys.NotInHeap, but this serves as a generic type
+// internal/runtime/sys.NotInHeap, but this serves as a generic type
 // for situations where that isn't possible (like in the allocators).
 //
 // TODO: Use this as the return type of sysAlloc, persistentAlloc, etc?

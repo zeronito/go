@@ -26,6 +26,7 @@ import (
 	"cmd/go/internal/modload"
 	"cmd/go/internal/run"
 	"cmd/go/internal/work"
+	"cmd/internal/pathcache"
 	"cmd/internal/telemetry/counter"
 
 	"golang.org/x/mod/module"
@@ -308,7 +309,7 @@ func Exec(gotoolchain string) {
 	// Look in PATH for the toolchain before we download one.
 	// This allows custom toolchains as well as reuse of toolchains
 	// already installed using go install golang.org/dl/go1.2.3@latest.
-	if exe, err := cfg.LookPath(gotoolchain); err == nil {
+	if exe, err := pathcache.LookPath(gotoolchain); err == nil {
 		execGoToolchain(gotoolchain, "", exe)
 	}
 
@@ -352,13 +353,20 @@ func Exec(gotoolchain string) {
 			base.Fatalf("download %s: %v", gotoolchain, err)
 		}
 		if info.Mode()&0111 == 0 {
-			// allowExec sets the exec permission bits on all files found in dir.
-			allowExec := func(dir string) {
+			// allowExec sets the exec permission bits on all files found in dir if pattern is the empty string,
+			// or only those files that match the pattern if it's non-empty.
+			allowExec := func(dir, pattern string) {
 				err := filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
 					if err != nil {
 						return err
 					}
 					if !d.IsDir() {
+						if pattern != "" {
+							if matched, _ := filepath.Match(pattern, d.Name()); !matched {
+								// Skip file.
+								return nil
+							}
+						}
 						info, err := os.Stat(path)
 						if err != nil {
 							return err
@@ -379,12 +387,13 @@ func Exec(gotoolchain string) {
 			// then the check of bin/go above might succeed, the other go command
 			// would skip its own mode-setting, and then the go command might
 			// try to run a tool before we get to setting the bits on pkg/tool.
-			// Setting pkg/tool before bin/go avoids that ordering problem.
+			// Setting pkg/tool and lib before bin/go avoids that ordering problem.
 			// The only other tool the go command invokes is gofmt,
 			// so we set that one explicitly before handling bin (which will include bin/go).
-			allowExec(filepath.Join(dir, "pkg/tool"))
-			allowExec(filepath.Join(dir, "bin/gofmt"))
-			allowExec(filepath.Join(dir, "bin"))
+			allowExec(filepath.Join(dir, "pkg/tool"), "")
+			allowExec(filepath.Join(dir, "lib"), "go_?*_?*_exec")
+			allowExec(filepath.Join(dir, "bin/gofmt"), "")
+			allowExec(filepath.Join(dir, "bin"), "")
 		}
 	}
 

@@ -285,7 +285,7 @@ func (t *Named) cleanup() {
 		if t.TypeArgs().Len() == 0 {
 			panic("nil underlying")
 		}
-	case *Named:
+	case *Named, *Alias:
 		t.under() // t.under may add entries to check.cleaners
 	}
 	t.check = nil
@@ -433,8 +433,8 @@ func (t *Named) expandMethod(i int) *Func {
 		rtyp = t
 	}
 
-	sig.recv = substVar(origSig.recv, rtyp)
-	return substFunc(origm, sig)
+	sig.recv = cloneVar(origSig.recv, rtyp)
+	return cloneFunc(origm, sig)
 }
 
 // SetUnderlying sets the underlying type and marks t as complete.

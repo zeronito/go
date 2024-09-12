@@ -39,11 +39,12 @@ import (
 	"cmd/go/internal/modindex"
 	"cmd/go/internal/modinfo"
 	"cmd/go/internal/modload"
-	"cmd/go/internal/par"
 	"cmd/go/internal/search"
 	"cmd/go/internal/str"
 	"cmd/go/internal/trace"
 	"cmd/go/internal/vcs"
+	"cmd/internal/par"
+	"cmd/internal/pathcache"
 	"cmd/internal/pkgpattern"
 
 	"golang.org/x/mod/modfile"
@@ -468,11 +469,10 @@ func (p *Package) copyBuild(opts PackageOpts, pp *build.Package) {
 // A PackageError describes an error loading information about a package.
 type PackageError struct {
 	ImportStack      ImportStack // shortest path from package named on command line to this one with position
-	Pos              string      // position of error
-	Err              error       // the error itself
-	IsImportCycle    bool        // the error is an import cycle
-	Hard             bool        // whether the error is soft or hard; soft errors are ignored in some places
-	alwaysPrintStack bool        // whether to always print the ImportStack
+	Pos              string   // position of error
+	Err              error    // the error itself
+	IsImportCycle    bool     // the error is an import cycle
+	alwaysPrintStack bool     // whether to always print the ImportStack
 }
 
 func (p *PackageError) Error() string {
@@ -555,7 +555,7 @@ type importError struct {
 
 func ImportErrorf(path, format string, args ...any) ImportPathError {
 	err := &importError{importPath: path, err: fmt.Errorf(format, args...)}
-	if errStr := err.Error(); !strings.Contains(errStr, path) {
+	if errStr := err.Error(); !strings.Contains(errStr, path) && !strings.Contains(errStr, strconv.Quote(path)) {
 		panic(fmt.Sprintf("path %q not in error %q", path, errStr))
 	}
 	return err
@@ -1594,7 +1594,7 @@ func disallowInternal(ctx context.Context, srcDir string, importer *Package, imp
 	perr := &PackageError{
 		alwaysPrintStack: true,
 		ImportStack:      stk.Copy(),
-		Err:              ImportErrorf(p.ImportPath, "use of internal package "+p.ImportPath+" not allowed"),
+		Err:              ImportErrorf(p.ImportPath, "use of internal package %s not allowed", p.ImportPath),
 	}
 	return perr
 }
@@ -2167,11 +2167,7 @@ func resolveEmbed(pkgdir string, patterns []string) (files []string, pmap map[st
 	for _, pattern = range patterns {
 		pid++
 
-		glob := pattern
-		all := strings.HasPrefix(pattern, "all:")
-		if all {
-			glob = pattern[len("all:"):]
-		}
+		glob, all := strings.CutPrefix(pattern, "all:")
 		// Check pattern is valid for //go:embed.
 		if _, err := pathpkg.Match(glob, ""); err != nil || !validEmbedPattern(glob) {
 			return nil, nil, fmt.Errorf("invalid pattern syntax")
@@ -2535,7 +2531,7 @@ func (p *Package) setBuildInfo(ctx context.Context, autoVCS bool) {
 			goto omitVCS
 		}
 		if cfg.BuildBuildvcs == "auto" && vcsCmd != nil && vcsCmd.Cmd != "" {
-			if _, err := cfg.LookPath(vcsCmd.Cmd); err != nil {
+			if _, err := pathcache.LookPath(vcsCmd.Cmd); err != nil {
 				// We fould a repository, but the required VCS tool is not present.
 				// "-buildvcs=auto" means that we should silently drop the VCS metadata.
 				goto omitVCS
@@ -2589,6 +2585,19 @@ func (p *Package) setBuildInfo(ctx context.Context, autoVCS bool) {
 			appendSetting("vcs.time", stamp)
 		}
 		appendSetting("vcs.modified", strconv.FormatBool(st.Uncommitted))
+		// Determine the correct version of this module at the current revision and update the build metadata accordingly.
+		repo := modfetch.LookupLocal(ctx, p.Module.Dir)
+		revInfo, err := repo.Stat(ctx, st.Revision)
+		if err != nil {
+			goto omitVCS
+		}
+		vers := revInfo.Version
+		if vers != "" {
+			if st.Uncommitted {
+				vers += "+dirty"
+			}
+			info.Main.Version = vers
+		}
 	}
 omitVCS:
 
@@ -2659,7 +2668,12 @@ func externalLinkingReason(p *Package) (what string) {
 
 	// Some build modes always require external linking.
 	switch cfg.BuildBuildmode {
-	case "c-shared", "plugin":
+	case "c-shared":
+		if cfg.BuildContext.GOARCH == "wasm" {
+			break
+		}
+		fallthrough
+	case "plugin":
 		return "-buildmode=" + cfg.BuildBuildmode
 	}
 

@@ -49,7 +49,9 @@ var (
 
 	procAdjustTokenPrivileges             = modadvapi32.NewProc("AdjustTokenPrivileges")
 	procDuplicateTokenEx                  = modadvapi32.NewProc("DuplicateTokenEx")
+	procImpersonateLoggedOnUser           = modadvapi32.NewProc("ImpersonateLoggedOnUser")
 	procImpersonateSelf                   = modadvapi32.NewProc("ImpersonateSelf")
+	procLogonUserW                        = modadvapi32.NewProc("LogonUserW")
 	procLookupPrivilegeValueW             = modadvapi32.NewProc("LookupPrivilegeValueW")
 	procOpenSCManagerW                    = modadvapi32.NewProc("OpenSCManagerW")
 	procOpenServiceW                      = modadvapi32.NewProc("OpenServiceW")
@@ -67,6 +69,7 @@ var (
 	procGetFileInformationByHandleEx      = modkernel32.NewProc("GetFileInformationByHandleEx")
 	procGetFinalPathNameByHandleW         = modkernel32.NewProc("GetFinalPathNameByHandleW")
 	procGetModuleFileNameW                = modkernel32.NewProc("GetModuleFileNameW")
+	procGetModuleHandleW                  = modkernel32.NewProc("GetModuleHandleW")
 	procGetTempPath2W                     = modkernel32.NewProc("GetTempPath2W")
 	procGetVolumeInformationByHandleW     = modkernel32.NewProc("GetVolumeInformationByHandleW")
 	procGetVolumeNameForVolumeMountPointW = modkernel32.NewProc("GetVolumeNameForVolumeMountPointW")
@@ -82,6 +85,8 @@ var (
 	procVirtualQuery                      = modkernel32.NewProc("VirtualQuery")
 	procNetShareAdd                       = modnetapi32.NewProc("NetShareAdd")
 	procNetShareDel                       = modnetapi32.NewProc("NetShareDel")
+	procNetUserAdd                        = modnetapi32.NewProc("NetUserAdd")
+	procNetUserDel                        = modnetapi32.NewProc("NetUserDel")
 	procNetUserGetLocalGroups             = modnetapi32.NewProc("NetUserGetLocalGroups")
 	procRtlGetVersion                     = modntdll.NewProc("RtlGetVersion")
 	procGetProcessMemoryInfo              = modpsapi.NewProc("GetProcessMemoryInfo")
@@ -113,8 +118,24 @@ func DuplicateTokenEx(hExistingToken syscall.Token, dwDesiredAccess uint32, lpTo
 	return
 }
 
+func ImpersonateLoggedOnUser(token syscall.Token) (err error) {
+	r1, _, e1 := syscall.Syscall(procImpersonateLoggedOnUser.Addr(), 1, uintptr(token), 0, 0)
+	if r1 == 0 {
+		err = errnoErr(e1)
+	}
+	return
+}
+
 func ImpersonateSelf(impersonationlevel uint32) (err error) {
 	r1, _, e1 := syscall.Syscall(procImpersonateSelf.Addr(), 1, uintptr(impersonationlevel), 0, 0)
+	if r1 == 0 {
+		err = errnoErr(e1)
+	}
+	return
+}
+
+func LogonUser(username *uint16, domain *uint16, password *uint16, logonType uint32, logonProvider uint32, token *syscall.Token) (err error) {
+	r1, _, e1 := syscall.Syscall6(procLogonUserW.Addr(), 6, uintptr(unsafe.Pointer(username)), uintptr(unsafe.Pointer(domain)), uintptr(unsafe.Pointer(password)), uintptr(logonType), uintptr(logonProvider), uintptr(unsafe.Pointer(token)))
 	if r1 == 0 {
 		err = errnoErr(e1)
 	}
@@ -267,6 +288,15 @@ func GetModuleFileName(module syscall.Handle, fn *uint16, len uint32) (n uint32,
 	return
 }
 
+func GetModuleHandle(modulename *uint16) (handle syscall.Handle, err error) {
+	r0, _, e1 := syscall.Syscall(procGetModuleHandleW.Addr(), 1, uintptr(unsafe.Pointer(modulename)), 0, 0)
+	handle = syscall.Handle(r0)
+	if handle == 0 {
+		err = errnoErr(e1)
+	}
+	return
+}
+
 func GetTempPath2(buflen uint32, buf *uint16) (n uint32, err error) {
 	r0, _, e1 := syscall.Syscall(procGetTempPath2W.Addr(), 2, uintptr(buflen), uintptr(unsafe.Pointer(buf)), 0)
 	n = uint32(r0)
@@ -379,6 +409,22 @@ func NetShareAdd(serverName *uint16, level uint32, buf *byte, parmErr *uint16) (
 
 func NetShareDel(serverName *uint16, netName *uint16, reserved uint32) (neterr error) {
 	r0, _, _ := syscall.Syscall(procNetShareDel.Addr(), 3, uintptr(unsafe.Pointer(serverName)), uintptr(unsafe.Pointer(netName)), uintptr(reserved))
+	if r0 != 0 {
+		neterr = syscall.Errno(r0)
+	}
+	return
+}
+
+func NetUserAdd(serverName *uint16, level uint32, buf *byte, parmErr *uint32) (neterr error) {
+	r0, _, _ := syscall.Syscall6(procNetUserAdd.Addr(), 4, uintptr(unsafe.Pointer(serverName)), uintptr(level), uintptr(unsafe.Pointer(buf)), uintptr(unsafe.Pointer(parmErr)), 0, 0)
+	if r0 != 0 {
+		neterr = syscall.Errno(r0)
+	}
+	return
+}
+
+func NetUserDel(serverName *uint16, userName *uint16) (neterr error) {
+	r0, _, _ := syscall.Syscall(procNetUserDel.Addr(), 2, uintptr(unsafe.Pointer(serverName)), uintptr(unsafe.Pointer(userName)), 0)
 	if r0 != 0 {
 		neterr = syscall.Errno(r0)
 	}

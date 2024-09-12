@@ -186,57 +186,6 @@ func CanInlineFuncs(funcs []*ir.Func, profile *pgoir.Profile) {
 	})
 }
 
-// GarbageCollectUnreferencedHiddenClosures makes a pass over all the
-// top-level (non-hidden-closure) functions looking for nested closure
-// functions that are reachable, then sweeps through the Target.Decls
-// list and marks any non-reachable hidden closure function as dead.
-// See issues #59404 and #59638 for more context.
-func GarbageCollectUnreferencedHiddenClosures() {
-
-	liveFuncs := make(map[*ir.Func]bool)
-
-	var markLiveFuncs func(fn *ir.Func)
-	markLiveFuncs = func(fn *ir.Func) {
-		if liveFuncs[fn] {
-			return
-		}
-		liveFuncs[fn] = true
-		ir.Visit(fn, func(n ir.Node) {
-			if clo, ok := n.(*ir.ClosureExpr); ok {
-				markLiveFuncs(clo.Func)
-			}
-		})
-	}
-
-	for i := 0; i < len(typecheck.Target.Funcs); i++ {
-		fn := typecheck.Target.Funcs[i]
-		if fn.IsHiddenClosure() {
-			continue
-		}
-		markLiveFuncs(fn)
-	}
-
-	for i := 0; i < len(typecheck.Target.Funcs); i++ {
-		fn := typecheck.Target.Funcs[i]
-		if !fn.IsHiddenClosure() {
-			continue
-		}
-		if fn.IsDeadcodeClosure() {
-			continue
-		}
-		if liveFuncs[fn] {
-			continue
-		}
-		fn.SetIsDeadcodeClosure(true)
-		if base.Flag.LowerM > 2 {
-			fmt.Printf("%v: unreferenced closure %v marked as dead\n", ir.Line(fn), fn)
-		}
-		if fn.Inl != nil && fn.LSym == nil {
-			ir.InitLSym(fn, true)
-		}
-	}
-}
-
 // inlineBudget determines the max budget for function 'fn' prior to
 // analyzing the hairiness of the body of 'fn'. We pass in the pgo
 // profile if available (which can change the budget), also a
@@ -511,10 +460,10 @@ opSwitch:
 				case "panicrangestate":
 					cheap = true
 				}
-				// Special case for reflect.noescape. It does just type
+				// Special case for internal/abi.NoEscape. It does just type
 				// conversions to appease the escape analysis, and doesn't
 				// generate code.
-				if types.ReflectSymName(name.Sym()) == "noescape" {
+				if s := name.Sym(); s.Name == "NoEscape" && s.Pkg.Path == "internal/abi" {
 					cheap = true
 				}
 			}
@@ -1007,6 +956,15 @@ func canInlineCallExpr(callerfn *ir.Func, n *ir.CallExpr, callee *ir.Func, bigCa
 		return false, 0, false
 	}
 
+	if base.Debug.Checkptr != 0 && types.IsRuntimePkg(callee.Sym().Pkg) {
+		// We don't instrument runtime packages for checkptr (see base/flag.go).
+		if log && logopt.Enabled() {
+			logopt.LogOpt(n.Pos(), "cannotInlineCall", "inline", ir.FuncName(callerfn),
+				fmt.Sprintf(`call to into runtime package function %s in -d=checkptr build`, ir.PkgFuncName(callee)))
+		}
+		return false, 0, false
+	}
+
 	// Check if we've already inlined this function at this particular
 	// call site, in order to stop inlining when we reach the beginning
 	// of a recursion cycle again. We don't inline immediately recursive
@@ -1062,7 +1020,7 @@ func mkinlcall(callerfn *ir.Func, n *ir.CallExpr, fn *ir.Func, bigCaller bool) *
 		// typecheck.Target.Decls (ir.UseClosure adds all closures to
 		// Decls).
 		//
-		// However, non-trivial closures in Decls are ignored, and are
+		// However, closures in Decls are ignored, and are
 		// instead enqueued when walk of the calling function
 		// discovers them.
 		//
@@ -1087,8 +1045,8 @@ func mkinlcall(callerfn *ir.Func, n *ir.CallExpr, fn *ir.Func, bigCaller bool) *
 		}
 
 		clo := n.Fun.(*ir.ClosureExpr)
-		if ir.IsTrivialClosure(clo) {
-			// enqueueFunc will handle trivial closures anyways.
+		if !clo.Func.IsClosure() {
+			// enqueueFunc will handle non closures anyways.
 			return
 		}
 

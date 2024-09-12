@@ -1255,9 +1255,12 @@
 // like "v1.2.3" or a closed interval like "[v1.1.0,v1.1.9]". Note that
 // -retract=version is a no-op if that retraction already exists.
 //
+// The -tool=path and -droptool=path flags add and drop a tool declaration
+// for the given path.
+//
 // The -godebug, -dropgodebug, -require, -droprequire, -exclude, -dropexclude,
-// -replace, -dropreplace, -retract, and -dropretract editing flags may be
-// repeated, and the changes are applied in the order given.
+// -replace, -dropreplace, -retract, -dropretract, -tool, and -droptool editing
+// flags may be repeated, and the changes are applied in the order given.
 //
 // The -print flag prints the final go.mod in its text format instead of
 // writing it back to go.mod.
@@ -1306,6 +1309,10 @@
 //		Low       string
 //		High      string
 //		Rationale string
+//	}
+//
+//	type Tool struct {
+//		Path string
 //	}
 //
 // Retract entries representing a single version (not an interval) will have
@@ -1794,6 +1801,11 @@
 // To enable both collection and uploading, run “go telemetry on”.
 // To disable both collection and uploading, run "go telemetry off".
 //
+// The current telemetry mode is also available as the value of the
+// non-settable "GOTELEMETRY" go env variable. The directory in the
+// local file system that telemetry data is written to is available
+// as the value of the non-settable "GOTELEMETRYDIR" go env variable.
+//
 // See https://go.dev/doc/telemetry for more information on telemetry.
 //
 // # Test packages
@@ -1830,7 +1842,7 @@
 // finds any problems, go test reports those and does not run the test
 // binary. Only a high-confidence subset of the default go vet checks are
 // used. That subset is: atomic, bool, buildtags, directive, errorsas,
-// ifaceassert, nilfunc, printf, and stringintconv. You can see
+// ifaceassert, nilfunc, printf, stringintconv, and tests. You can see
 // the documentation for these and other vet tests via "go doc cmd/vet".
 // To disable the running of go vet, use the -vet=off flag. To run all
 // checks, use the -vet=all flag.
@@ -1883,10 +1895,10 @@
 // the result is not cached. To disable test caching, use any test flag
 // or argument other than the cacheable flags. The idiomatic way to disable
 // test caching explicitly is to use -count=1. Tests that open files within
-// the package's source root (usually $GOPATH) or that consult environment
-// variables only match future runs in which the files and environment
-// variables are unchanged. A cached test result is treated as executing
-// in no time at all, so a successful package test result will be cached and
+// the package's module or that consult environment variables only
+// match future runs in which the files and environment variables are
+// unchanged. A cached test result is treated as executing in no time
+// at all, so a successful package test result will be cached and
 // reused regardless of -timeout setting.
 //
 // In addition to the build flags, the flags handled by 'go test' itself are:
@@ -2447,6 +2459,11 @@
 //		If module-aware mode is enabled, but there is no go.mod, GOMOD will be
 //		os.DevNull ("/dev/null" on Unix-like systems, "NUL" on Windows).
 //		If module-aware mode is disabled, GOMOD will be the empty string.
+//	GOTELEMETRY
+//		The current Go telemetry mode ("off", "local", or "on").
+//		See "go help telemetry" for more information.
+//	GOTELEMETRYDIR
+//		The directory Go telemetry data is written is written to.
 //	GOTOOLDIR
 //		The directory where the go tools (compile, cover, doc, etc...) are installed.
 //	GOVERSION

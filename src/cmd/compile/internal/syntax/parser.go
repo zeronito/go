@@ -721,8 +721,20 @@ func extractName(x Expr, force bool) (*Name, Expr) {
 	case *CallExpr:
 		if name, _ := x.Fun.(*Name); name != nil {
 			if len(x.ArgList) == 1 && !x.HasDots && (force || isTypeElem(x.ArgList[0])) {
-				// x = name "(" x.ArgList[0] ")"
-				return name, x.ArgList[0]
+				// The parser doesn't keep unnecessary parentheses.
+				// Set the flag below to keep them, for testing
+				// (see go.dev/issues/69206).
+				const keep_parens = false
+				if keep_parens {
+					// x = name (x.ArgList[0])
+					px := new(ParenExpr)
+					px.pos = x.pos // position of "(" in call
+					px.X = x.ArgList[0]
+					return name, px
+				} else {
+					// x = name x.ArgList[0]
+					return name, Unparen(x.ArgList[0])
+				}
 			}
 		}
 	}
@@ -1398,6 +1410,16 @@ func (p *parser) typeOrNil() Expr {
 		p.next()
 		t := p.type_()
 		p.want(_Rparen)
+		// The parser doesn't keep unnecessary parentheses.
+		// Set the flag below to keep them, for testing
+		// (see e.g. tests for go.dev/issue/68639).
+		const keep_parens = false
+		if keep_parens {
+			px := new(ParenExpr)
+			px.pos = pos
+			px.X = t
+			t = px
+		}
 		return t
 	}
 

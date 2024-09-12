@@ -39,6 +39,7 @@ const (
 	ERROR_CALL_NOT_IMPLEMENTED   syscall.Errno = 120
 	ERROR_INVALID_NAME           syscall.Errno = 123
 	ERROR_LOCK_FAILED            syscall.Errno = 167
+	ERROR_NO_TOKEN               syscall.Errno = 1008
 	ERROR_NO_UNICODE_TRANSLATION syscall.Errno = 1113
 )
 
@@ -499,3 +500,5 @@ func QueryPerformanceCounter() int64 // Implemented in runtime package.
 //
 //go:linkname QueryPerformanceFrequency
 func QueryPerformanceFrequency() int64 // Implemented in runtime package.
+
+//sys   GetModuleHandle(modulename *uint16) (handle syscall.Handle, err error) = kernel32.GetModuleHandleW

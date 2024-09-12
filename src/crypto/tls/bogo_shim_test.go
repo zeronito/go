@@ -17,9 +17,12 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
+
+	"golang.org/x/crypto/cryptobyte"
 )
 
 var (
@@ -37,6 +40,9 @@ var (
 	maxVersion    = flag.Int("max-version", VersionTLS13, "")
 	expectVersion = flag.Int("expect-version", 0, "")
 
+	noTLS1  = flag.Bool("no-tls1", false, "")
+	noTLS11 = flag.Bool("no-tls11", false, "")
+	noTLS12 = flag.Bool("no-tls12", false, "")
 	noTLS13 = flag.Bool("no-tls13", false, "")
 
 	requireAnyClientCertificate = flag.Bool("require-any-client-certificate", false, "")
@@ -54,6 +60,7 @@ var (
 	echConfigListB64           = flag.String("ech-config-list", "", "")
 	expectECHAccepted          = flag.Bool("expect-ech-accept", false, "")
 	expectHRR                  = flag.Bool("expect-hrr", false, "")
+	expectNoHRR                = flag.Bool("expect-no-hrr", false, "")
 	expectedECHRetryConfigs    = flag.String("expect-ech-retry-configs", "", "")
 	expectNoECHRetryConfigs    = flag.Bool("expect-no-ech-retry-configs", false, "")
 	onInitialExpectECHAccepted = flag.Bool("on-initial-expect-ech-accept", false, "")
@@ -73,8 +80,12 @@ var (
 	_                       = flag.Bool("expect-ticket-supports-early-data", false, "")
 	onResumeShimWritesFirst = flag.Bool("on-resume-shim-writes-first", false, "")
 
-	advertiseALPN = flag.String("advertise-alpn", "", "")
-	expectALPN    = flag.String("expect-alpn", "", "")
+	advertiseALPN        = flag.String("advertise-alpn", "", "")
+	expectALPN           = flag.String("expect-alpn", "", "")
+	rejectALPN           = flag.Bool("reject-alpn", false, "")
+	declineALPN          = flag.Bool("decline-alpn", false, "")
+	expectAdvertisedALPN = flag.String("expect-advertised-alpn", "", "")
+	selectALPN           = flag.String("select-alpn", "", "")
 
 	hostName = flag.String("host-name", "", "")
 
@@ -112,9 +123,53 @@ func bogoShim() {
 		MaxVersion: uint16(*maxVersion),
 
 		ClientSessionCache: NewLRUClientSessionCache(0),
+
+		GetConfigForClient: func(chi *ClientHelloInfo) (*Config, error) {
+
+			if *expectAdvertisedALPN != "" {
+
+				s := cryptobyte.String(*expectAdvertisedALPN)
+
+				var expectedALPNs []string
+
+				for !s.Empty() {
+					var alpn cryptobyte.String
+					if !s.ReadUint8LengthPrefixed(&alpn) {
+						return nil, fmt.Errorf("unexpected error while parsing arguments for -expect-advertised-alpn")
+					}
+					expectedALPNs = append(expectedALPNs, string(alpn))
+				}
+
+				if !slices.Equal(chi.SupportedProtos, expectedALPNs) {
+					return nil, fmt.Errorf("unexpected ALPN: got %q, want %q", chi.SupportedProtos, expectedALPNs)
+				}
+			}
+			return nil, nil
+		},
 	}
-	if *noTLS13 && cfg.MaxVersion == VersionTLS13 {
+
+	if *noTLS1 {
+		cfg.MinVersion = VersionTLS11
+		if *noTLS11 {
+			cfg.MinVersion = VersionTLS12
+			if *noTLS12 {
+				cfg.MinVersion = VersionTLS13
+				if *noTLS13 {
+					log.Fatalf("no supported versions enabled")
+				}
+			}
+		}
+	} else if *noTLS13 {
 		cfg.MaxVersion = VersionTLS12
+		if *noTLS12 {
+			cfg.MaxVersion = VersionTLS11
+			if *noTLS11 {
+				cfg.MaxVersion = VersionTLS10
+				if *noTLS1 {
+					log.Fatalf("no supported versions enabled")
+				}
+			}
+		}
 	}
 
 	if *advertiseALPN != "" {
@@ -124,6 +179,17 @@ func bogoShim() {
 			cfg.NextProtos = append(cfg.NextProtos, alpns[1:1+alpnLen])
 			alpns = alpns[alpnLen+1:]
 		}
+	}
+
+	if *rejectALPN {
+		cfg.NextProtos = []string{"unnegotiableprotocol"}
+	}
+
+	if *declineALPN {
+		cfg.NextProtos = []string{}
+	}
+	if *selectALPN != "" {
+		cfg.NextProtos = []string{*selectALPN}
 	}
 
 	if *hostName != "" {
@@ -253,8 +319,16 @@ func bogoShim() {
 			if *expectALPN != "" && cs.NegotiatedProtocol != *expectALPN {
 				log.Fatalf("unexpected protocol negotiated: want %q, got %q", *expectALPN, cs.NegotiatedProtocol)
 			}
+
+			if *selectALPN != "" && cs.NegotiatedProtocol != *selectALPN {
+				log.Fatalf("unexpected protocol negotiated: want %q, got %q", *selectALPN, cs.NegotiatedProtocol)
+			}
+
 			if *expectVersion != 0 && cs.Version != uint16(*expectVersion) {
 				log.Fatalf("expected ssl version %q, got %q", uint16(*expectVersion), cs.Version)
+			}
+			if *declineALPN && cs.NegotiatedProtocol != "" {
+				log.Fatal("unexpected ALPN protocol")
 			}
 			if *expectECHAccepted && !cs.ECHAccepted {
 				log.Fatal("expected ECH to be accepted, but connection state shows it was not")
@@ -268,6 +342,10 @@ func bogoShim() {
 
 			if *expectHRR && !cs.testingOnlyDidHRR {
 				log.Fatal("expected HRR but did not do it")
+			}
+
+			if *expectNoHRR && cs.testingOnlyDidHRR {
+				log.Fatal("expected no HRR but did do it")
 			}
 
 			if *expectSessionMiss && cs.DidResume {

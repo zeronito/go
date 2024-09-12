@@ -7,6 +7,7 @@ package riscv64
 import (
 	"cmd/compile/internal/base"
 	"cmd/compile/internal/ir"
+	"cmd/compile/internal/logopt"
 	"cmd/compile/internal/objw"
 	"cmd/compile/internal/ssa"
 	"cmd/compile/internal/ssagen"
@@ -287,8 +288,9 @@ func ssaGenValue(s *ssagen.State, v *ssa.Value) {
 		ssa.OpRISCV64FADDS, ssa.OpRISCV64FSUBS, ssa.OpRISCV64FMULS, ssa.OpRISCV64FDIVS,
 		ssa.OpRISCV64FEQS, ssa.OpRISCV64FNES, ssa.OpRISCV64FLTS, ssa.OpRISCV64FLES,
 		ssa.OpRISCV64FADDD, ssa.OpRISCV64FSUBD, ssa.OpRISCV64FMULD, ssa.OpRISCV64FDIVD,
-		ssa.OpRISCV64FEQD, ssa.OpRISCV64FNED, ssa.OpRISCV64FLTD, ssa.OpRISCV64FLED,
-		ssa.OpRISCV64FSGNJD:
+		ssa.OpRISCV64FEQD, ssa.OpRISCV64FNED, ssa.OpRISCV64FLTD, ssa.OpRISCV64FLED, ssa.OpRISCV64FSGNJD,
+		ssa.OpRISCV64MIN, ssa.OpRISCV64MAX, ssa.OpRISCV64MINU, ssa.OpRISCV64MAXU,
+		ssa.OpRISCV64SH1ADD, ssa.OpRISCV64SH2ADD, ssa.OpRISCV64SH3ADD:
 		r := v.Reg()
 		r1 := v.Args[0].Reg()
 		r2 := v.Args[1].Reg()
@@ -720,13 +722,15 @@ func ssaGenValue(s *ssagen.State, v *ssa.Value) {
 
 	case ssa.OpRISCV64LoweredNilCheck:
 		// Issue a load which will fault if arg is nil.
-		// TODO: optimizations. See arm and amd64 LoweredNilCheck.
 		p := s.Prog(riscv.AMOVB)
 		p.From.Type = obj.TYPE_MEM
 		p.From.Reg = v.Args[0].Reg()
 		ssagen.AddAux(&p.From, v)
 		p.To.Type = obj.TYPE_REG
 		p.To.Reg = riscv.REG_ZERO
+		if logopt.Enabled() {
+			logopt.LogOpt(v.Pos, "nilcheck", "genssa", v.Block.Func.Name)
+		}
 		if base.Debug.Nil != 0 && v.Pos.Line() > 1 { // v.Pos == 1 in generated wrappers
 			base.WarnfAt(v.Pos, "generated nil check")
 		}

@@ -9,6 +9,7 @@ package sha256
 import (
 	"bytes"
 	"crypto/internal/boring"
+	"crypto/internal/cryptotest"
 	"crypto/rand"
 	"encoding"
 	"fmt"
@@ -103,7 +104,7 @@ func TestGolden(t *testing.T) {
 			if j < 2 {
 				io.WriteString(c, g.in)
 			} else {
-				io.WriteString(c, g.in[0:len(g.in)/2])
+				io.WriteString(c, g.in[:len(g.in)/2])
 				c.Sum(nil)
 				io.WriteString(c, g.in[len(g.in)/2:])
 			}
@@ -125,7 +126,7 @@ func TestGolden(t *testing.T) {
 			if j < 2 {
 				io.WriteString(c, g.in)
 			} else {
-				io.WriteString(c, g.in[0:len(g.in)/2])
+				io.WriteString(c, g.in[:len(g.in)/2])
 				c.Sum(nil)
 				io.WriteString(c, g.in[len(g.in)/2:])
 			}
@@ -162,8 +163,20 @@ func TestGoldenMarshal(t *testing.T) {
 					continue
 				}
 
+				stateAppend, err := h.(encoding.BinaryAppender).AppendBinary(make([]byte, 4, 32))
+				if err != nil {
+					t.Errorf("could not marshal: %v", err)
+					continue
+				}
+				stateAppend = stateAppend[4:]
+
 				if string(state) != g.halfState {
 					t.Errorf("sha%s(%q) state = %q, want %q", tt.name, g.in, state, g.halfState)
+					continue
+				}
+
+				if string(stateAppend) != g.halfState {
+					t.Errorf("sha%s(%q) stateAppend = %q, want %q", tt.name, g.in, stateAppend, g.halfState)
 					continue
 				}
 
@@ -323,6 +336,15 @@ func TestCgo(t *testing.T) {
 	h := New()
 	h.Write(d.Data[:])
 	h.Sum(nil)
+}
+
+func TestSHA256Hash(t *testing.T) {
+	t.Run("SHA-224", func(t *testing.T) {
+		cryptotest.TestHash(t, New224)
+	})
+	t.Run("SHA-256", func(t *testing.T) {
+		cryptotest.TestHash(t, New)
+	})
 }
 
 var bench = New()
