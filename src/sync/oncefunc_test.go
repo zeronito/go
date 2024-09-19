@@ -198,7 +198,6 @@ func TestOnceXGC(t *testing.T) {
 			f := sync.OnceValues(func() (any, any) { buf[0] = 1; return nil, nil })
 			return func() { f() }
 		},
-
 		"OnceFunc panic": func(buf []byte) func() {
 			return sync.OnceFunc(func() { buf[0] = 1; panic("test panic") })
 		},
