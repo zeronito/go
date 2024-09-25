@@ -78,11 +78,17 @@ func netrcPath() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	base := ".netrc"
+	path := filepath.Join(dir, ".netrc")
 	if runtime.GOOS == "windows" {
-		base = "_netrc"
+		if _, err := os.Stat(path); err != nil {
+			if !os.IsNotExist(err) {
+				return "", err
+			}
+			path = filepath.Join(dir, "_netrc")
+		}
 	}
-	return filepath.Join(dir, base), nil
+
+	return path, nil
 }
 
 var readNetrc = sync.OnceValues(func() ([]netrcLine, error) {
