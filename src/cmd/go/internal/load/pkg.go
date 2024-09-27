@@ -327,7 +327,16 @@ func (p *Package) setLoadPackageDataError(err error, path string, stk *ImportSta
 	// move the modload errors into this package to avoid a package import cycle,
 	// and from having to export an error type for the errors produced in build.
 	if !isMatchErr && (nogoErr != nil || isScanErr) {
-		stk.Push(path)
+		var tkPos *token.Position
+		if len(importPos) > 0 {
+			tkPos = &token.Position{
+				Filename: importPos[0].Filename,
+				Offset:   importPos[0].Offset,
+				Line:     importPos[0].Line,
+				Column:   importPos[0].Column,
+			}
+		}
+		stk.Push(&importInfo{Pkg: path, Pos: tkPos})
 		defer stk.Pop()
 	}
 
@@ -338,7 +347,11 @@ func (p *Package) setLoadPackageDataError(err error, path string, stk *ImportSta
 	}
 	p.Incomplete = true
 
-	if path != stk.Top() {
+	top := ""
+	if stk.Top() != nil {
+		top = stk.Top().Pkg
+	}
+	if path != top {
 		p.Error.setPos(importPos)
 	}
 }
@@ -455,7 +468,7 @@ func (p *Package) copyBuild(opts PackageOpts, pp *build.Package) {
 
 // A PackageError describes an error loading information about a package.
 type PackageError struct {
-	ImportStack      []string // shortest path from package named on command line to this one
+	ImportStack      ImportStack // shortest path from package named on command line to this one with position
 	Pos              string   // position of error
 	Err              error    // the error itself
 	IsImportCycle    bool     // the error is an import cycle
@@ -485,7 +498,11 @@ func (p *PackageError) Error() string {
 	if p.Pos != "" {
 		optpos = "\n\t" + p.Pos
 	}
-	return "package " + strings.Join(p.ImportStack, "\n\timports ") + optpos + ": " + p.Err.Error()
+	imports := p.ImportStack.CopyPkgs()
+	if p.IsImportCycle {
+		imports = p.ImportStack.CopyPkgsWithPos()
+	}
+	return "package " + strings.Join(imports, "\n\timports ") + optpos + ": " + p.Err.Error()
 }
 
 func (p *PackageError) Unwrap() error { return p.Err }
@@ -494,10 +511,10 @@ func (p *PackageError) Unwrap() error { return p.Err }
 // and non-essential fields are omitted.
 func (p *PackageError) MarshalJSON() ([]byte, error) {
 	perr := struct {
-		ImportStack []string
+		ImportStack []string // use []string for package names
 		Pos         string
 		Err         string
-	}{p.ImportStack, p.Pos, p.Err.Error()}
+	}{p.ImportStack.CopyPkgs(), p.Pos, p.Err.Error()}
 	return json.Marshal(perr)
 }
 
@@ -558,12 +575,30 @@ func (e *importError) ImportPath() string {
 	return e.importPath
 }
 
+type importInfo struct {
+	Pkg string
+	Pos *token.Position
+}
+
 // An ImportStack is a stack of import paths, possibly with the suffix " (test)" appended.
 // The import path of a test package is the import path of the corresponding
 // non-test package with the suffix "_test" added.
-type ImportStack []string
+type ImportStack []*importInfo
 
-func (s *ImportStack) Push(p string) {
+func NewImportInfo(pkg string, pos *token.Position) *importInfo {
+	var ppos *token.Position
+	if pos != nil {
+		ppos = &token.Position{
+			Filename: pos.Filename,
+			Offset:   pos.Offset,
+			Line:     pos.Line,
+			Column:   pos.Column,
+		}
+	}
+	return &importInfo{Pkg: pkg, Pos: ppos}
+}
+
+func (s *ImportStack) Push(p *importInfo) {
 	*s = append(*s, p)
 }
 
@@ -571,13 +606,47 @@ func (s *ImportStack) Pop() {
 	*s = (*s)[0 : len(*s)-1]
 }
 
-func (s *ImportStack) Copy() []string {
-	return append([]string{}, *s...)
+func (s *ImportStack) Copy() ImportStack {
+	ii := make(ImportStack, len(*s))
+	for i, v := range *s {
+		ii[i] = &importInfo{
+			Pkg: v.Pkg,
+		}
+		if v.Pos != nil {
+			ii[i].Pos = &token.Position{
+				Filename: v.Pos.Filename,
+				Offset:   v.Pos.Offset,
+				Line:     v.Pos.Line,
+				Column:   v.Pos.Column,
+			}
+		}
+	}
+	return ii
 }
 
-func (s *ImportStack) Top() string {
+func (s *ImportStack) CopyPkgs() []string {
+	ss := make([]string, 0, len(*s))
+	for _, v := range *s {
+		ss = append(ss, v.Pkg)
+	}
+	return ss
+}
+
+func (s *ImportStack) CopyPkgsWithPos() []string {
+	ss := make([]string, 0, len(*s))
+	for _, v := range *s {
+		if v.Pos != nil {
+			ss = append(ss, v.Pkg+" from "+filepath.Base(v.Pos.Filename))
+		} else {
+			ss = append(ss, v.Pkg)
+		}
+	}
+	return ss
+}
+
+func (s *ImportStack) Top() *importInfo {
 	if len(*s) == 0 {
-		return ""
+		return nil
 	}
 	return (*s)[len(*s)-1]
 }
@@ -592,8 +661,12 @@ func (sp *ImportStack) shorterThan(t []string) bool {
 	}
 	// If they are the same length, settle ties using string ordering.
 	for i := range s {
-		if s[i] != t[i] {
-			return s[i] < t[i]
+		siPkg := ""
+		if s[i] != nil {
+			siPkg = s[i].Pkg
+		}
+		if siPkg != t[i] {
+			return siPkg < t[i]
 		}
 	}
 	return false // they are equal
@@ -655,7 +728,7 @@ const (
 	cmdlinePkgLiteral
 )
 
-// LoadPackage does Load import, but without a parent package load contezt
+// LoadPackage does Load import, but without a parent package load context
 func LoadPackage(ctx context.Context, opts PackageOpts, path, srcDir string, stk *ImportStack, importPos []token.Position, mode int) *Package {
 	p, err := loadImport(ctx, opts, nil, path, srcDir, nil, stk, importPos, mode)
 	if err != nil {
@@ -707,7 +780,7 @@ func loadImport(ctx context.Context, opts PackageOpts, pre *preload, path, srcDi
 			// sequence that empirically doesn't trigger for these errors, guarded by
 			// a somewhat complex condition. Figure out how to generalize that
 			// condition and eliminate the explicit calls here.
-			stk.Push(path)
+			stk.Push(&importInfo{Pkg: path, Pos: extractFirstImport(importPos)})
 			defer stk.Pop()
 		}
 		p.setLoadPackageDataError(err, path, stk, nil)
@@ -726,7 +799,7 @@ func loadImport(ctx context.Context, opts PackageOpts, pre *preload, path, srcDi
 	importPath := bp.ImportPath
 	p := packageCache[importPath]
 	if p != nil {
-		stk.Push(path)
+		stk.Push(&importInfo{Pkg: path, Pos: extractFirstImport(importPos)})
 		p = reusePackage(p, stk)
 		stk.Pop()
 		setCmdline(p)
@@ -790,6 +863,20 @@ func loadImport(ctx context.Context, opts PackageOpts, pre *preload, path, srcDi
 	}
 
 	return p, nil
+}
+
+func extractFirstImport(importPos []token.Position) *token.Position {
+	var pos *token.Position
+	if len(importPos) > 0 {
+		first := importPos[0]
+		pos = &token.Position{
+			Filename: first.Filename,
+			Offset:   first.Offset,
+			Line:     first.Line,
+			Column:   first.Column,
+		}
+	}
+	return pos
 }
 
 // loadPackageData loads information needed to construct a *Package. The result
@@ -1412,7 +1499,8 @@ func reusePackage(p *Package, stk *ImportStack) *Package {
 	}
 	// Don't rewrite the import stack in the error if we have an import cycle.
 	// If we do, we'll lose the path that describes the cycle.
-	if p.Error != nil && !p.Error.IsImportCycle && stk.shorterThan(p.Error.ImportStack) {
+	if p.Error != nil && p.Error.ImportStack != nil &&
+		!p.Error.IsImportCycle && stk.shorterThan(p.Error.ImportStack.CopyPkgs()) {
 		p.Error.ImportStack = stk.Copy()
 	}
 	return p
@@ -1739,7 +1827,11 @@ func (p *Package) load(ctx context.Context, opts PackageOpts, path string, stk *
 			// then the cause of the error is not within p itself: the error
 			// must be either in an explicit command-line argument,
 			// or on the importer side (indicated by a non-empty importPos).
-			if path != stk.Top() && len(importPos) > 0 {
+			top := ""
+			if stk.Top() != nil {
+				top = stk.Top().Pkg
+			}
+			if path != top && len(importPos) > 0 {
 				p.Error.setPos(importPos)
 			}
 		}
@@ -1905,7 +1997,7 @@ func (p *Package) load(ctx context.Context, opts PackageOpts, path string, stk *
 	// Errors after this point are caused by this package, not the importing
 	// package. Pushing the path here prevents us from reporting the error
 	// with the position of the import declaration.
-	stk.Push(path)
+	stk.Push(&importInfo{Pkg: path, Pos: extractFirstImport(importPos)})
 	defer stk.Pop()
 
 	pkgPath := p.ImportPath

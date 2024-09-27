@@ -114,7 +114,7 @@ func TestPackagesAndErrors(ctx context.Context, done func(), opts PackageOpts, p
 	var stk ImportStack
 	var testEmbed, xtestEmbed map[string][]string
 	var incomplete bool
-	stk.Push(p.ImportPath + " (test)")
+	stk.Push(&importInfo{Pkg: p.ImportPath + " (test)"})
 	rawTestImports := str.StringList(p.TestImports)
 	for i, path := range p.TestImports {
 		p1, err := loadImport(ctx, opts, pre, path, p.Dir, p, &stk, p.Internal.Build.TestImportPos[path], ResolveImport)
@@ -141,7 +141,7 @@ func TestPackagesAndErrors(ctx context.Context, done func(), opts PackageOpts, p
 	}
 	stk.Pop()
 
-	stk.Push(p.ImportPath + "_test")
+	stk.Push(&importInfo{Pkg: p.ImportPath + "_test"})
 	pxtestNeedsPtest := false
 	var pxtestIncomplete bool
 	rawXTestImports := str.StringList(p.XTestImports)
@@ -304,7 +304,7 @@ func TestPackagesAndErrors(ctx context.Context, done func(), opts PackageOpts, p
 
 	// The generated main also imports testing, regexp, and os.
 	// Also the linker introduces implicit dependencies reported by LinkerDeps.
-	stk.Push("testmain")
+	stk.Push(&importInfo{Pkg: "testmain"})
 	deps := TestMainDeps // cap==len, so safe for append
 	if cover != nil && cfg.Experiment.CoverageRedesign {
 		deps = append(deps, "internal/coverage/cfile")
@@ -544,9 +544,20 @@ func recompileForTest(pmain, preal, ptest, pxtest *Package) *PackageError {
 			// The stack is supposed to be in the order x imports y imports z.
 			// We collect in the reverse order: z is imported by y is imported
 			// by x, and then we reverse it.
-			var stk []string
+			var stk ImportStack
+			pkgToFiles := map[string][]string{}
 			for p != nil {
-				stk = append(stk, p.ImportPath)
+				stk = append(stk, &importInfo{
+					Pkg: p.ImportPath,
+				})
+				if p.Internal.Build != nil {
+					for key, val := range p.Internal.Build.ImportPos {
+						if len(val) == 0 {
+							continue
+						}
+						pkgToFiles[key] = append(pkgToFiles[key], filepath.Base(val[0].Filename))
+					}
+				}
 				p = importerOf[p]
 			}
 			// complete the cycle: we set importer[p] = nil to break the cycle
@@ -554,8 +565,18 @@ func recompileForTest(pmain, preal, ptest, pxtest *Package) *PackageError {
 			// back here since we reached nil in the loop above to demonstrate
 			// the cycle as (for example) package p imports package q imports package r
 			// imports package p.
-			stk = append(stk, ptest.ImportPath)
+			stk = append(stk, &importInfo{
+				Pkg: ptest.ImportPath,
+			})
 			slices.Reverse(stk)
+
+			for i, ii := range stk {
+				if file, ok := pkgToFiles[ii.Pkg]; ok && len(file) > 0 && i != 0 {
+					ii.Pos = &token.Position{
+						Filename: filepath.Base(file[0]),
+					}
+				}
+			}
 
 			return &PackageError{
 				ImportStack:   stk,
